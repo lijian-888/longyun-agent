@@ -1,0 +1,76 @@
+##fileformat=VCFv4.2
+##source=rice-data-governance-platform-demo
+##contig=<ID=chr1>
+##contig=<ID=chr2>
+##contig=<ID=chr3>
+##contig=<ID=chr4>
+##contig=<ID=chr5>
+##contig=<ID=chr6>
+##contig=<ID=chr7>
+##contig=<ID=chr8>
+##contig=<ID=chr9>
+##contig=<ID=chr10>
+##contig=<ID=chr11>
+##contig=<ID=chr12>
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	SEQ2025_001	SEQ2025_002	SEQ2025_003	SEQ2025_004	SEQ2025_005	SEQ2025_006	SEQ2025_007	SEQ2025_008	SEQ2025_009	SEQ2025_010
+chr1	101379	rice_demo_snp_1	C	T	.	PASS	.	GT	0/0	0/1	0/0	0/1	0/0	1/1	0/0	0/0	0/1	0/0
+chr1	102758	rice_demo_snp_2	A	T	.	PASS	.	GT	0/0	0/0	0/1	1/1	0/0	0/1	0/0	0/0	0/0	0/1
+chr1	104137	rice_demo_snp_3	C	G	.	PASS	.	GT	1/1	0/0	0/1	0/0	0/0	0/1	0/0	0/1	0/0	0/0
+chr1	105516	rice_demo_snp_4	A	T	.	PASS	.	GT	0/1	0/0	1/1	0/0	0/0	0/1	0/0	0/0	0/1	0/0
+chr1	106895	rice_demo_snp_5	C	T	.	PASS	.	GT	1/1	0/0	0/1	0/0	0/0	0/0	0/1	0/0	0/0	0/1
+chr2	101379	rice_demo_snp_6	A	G	.	PASS	.	GT	0/0	0/0	0/1	0/0	0/1	0/0	0/0	1/1	0/0	0/1
+chr2	102758	rice_demo_snp_7	C	T	.	PASS	.	GT	0/0	0/0	0/1	0/0	0/0	0/1	0/0	0/1	0/0	1/1
+chr2	104137	rice_demo_snp_8	A	T	.	PASS	.	GT	0/0	0/0	0/0	0/1	0/0	0/0	0/1	1/1	0/0	0/1
+chr2	105516	rice_demo_snp_9	C	G	.	PASS	.	GT	0/0	0/1	0/0	0/0	1/1	0/0	0/1	0/0	0/0	0/1
+chr2	106895	rice_demo_snp_10	A	T	.	PASS	.	GT	0/0	0/0	0/1	0/0	0/1	0/0	1/1	0/0	0/0	0/1
+chr3	101379	rice_demo_snp_11	C	T	.	PASS	.	GT	0/1	0/0	0/0	0/1	1/1	0/0	0/1	0/0	0/0	0/0
+chr3	102758	rice_demo_snp_12	A	G	.	PASS	.	GT	0/0	1/1	0/0	0/1	0/0	0/0	0/1	0/0	0/1	0/0
+chr3	104137	rice_demo_snp_13	C	T	.	PASS	.	GT	0/0	0/1	0/0	1/1	0/0	0/0	0/1	0/0	0/0	0/1
+chr3	105516	rice_demo_snp_14	A	T	.	PASS	.	GT	0/1	1/1	0/0	0/1	0/0	0/0	0/0	0/1	0/0	0/0
+chr3	106895	rice_demo_snp_15	C	G	.	PASS	.	GT	0/1	0/0	0/0	0/1	0/0	0/1	0/0	0/0	1/1	0/0
+chr4	101379	rice_demo_snp_16	A	T	.	PASS	.	GT	1/1	0/0	0/0	0/1	0/0	0/0	0/1	0/0	0/1	0/0
+chr4	102758	rice_demo_snp_17	C	T	.	PASS	.	GT	0/1	0/0	0/0	0/0	0/1	0/0	0/0	0/1	1/1	0/0
+chr4	104137	rice_demo_snp_18	A	G	.	PASS	.	GT	0/1	0/0	0/1	0/0	0/0	1/1	0/0	0/1	0/0	0/0
+chr4	105516	rice_demo_snp_19	C	T	.	PASS	.	GT	0/1	0/0	0/0	0/1	0/0	0/1	0/0	1/1	0/0	0/0
+chr4	106895	rice_demo_snp_20	A	T	.	PASS	.	GT	0/0	0/1	0/0	0/0	0/1	1/1	0/0	0/1	0/0	0/0
+chr5	101379	rice_demo_snp_21	C	G	.	PASS	.	GT	0/0	0/0	1/1	0/0	0/1	0/0	0/0	0/1	0/0	0/1
+chr5	102758	rice_demo_snp_22	A	T	.	PASS	.	GT	0/1	0/0	0/1	0/0	1/1	0/0	0/0	0/1	0/0	0/0
+chr5	104137	rice_demo_snp_23	C	T	.	PASS	.	GT	0/0	0/1	1/1	0/0	0/1	0/0	0/0	0/0	0/1	0/0
+chr5	105516	rice_demo_snp_24	A	G	.	PASS	.	GT	0/0	0/1	0/0	0/0	0/1	0/0	0/1	0/0	0/0	1/1
+chr5	106895	rice_demo_snp_25	C	T	.	PASS	.	GT	0/0	1/1	0/0	0/0	0/1	0/0	0/0	0/1	0/0	0/1
+chr6	101379	rice_demo_snp_26	A	T	.	PASS	.	GT	0/0	0/1	0/0	0/0	0/0	0/1	0/0	0/0	0/1	1/1
+chr6	102758	rice_demo_snp_27	C	G	.	PASS	.	GT	0/0	0/1	0/0	0/1	0/0	0/0	1/1	0/0	0/1	0/0
+chr6	104137	rice_demo_snp_28	A	T	.	PASS	.	GT	0/0	0/1	0/0	0/0	0/1	0/0	0/1	0/0	1/1	0/0
+chr6	105516	rice_demo_snp_29	C	T	.	PASS	.	GT	0/0	0/0	0/1	0/0	0/0	0/1	1/1	0/0	0/1	0/0
+chr6	106895	rice_demo_snp_30	A	G	.	PASS	.	GT	0/1	0/0	0/0	1/1	0/0	0/1	0/0	0/0	0/1	0/0
+chr7	101379	rice_demo_snp_31	C	T	.	PASS	.	GT	0/0	0/1	0/0	0/1	0/0	1/1	0/0	0/0	0/1	0/0
+chr7	102758	rice_demo_snp_32	A	T	.	PASS	.	GT	0/0	0/0	0/1	1/1	0/0	0/1	0/0	0/0	0/0	0/1
+chr7	104137	rice_demo_snp_33	C	G	.	PASS	.	GT	1/1	0/0	0/1	0/0	0/0	0/1	0/0	0/1	0/0	0/0
+chr7	105516	rice_demo_snp_34	A	T	.	PASS	.	GT	0/1	0/0	1/1	0/0	0/0	0/1	0/0	0/0	0/1	0/0
+chr7	106895	rice_demo_snp_35	C	T	.	PASS	.	GT	1/1	0/0	0/1	0/0	0/0	0/0	0/1	0/0	0/0	0/1
+chr8	101379	rice_demo_snp_36	A	G	.	PASS	.	GT	0/0	0/0	0/1	0/0	0/1	0/0	0/0	1/1	0/0	0/1
+chr8	102758	rice_demo_snp_37	C	T	.	PASS	.	GT	0/0	0/0	0/1	0/0	0/0	0/1	0/0	0/1	0/0	1/1
+chr8	104137	rice_demo_snp_38	A	T	.	PASS	.	GT	0/0	0/0	0/0	0/1	0/0	0/0	0/1	1/1	0/0	0/1
+chr8	105516	rice_demo_snp_39	C	G	.	PASS	.	GT	0/0	0/1	0/0	0/0	1/1	0/0	0/1	0/0	0/0	0/1
+chr8	106895	rice_demo_snp_40	A	T	.	PASS	.	GT	0/0	0/0	0/1	0/0	0/1	0/0	1/1	0/0	0/0	0/1
+chr9	101379	rice_demo_snp_41	C	T	.	PASS	.	GT	0/1	0/0	0/0	0/1	1/1	0/0	0/1	0/0	0/0	0/0
+chr9	102758	rice_demo_snp_42	A	G	.	PASS	.	GT	0/0	1/1	0/0	0/1	0/0	0/0	0/1	0/0	0/1	0/0
+chr9	104137	rice_demo_snp_43	C	T	.	PASS	.	GT	0/0	0/1	0/0	1/1	0/0	0/0	0/1	0/0	0/0	0/1
+chr9	105516	rice_demo_snp_44	A	T	.	PASS	.	GT	0/1	1/1	0/0	0/1	0/0	0/0	0/0	0/1	0/0	0/0
+chr9	106895	rice_demo_snp_45	C	G	.	PASS	.	GT	0/1	0/0	0/0	0/1	0/0	0/1	0/0	0/0	1/1	0/0
+chr10	101379	rice_demo_snp_46	A	T	.	PASS	.	GT	1/1	0/0	0/0	0/1	0/0	0/0	0/1	0/0	0/1	0/0
+chr10	102758	rice_demo_snp_47	C	T	.	PASS	.	GT	0/1	0/0	0/0	0/0	0/1	0/0	0/0	0/1	1/1	0/0
+chr10	104137	rice_demo_snp_48	A	G	.	PASS	.	GT	0/1	0/0	0/1	0/0	0/0	1/1	0/0	0/1	0/0	0/0
+chr10	105516	rice_demo_snp_49	C	T	.	PASS	.	GT	0/1	0/0	0/0	0/1	0/0	0/1	0/0	1/1	0/0	0/0
+chr10	106895	rice_demo_snp_50	A	T	.	PASS	.	GT	0/0	0/1	0/0	0/0	0/1	1/1	0/0	0/1	0/0	0/0
+chr11	101379	rice_demo_snp_51	C	G	.	PASS	.	GT	0/0	0/0	1/1	0/0	0/1	0/0	0/0	0/1	0/0	0/1
+chr11	102758	rice_demo_snp_52	A	T	.	PASS	.	GT	0/1	0/0	0/1	0/0	1/1	0/0	0/0	0/1	0/0	0/0
+chr11	104137	rice_demo_snp_53	C	T	.	PASS	.	GT	0/0	0/1	1/1	0/0	0/1	0/0	0/0	0/0	0/1	0/0
+chr11	105516	rice_demo_snp_54	A	G	.	PASS	.	GT	0/0	0/1	0/0	0/0	0/1	0/0	0/1	0/0	0/0	1/1
+chr11	106895	rice_demo_snp_55	C	T	.	PASS	.	GT	0/0	1/1	0/0	0/0	0/1	0/0	0/0	0/1	0/0	0/1
+chr12	101379	rice_demo_snp_56	A	T	.	PASS	.	GT	0/0	0/1	0/0	0/0	0/0	0/1	0/0	0/0	0/1	1/1
+chr12	102758	rice_demo_snp_57	C	G	.	PASS	.	GT	0/0	0/1	0/0	0/1	0/0	0/0	1/1	0/0	0/1	0/0
+chr12	104137	rice_demo_snp_58	A	T	.	PASS	.	GT	0/0	0/1	0/0	0/0	0/1	0/0	0/1	0/0	1/1	0/0
+chr12	105516	rice_demo_snp_59	C	T	.	PASS	.	GT	0/0	0/0	0/1	0/0	0/0	0/1	1/1	0/0	0/1	0/0
+chr12	106895	rice_demo_snp_60	A	G	.	PASS	.	GT	0/1	0/0	0/0	1/1	0/0	0/1	0/0	0/0	0/1	0/0

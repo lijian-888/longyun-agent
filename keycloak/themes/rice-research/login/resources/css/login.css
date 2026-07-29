@@ -1,0 +1,139 @@
+:root {
+  color-scheme: light;
+  font-family: "Microsoft YaHei", "Noto Sans SC", Arial, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html, body { min-height: 100%; margin: 0; }
+
+body.rice-login-page {
+  min-width: 320px;
+  color: #123c34;
+  background: #f5f8f5 url("../img/rice-research-hero.png") center / cover no-repeat fixed;
+}
+
+.rice-login-page::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background: rgba(249, 251, 247, 0.72);
+  pointer-events: none;
+}
+
+.rice-login-shell {
+  position: relative;
+  min-height: 100vh;
+  padding: 0 clamp(28px, 6.5vw, 128px);
+  display: flex;
+  flex-direction: column;
+}
+
+.rice-login-header {
+  min-height: 76px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid rgba(24, 76, 63, 0.16);
+}
+
+.brand { display: inline-flex; gap: 12px; align-items: center; min-width: 0; text-decoration: none; color: #103f35; }
+.brand > span:last-child { min-width: 0; }
+.brand-mark {
+  width: 35px;
+  height: 35px;
+  display: grid;
+  place-items: center;
+  background: #1d765e;
+  color: #fff;
+  border-radius: 7px;
+  font-size: 17px;
+  font-weight: 700;
+}
+.brand strong, .brand small { display: block; }
+.brand strong { font-size: 15px; line-height: 1.15; letter-spacing: 0; white-space: nowrap; }
+.brand small { margin-top: 4px; color: #638278; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; white-space: nowrap; }
+
+.deployment-note { color: #4d6c63; font-size: 13px; display: inline-flex; gap: 8px; align-items: center; }
+.deployment-note span { width: 8px; height: 8px; border-radius: 50%; background: #42a578; }
+
+.rice-login-content {
+  width: min(1280px, 100%);
+  margin: auto;
+  padding: 50px 0 64px;
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(340px, 430px);
+  align-items: center;
+  gap: clamp(52px, 8vw, 148px);
+}
+
+.product-intro { max-width: 760px; }
+.eyebrow { margin: 0 0 16px; font-size: 14px; color: #3a8570; font-weight: 700; letter-spacing: 0.08em; }
+.product-intro h1 { margin: 0; color: #113c33; font-size: clamp(34px, 3.35vw, 57px); line-height: 1.18; letter-spacing: 0; }
+.intro-copy { max-width: 670px; margin: 22px 0 30px; color: #496b61; line-height: 1.85; font-size: 16px; }
+
+.capability-grid {
+  max-width: 740px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  background: rgba(255,255,255,0.78);
+  border: 1px solid rgba(22, 86, 69, 0.14);
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 16px 42px rgba(30, 83, 63, 0.08);
+}
+.capability-grid article { min-height: 132px; padding: 20px 22px 18px; border-right: 1px solid rgba(22, 86, 69, 0.12); border-bottom: 1px solid rgba(22, 86, 69, 0.12); }
+.capability-grid article:nth-child(2n) { border-right: 0; }
+.capability-grid article:nth-last-child(-n+2) { border-bottom: 0; }
+.capability-index { display: block; color: #6fa890; font-size: 11px; font-weight: 800; letter-spacing: 0.12em; }
+.capability-grid strong { display: block; margin-top: 7px; color: #154b3f; font-size: 16px; }
+.capability-grid p { margin: 7px 0 0; color: #5f7a72; font-size: 12px; line-height: 1.65; }
+
+.feature-line { margin-top: 25px; display: flex; align-items: center; gap: 14px; color: #3f675a; font-size: 13px; font-weight: 600; flex-wrap: wrap; }
+.feature-line i { width: 4px; height: 4px; background: #c6a449; border-radius: 50%; }
+
+.sign-in-card { background: rgba(255, 255, 255, 0.92); border: 1px solid rgba(24, 78, 63, 0.16); border-top: 4px solid #2d8a70; border-radius: 8px; box-shadow: 0 18px 46px rgba(20, 68, 55, 0.15); padding: 32px; }
+.sign-in-heading p { margin: 0; color: #4e987f; font-size: 12px; font-weight: 700; letter-spacing: 0.08em; }
+.sign-in-heading h2 { margin: 8px 0 10px; font-size: 28px; line-height: 1.2; color: #123e34; letter-spacing: 0; }
+.sign-in-heading span { color: #688178; font-size: 13px; line-height: 1.6; }
+
+.login-form { margin-top: 25px; }
+.login-form label { display: block; margin: 0 0 8px; color: #254f44; font-size: 13px; font-weight: 700; }
+.login-form input[type="text"], .login-form input[type="password"] { width: 100%; height: 45px; margin-bottom: 18px; border: 1px solid #b9d0c7; border-radius: 5px; background: #fbfdfb; color: #143f35; padding: 0 12px; font: inherit; outline: none; transition: border-color 120ms ease, box-shadow 120ms ease; }
+.login-form input:focus { border-color: #268066; box-shadow: 0 0 0 3px rgba(38,128,102,0.12); }
+.password-label-row { display: flex; justify-content: space-between; align-items: baseline; }
+.password-label-row a { color: #24735e; font-size: 12px; text-decoration: none; }
+.password-label-row a:hover { text-decoration: underline; }
+.remember-row { display: inline-flex !important; align-items: center; gap: 8px; margin: -1px 0 20px !important; color: #58746b !important; font-weight: 500 !important; cursor: pointer; }
+.remember-row input { accent-color: #21795f; }
+.login-button { width: 100%; height: 46px; border: 0; border-radius: 5px; background: #17765e; color: #fff; font: inherit; font-weight: 700; cursor: pointer; transition: background 120ms ease, transform 120ms ease; }
+.login-button:hover { background: #0e634d; }
+.login-button:active { transform: translateY(1px); }
+.login-button span { margin-left: 7px; font-size: 18px; }
+.sign-in-footnote { margin: 20px 0 0; color: #789087; font-size: 12px; line-height: 1.55; }
+
+.login-message { margin-top: 20px; padding: 10px 12px; border-radius: 5px; font-size: 13px; line-height: 1.55; }
+.login-message-error { background: #fff4f2; color: #a5483c; border: 1px solid #efc9c4; }
+.login-message-success { background: #edf8f1; color: #28704d; border: 1px solid #c5e3cf; }
+.login-message-warning { background: #fff8e8; color: #8a6821; border: 1px solid #ecdba8; }
+
+@media (max-width: 900px) {
+  body.rice-login-page { background-position: 64% center; }
+  .rice-login-shell { padding: 0 24px; }
+  .rice-login-content { grid-template-columns: 1fr; gap: 34px; padding-top: 42px; }
+  .product-intro { max-width: 680px; }
+  .sign-in-card { width: min(430px, 100%); }
+}
+
+@media (max-width: 580px) {
+  .rice-login-shell { padding: 0 18px; }
+  .rice-login-header { min-height: 66px; }
+  .deployment-note { display: none; }
+  .rice-login-content { padding: 32px 0 36px; }
+  .product-intro h1 { font-size: 32px; }
+  .intro-copy { font-size: 14px; }
+  .capability-grid { grid-template-columns: 1fr; }
+  .capability-grid article, .capability-grid article:nth-last-child(-n+2) { border-right: 0; border-bottom: 1px solid rgba(22, 86, 69, 0.12); }
+  .capability-grid article:last-child { border-bottom: 0; }
+  .sign-in-card { padding: 24px 21px; }
+}

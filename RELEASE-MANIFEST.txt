@@ -1,0 +1,5 @@
+﻿Product: Longyun Agent Breeding Intelligence
+Release: v1.5.2-vision-isolation
+Build time: 2026-07-27T11:35:42
+Deployment guide: deploy/LAN-DEPLOYMENT.md
+This package intentionally excludes .env files, TLS certificates, local databases, raw uploads, and research attachments.

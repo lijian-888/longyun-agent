@@ -1,0 +1,3 @@
+services:
+  web:
+    image: longyun-agent-web:v1.5.3-public-domain-20260728

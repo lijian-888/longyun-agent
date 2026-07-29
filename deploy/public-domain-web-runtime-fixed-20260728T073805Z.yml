@@ -1,0 +1,5 @@
+services:
+  web:
+    image: longyun-agent-web:v1.5.3-public-domain-runtime-fixed-20260728T073805Z
+    entrypoint: ["/docker-entrypoint.sh"]
+    command: ["nginx", "-g", "daemon off;"]

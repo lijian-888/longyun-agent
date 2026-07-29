@@ -1,0 +1,9 @@
+# Narrow, incident-only Compose override.
+#
+# Keep every other service at its existing release tag.  This lets an operator
+# replace the API image with the validated placeholder-output guard without
+# accidentally pulling or recreating web, MinerU, Keycloak, PostgreSQL, or the
+# genotype worker.
+services:
+  api:
+    image: longyun-agent-api:v1.5.2

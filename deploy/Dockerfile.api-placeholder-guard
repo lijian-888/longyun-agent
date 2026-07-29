@@ -1,0 +1,11 @@
+# Emergency, dependency-free API patch image.
+#
+# This is intentionally not the normal release path.  It derives from a
+# verified deployed API image and copies only the placeholder-answer guard.
+# Building it with `--network=none` guarantees that an incident repair never
+# downloads packages or reaches a public registry.
+ARG BASE_IMAGE=longyun-agent-api:v1.5.1
+FROM ${BASE_IMAGE}
+
+COPY backend/app/research_agent.py /app/app/research_agent.py
+COPY backend/app/main.py /app/app/main.py

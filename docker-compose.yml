@@ -1,0 +1,166 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: rice_demo
+      POSTGRES_USER: rice
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rice_demo_password}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rice -d rice_demo"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "54329:5432"
+
+  api:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg://rice_app:${APP_DATABASE_PASSWORD:-rice_app_demo_password}@db:5432/rice_demo
+      MIGRATION_DATABASE_URL: postgresql+psycopg://rice:${POSTGRES_PASSWORD:-rice_demo_password}@db:5432/rice_demo
+      APP_DATABASE_ROLE: rice_app
+      APP_DATABASE_PASSWORD: ${APP_DATABASE_PASSWORD:-rice_app_demo_password}
+      # Vite's local reverse proxy sends its Docker service name as Host.
+      # Keep the local development boundary explicit instead of allowing '*'.
+      TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,api,web}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:5173,http://localhost:5183}
+      RAW_STORAGE_DIR: /data/raw
+      RESEARCH_STORAGE_DIR: /data/research
+      ENABLE_SOURCE_DEDUPLICATION: "false"
+      # Browser login uses local HTTPS so Keycloak's secure OIDC cookies survive the redirect flow.
+      KEYCLOAK_ISSUER: https://localhost:8443/realms/rice-research
+      KEYCLOAK_JWKS_URL: http://keycloak:8080/realms/rice-research/protocol/openid-connect/certs
+      KEYCLOAK_AUDIENCE: rice-research-web
+      SHENNONG_API_BASE_URL: ${SHENNONG_API_BASE_URL:-https://api.agent-tech.cc/api/v1}
+      SHENNONG_MODEL: ${SHENNONG_MODEL:-sn}
+      SHENNONG_API_KEY: ${SHENNONG_API_KEY:-}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      DOC_PARSE_MODE: ${DOC_PARSE_MODE:-local}
+      # The CPU parser pipeline is deliberately serial.  More parallel workers
+      # compete with MinerU, Docling and OCR for the same host CPU.
+      KNOWLEDGE_DOCUMENT_CONCURRENCY: ${KNOWLEDGE_DOCUMENT_CONCURRENCY:-1}
+      MINERU_API_URL: http://mineru:8001
+      MINERU_MODEL_SOURCE: ${MINERU_MODEL_SOURCE:-modelscope}
+      MINERU_BACKEND: ${MINERU_BACKEND:-pipeline}
+      MINERU_PARSE_TIMEOUT_SECONDS: ${MINERU_PARSE_TIMEOUT_SECONDS:-900}
+      MINERU_REQUEST_TIMEOUT_SECONDS: ${MINERU_REQUEST_TIMEOUT_SECONDS:-960}
+      HF_HOME: /data/models/huggingface
+      MODELSCOPE_CACHE: /data/models/modelscope
+      PADDLE_PDX_CACHE_HOME: /data/models/paddlex
+      FLAGS_use_mkldnn: "0"
+      PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT: "False"
+      DOCLING_ARTIFACTS_PATH: /data/models/docling
+      DOCLING_DOCUMENT_TIMEOUT_SECONDS: ${DOCLING_DOCUMENT_TIMEOUT_SECONDS:-600}
+      BGE_M3_MODEL_PATH: /data/models/bge-m3
+    depends_on:
+      db:
+        condition: service_healthy
+      mineru:
+        condition: service_healthy
+    volumes:
+      - raw_data:/data/raw
+      - research_data:/data/research
+      - model_data:/data/models
+    ports:
+      - "8000:8000"
+
+  web:
+    build: ./frontend
+    depends_on:
+      - api
+    environment:
+      VITE_KEYCLOAK_URL: https://localhost:8443
+    ports:
+      - "5183:5173"
+
+  genotype-worker:
+    build: ./backend
+    command: ["python", "-m", "app.genotype_worker"]
+    environment:
+      MIGRATION_DATABASE_URL: postgresql+psycopg://rice:${POSTGRES_PASSWORD:-rice_demo_password}@db:5432/rice_demo
+      RESEARCH_STORAGE_DIR: /data/research
+      PLINK2_BINARY: /usr/local/bin/plink2
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - research_data:/data/research
+    restart: unless-stopped
+
+  mineru:
+    build: ./mineru
+    environment:
+      MINERU_MODEL_SOURCE: ${MINERU_MODEL_SOURCE:-modelscope}
+      MINERU_BACKEND: ${MINERU_BACKEND:-pipeline}
+      MINERU_PARSE_TIMEOUT_SECONDS: ${MINERU_PARSE_TIMEOUT_SECONDS:-900}
+      HF_HOME: /data/models/huggingface
+      MODELSCOPE_CACHE: /data/models/modelscope
+    volumes:
+      - mineru_model_data:/data/models
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.2
+    command:
+      - start-dev
+      - --import-realm
+      - --hostname=https://localhost:8443
+      - --https-key-store-file=/opt/keycloak/conf/local-keycloak.pfx
+      - --https-key-store-password=${KEYCLOAK_HTTPS_KEYSTORE_PASSWORD:-LongyunLocalDev2026!}
+      - --https-port=8443
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-ChangeThisAdminPassword!}
+      KC_HEALTH_ENABLED: "true"
+    volumes:
+      # Keep the local Keycloak realm and account credentials across container recreations.
+      - keycloak_data:/opt/keycloak/data
+      - ./keycloak:/opt/keycloak/data/import:ro
+      - ./keycloak/themes:/opt/keycloak/themes:ro
+      - ./keycloak/certs/local-keycloak.pfx:/opt/keycloak/conf/local-keycloak.pfx:ro
+    ports:
+      - "8088:8080"
+      - "8443:8443"
+
+  mineru-model-warmup:
+    build: ./mineru
+    profiles: ["warmup"]
+    command: ["python", "warm_models.py"]
+    environment:
+      MINERU_MODEL_SOURCE: ${MINERU_MODEL_SOURCE:-modelscope}
+      MINERU_BACKEND: ${MINERU_BACKEND:-pipeline}
+      MINERU_PARSE_TIMEOUT_SECONDS: ${MINERU_PARSE_TIMEOUT_SECONDS:-900}
+      HF_HOME: /data/models/huggingface
+      MODELSCOPE_CACHE: /data/models/modelscope
+    volumes:
+      - mineru_model_data:/data/models
+
+  model-warmup:
+    image: rice-data-governance-platform-demo-api:latest
+    profiles: ["warmup"]
+    command: ["python", "-m", "app.warm_models"]
+    environment:
+      HF_HOME: /data/models/huggingface
+      MODELSCOPE_CACHE: /data/models/modelscope
+      PADDLE_PDX_CACHE_HOME: /data/models/paddlex
+      FLAGS_use_mkldnn: "0"
+      PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT: "False"
+      DOCLING_ARTIFACTS_PATH: /data/models/docling
+      DOCLING_DOCUMENT_TIMEOUT_SECONDS: ${DOCLING_DOCUMENT_TIMEOUT_SECONDS:-600}
+      BGE_M3_MODEL_PATH: /data/models/bge-m3
+    volumes:
+      - model_data:/data/models
+
+volumes:
+  postgres_data:
+  raw_data:
+  research_data:
+  model_data:
+  mineru_model_data:
+  keycloak_data:

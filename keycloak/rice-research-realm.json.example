@@ -1,0 +1,116 @@
+{
+  "realm": "rice-research",
+  "enabled": true,
+  "displayName": "隆耘 Agent 育种智能体",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": false,
+  "roles": {
+    "realm": [
+      {
+        "name": "researcher",
+        "description": "Can access published standard data and their own private research sessions."
+      },
+      {
+        "name": "data_processor",
+        "description": "Can import, review, correct, and publish high-standard dataset records."
+      },
+      {
+        "name": "field_admin",
+        "description": "Can maintain high-standard dataset templates, field definitions, and rule versions."
+      }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "rice-research-web",
+      "name": "Longyun Agent Breeding Intelligence Web",
+      "publicClient": true,
+      "protocol": "openid-connect",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": [
+        "http://localhost:5183/*"
+      ],
+      "webOrigins": [
+        "http://localhost:5183"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      }
+    }
+  ],
+  "users": [
+    {
+      "username": "wang.researcher",
+      "enabled": true,
+      "firstName": "Wang",
+      "lastName": "Researcher",
+      "email": "wang.researcher@example.local",
+      "emailVerified": true,
+      "realmRoles": [
+        "researcher"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "CHANGE_ME_BEFORE_USE",
+          "temporary": true
+        }
+      ]
+    },
+    {
+      "username": "li.researcher",
+      "enabled": true,
+      "firstName": "Li",
+      "lastName": "Researcher",
+      "email": "li.researcher@example.local",
+      "emailVerified": true,
+      "realmRoles": [
+        "researcher"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "CHANGE_ME_BEFORE_USE",
+          "temporary": true
+        }
+      ]
+    },
+    {
+      "username": "zhang.processor",
+      "enabled": true,
+      "firstName": "Zhang",
+      "lastName": "Processor",
+      "email": "zhang.processor@example.local",
+      "emailVerified": true,
+      "realmRoles": [
+        "data_processor"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "CHANGE_ME_BEFORE_USE",
+          "temporary": true
+        }
+      ]
+    },
+    {
+      "username": "chen.fieldadmin",
+      "enabled": true,
+      "firstName": "Chen",
+      "lastName": "FieldAdmin",
+      "email": "chen.fieldadmin@example.local",
+      "emailVerified": true,
+      "realmRoles": [
+        "field_admin"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "CHANGE_ME_BEFORE_USE",
+          "temporary": true
+        }
+      ]
+    }
+  ]
+}
