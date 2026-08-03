@@ -787,7 +787,7 @@ export default function ResearchAssistant() {
 
   return <div className="research-shell">
     <aside className="research-sidebar">
-      <div className="research-brand"><div className="research-brand-mark">稻</div><div><strong>{AGENT_NAME}</strong><span>已发布标准数据 + 大模型</span></div></div>
+      <div className="research-brand"><div className="research-brand-mark brand-logo-mark" aria-hidden="true"><img src="/brand/longyun-agent-logo.png" alt="" /></div><div><strong>{AGENT_NAME}</strong><span>已发布标准数据 + 大模型</span></div></div>
       <nav className="research-workspaces" aria-label="科研工作台">
         <section className="research-workspace-group" aria-label="对话">
           <small>对话</small>

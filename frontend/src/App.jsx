@@ -410,7 +410,7 @@ function App({ user, accessRole = "data_processor" }) {
   return <div className="app-shell">
     <aside className="sidebar">
       <div className="brand">
-        <div className="brand-mark">稻</div>
+        <div className="brand-mark brand-logo-mark" aria-hidden="true"><img src="/brand/longyun-agent-logo.png" alt="" /></div>
         <div><strong>隆耘 Agent</strong><span>水稻育种研究与数据治理</span></div>
       </div>
       <nav>{navItems.map((item) => <button key={item.id} className={page === item.id ? "nav-item active" : "nav-item"} onClick={() => { setPage(item.id); setAccountMenuOpen(false); }}><item.icon size={18} />{item.label}<ChevronRight size={15} /></button>)}</nav>
