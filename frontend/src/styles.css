@@ -14,6 +14,9 @@ button { cursor: pointer; }
 .sidebar { background: #123e35; color: #eef8f3; padding: 22px 16px; display: flex; flex-direction: column; gap: 24px; }
 .brand { display: flex; align-items: center; gap: 11px; padding: 4px 8px; }
 .brand-mark { width: 38px; height: 38px; display: grid; place-items: center; background: #d6ad35; color: #173f36; font-weight: 800; font-size: 19px; border-radius: 5px; }
+.brand-logo-mark { position: relative; overflow: visible; background: transparent; border: 0; box-shadow: none; }
+.brand-logo-mark img { width: 100%; height: 100%; object-fit: contain; display: block; filter: drop-shadow(0 2px 2px rgba(0,0,0,.15)); }
+.research-brand-mark.brand-logo-mark { background: transparent; }
 .brand strong, .brand span { display: block; }
 .brand strong { font-size: 15px; }
 .brand span { color: #a8cbbd; font-size: 12px; margin-top: 3px; }

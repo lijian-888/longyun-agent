@@ -10,7 +10,7 @@
   <main class="rice-login-shell">
     <header class="rice-login-header">
       <a class="brand" href="#" aria-label="隆耘 Agent 育种智能体">
-        <span class="brand-mark">稻</span>
+        <span class="brand-mark" aria-hidden="true"><img src="${url.resourcesPath}/img/longyun-agent-logo.png" alt="" /></span>
         <span>
           <strong>隆耘 Agent 育种智能体</strong>
           <small>Longyun Agent · Breeding Intelligence</small>
