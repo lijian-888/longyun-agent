@@ -1,10 +1,11 @@
-"""AgentScope-backed execution for the authenticated research assistant.
+"""Provider-neutral execution for the authenticated research assistant.
 
-The database owns durable conversation state. AgentScope owns the working
-memory representation, while this module compacts older working-memory turns
-before a model call. This avoids provider-specific compression failures and
-keeps complete private history in PostgreSQL RLS tables instead of an external
-agent service.
+The database owns durable conversation state.  Server-side code resolves the
+evidence that the current user may read before a model call.  The default text
+path sends that evidence through the provider's ordinary chat protocol because
+external OpenAI-compatible relays do not consistently preserve ReAct tool
+messages.  The legacy AgentScope path remains available behind an explicit
+compatibility switch for a future model endpoint with a verified tool contract.
 """
 
 import asyncio
@@ -16,6 +17,8 @@ import re
 import uuid
 from collections.abc import AsyncGenerator
 from typing import Any
+
+from .ai.provider import ProviderSettings
 
 
 logger = logging.getLogger(__name__)
@@ -34,6 +37,13 @@ RECENT_MEMORY_CHAR_LIMIT = 12000
 # turning a complete response into the old "wait, then fake stream" behavior.
 STREAM_INITIAL_GUARD_CHARS = 220
 STREAM_TRAILING_GUARD_CHARS = 96
+
+# The external relay is reliable for ordinary chat completions but has
+# intermittently returned an empty string or ``...`` when AgentScope sends a
+# synthetic assistant tool-use + system tool-result history.  Keep that legacy
+# protocol opt-in; production text chat uses the portable plain-evidence path.
+DEFAULT_TEXT_PROTOCOL = "plain_evidence"
+RETRIABLE_PROVIDER_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 
 # A provider may occasionally serialize its internal tool protocol as ordinary
 # text instead of returning an OpenAI-compatible tool call. That text must
@@ -77,7 +87,8 @@ async def infer_controlled_query_request(
     This is only a fallback when deterministic name/field rules cannot build a
     plan. The caller validates every returned value against the local catalog.
     """
-    api_key = os.getenv("SHENNONG_API_KEY", "").strip()
+    settings = ProviderSettings.from_environment()
+    api_key = settings.api_key
     if not api_key:
         return None
     try:
@@ -85,8 +96,8 @@ async def infer_controlled_query_request(
     except Exception:
         return None
 
-    base_url = os.getenv("SHENNONG_API_BASE_URL", "https://api.agent-tech.cc/api/v1").rstrip("/")
-    model_name = os.getenv("SHENNONG_MODEL", "sn").strip() or "sn"
+    base_url = settings.base_url
+    model_name = settings.model
     # This provider does not reliably apply `system` messages. Keep the full
     # contract in the user message so the request is executed consistently.
     planner_prompt = """你是水稻科研平台的结构化数据查询参数解析器。
@@ -272,7 +283,7 @@ Evidence priority, from highest to lowest:
 
 Use only tool-returned evidence for claims about a platform variety or a private attachment. Clearly say when evidence is missing, incomparable, or needs human verification. Do not invent data, studies, standards, or citations. The user may ask non-rice agricultural questions; answer within your competence.
 
-The platform runs a mandatory, audited ReAct evidence workflow before each final response. Its first action reads verified platform, attachment, and knowledge-base evidence. When trusted current public references were prepared for this turn, its second action reads those references. Treat the resulting tool observations in this conversation as the evidence available for the answer. Only write the final answer after using those observations.
+The platform runs a mandatory, audited evidence workflow before each final response. Server-side code supplies the platform, attachment, knowledge-base, and trusted public-reference evidence that the current user is authorized to read. Treat the clearly labelled evidence in the current request as the complete evidence available for this answer. Only write the final answer after using that evidence.
 
 Tool calls are machine actions, not answer text. Never imitate, disclose, or explain internal reasoning or tool syntax. Never output `<think>`, `</think>`, `<tool>`, `</tool>`, `<query>`, XML, function-call JSON, or a plan to search. Do not claim that you searched unless a tool result explicitly says that trusted public references were returned. If no evidence is returned, say so plainly and answer only with clearly labelled general knowledge when appropriate.
 
@@ -448,6 +459,276 @@ async def _execute_controlled_react_action(
     await agent._acting(tool_call)
 
 
+def _normalise_openai_content(value: Any) -> str:
+    """Read only researcher-facing text from compatible API content blocks."""
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, list):
+        return ""
+    parts: list[str] = []
+    for block in value:
+        if isinstance(block, str):
+            parts.append(block)
+            continue
+        if not isinstance(block, dict):
+            continue
+        # Do not fall back to reasoning_content/analysis fields.  They are not
+        # researcher-facing answers and must never be persisted or displayed.
+        text = block.get("text")
+        if isinstance(text, str):
+            parts.append(text)
+        elif isinstance(text, dict) and isinstance(text.get("value"), str):
+            parts.append(text["value"])
+    return "".join(parts)
+
+
+def _extract_openai_answer_text(body: dict[str, Any]) -> str:
+    """Handle both streaming deltas and final compatible chat responses."""
+    choices = body.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return ""
+    choice = choices[0]
+    delta = choice.get("delta")
+    if isinstance(delta, dict):
+        content = _normalise_openai_content(delta.get("content"))
+        if content:
+            return content
+    message = choice.get("message")
+    if isinstance(message, dict):
+        content = _normalise_openai_content(message.get("content"))
+        if content:
+            return content
+    # A few OpenAI-compatible gateways expose completion text at choice level.
+    return _normalise_openai_content(choice.get("text"))
+
+
+def _build_plain_evidence_messages(
+    *,
+    user_prompt: str,
+    evidence_context: str,
+    public_web_context: str,
+    conversation_history: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Build a portable chat request without synthetic tool protocol turns."""
+    history: list[dict[str, str]] = []
+    for item in conversation_history[-8:]:
+        role = item.get("role")
+        content = str(item.get("content") or "").strip()
+        if role in {"user", "assistant"} and content:
+            history.append({"role": role, "content": content})
+
+    verified = evidence_context.strip() or "本轮没有检索到可用的平台、附件或知识库证据。"
+    public = public_web_context.strip() or "本轮没有准备可信公开网络资料，不得声称已经联网检索。"
+    current_turn = f"""【必须遵守的本轮约束】
+直接回答“本轮问题”，不得只回复省略号、确认语、搜索计划、工具语法或报告下载说明。
+有关机构数据、课题数据和附件的事实，只能来自下方已核验证据；证据不足时必须明确说明边界。
+
+【本轮问题】
+{user_prompt.strip()}
+
+【已核验的平台、课题附件与知识库证据】
+{verified}
+
+【已准备的可信公开资料】
+{public}
+
+请基于以上内容给出可供科研人员阅读的 Markdown 结论，并说明主要关联、可能机制、数据边界和下一步可验证方法。"""
+    return [
+        {"role": "system", "content": _build_system_prompt()},
+        *history,
+        {"role": "user", "content": current_turn},
+    ]
+
+
+def _provider_headers(api_key: str) -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
+def _is_retriable_provider_error(exc: Exception) -> bool:
+    """Retry only transient relay failures and malformed empty responses."""
+    try:
+        import httpx
+    except Exception:  # pragma: no cover - dependency is required in deployment
+        return False
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in RETRIABLE_PROVIDER_STATUSES
+    return isinstance(
+        exc,
+        (
+            httpx.TimeoutException,
+            httpx.TransportError,
+            ValueError,
+            _StreamProtocolLeakError,
+        ),
+    )
+
+
+def _raise_native_provider_error(exc: Exception, *, timeout_seconds: float) -> None:
+    """Map provider details to stable user messages without exposing secrets."""
+    try:
+        import httpx
+    except Exception:  # pragma: no cover - dependency is required in deployment
+        raise ResearchAgentError("统一模型运行环境不可用，请检查后端依赖安装。") from exc
+
+    if isinstance(exc, httpx.TimeoutException):
+        raise ResearchAgentError(
+            f"当前配置的大模型在 {int(timeout_seconds)} 秒内未返回完整结果，请稍后重试。"
+        ) from exc
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if status in {401, 403}:
+            detail = "当前配置的大模型 API 鉴权失败，请检查服务器 API Key。"
+        elif status == 429:
+            detail = "当前配置的大模型请求过于频繁，系统自动重试后仍未恢复，请稍后再试。"
+        else:
+            detail = f"当前配置的大模型返回 HTTP {status}，请稍后重试。"
+        raise ResearchAgentError(detail) from exc
+    if isinstance(exc, (httpx.HTTPError, ValueError, json.JSONDecodeError)):
+        raise ResearchAgentError("无法稳定连接当前配置的大模型服务，请稍后重试。") from exc
+    raise ResearchAgentError("大模型调用未完成，请稍后重试。") from exc
+
+
+async def _stream_plain_evidence_reply(
+    *,
+    api_key: str,
+    user_prompt: str,
+    evidence_context: str,
+    public_web_context: str,
+    conversation_history: list[dict[str, str]],
+) -> AsyncGenerator[dict[str, Any], None]:
+    """Stream an ordinary chat completion and retry empty results safely.
+
+    The first attempt is streaming.  Its short prefix is retained locally so
+    an empty/ellipsis response never reaches the browser.  If no usable text
+    arrives, a second non-streaming request uses the same evidence contract;
+    this also covers transient gateway errors before any answer was rendered.
+    """
+    try:
+        import httpx
+    except Exception as exc:  # pragma: no cover - installed in deployment image
+        raise ResearchAgentError("统一模型运行环境不可用，请检查后端依赖安装。") from exc
+
+    settings = ProviderSettings.from_environment()
+    messages = _build_plain_evidence_messages(
+        user_prompt=user_prompt,
+        evidence_context=evidence_context,
+        public_web_context=public_web_context,
+        conversation_history=conversation_history,
+    )
+    endpoint = f"{settings.base_url}/chat/completions"
+    headers = _provider_headers(api_key)
+    timeout = httpx.Timeout(
+        connect=min(20.0, settings.timeout_seconds),
+        read=settings.timeout_seconds,
+        write=min(30.0, settings.timeout_seconds),
+        pool=min(30.0, settings.timeout_seconds),
+    )
+    base_payload: dict[str, Any] = {
+        "model": settings.model,
+        "temperature": 0.15,
+        "max_tokens": 4096,
+        "messages": messages,
+    }
+
+    output_guard = _StreamingOutputGuard()
+    released_to_caller = False
+    stream_text = ""
+    first_error: Exception | None = None
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream(
+                "POST",
+                endpoint,
+                headers=headers,
+                json={**base_payload, "stream": True},
+            ) as response:
+                response.raise_for_status()
+                async for raw_line in response.aiter_lines():
+                    line = raw_line.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        break
+                    try:
+                        delta = _extract_openai_answer_text(json.loads(payload))
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    if not delta:
+                        continue
+                    stream_text += delta
+                    try:
+                        safe_chunk = output_guard.append(delta)
+                    except _StreamProtocolLeakError as exc:
+                        first_error = exc
+                        break
+                    if safe_chunk:
+                        released_to_caller = True
+                        yield {"type": "token", "text": safe_chunk}
+    except (httpx.HTTPError, ValueError) as exc:
+        first_error = exc
+
+    clean_stream_text = ""
+    remaining = ""
+    try:
+        remaining, clean_stream_text = output_guard.finish()
+    except _StreamProtocolLeakError as exc:
+        first_error = first_error or exc
+    if first_error is None and _is_meaningful_final_answer(clean_stream_text):
+        if remaining:
+            released_to_caller = True
+            yield {"type": "token", "text": remaining}
+        return
+    if released_to_caller:
+        # Do not append a second answer to an already visible partial stream.
+        if first_error is not None:
+            _raise_native_provider_error(first_error, timeout_seconds=settings.timeout_seconds)
+        raise _empty_answer_error()
+    if first_error is not None and not _is_retriable_provider_error(first_error):
+        _raise_native_provider_error(first_error, timeout_seconds=settings.timeout_seconds)
+
+    logger.warning(
+        "Plain-evidence stream returned no displayable answer; retrying non-streaming: model=%s length=%s error=%s",
+        settings.model,
+        len(stream_text),
+        type(first_error).__name__ if first_error else "none",
+    )
+    retry_messages = [*messages]
+    retry_messages[-1] = {
+        "role": "user",
+        "content": messages[-1]["content"]
+        + "\n\n【系统重试要求】上一次请求未得到可展示正文。请直接输出完整研究结论，不得返回空内容或省略号。",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                endpoint,
+                headers=headers,
+                json={**base_payload, "stream": False, "messages": retry_messages},
+            )
+            response.raise_for_status()
+            retry_text = _extract_openai_answer_text(response.json())
+    except (httpx.HTTPError, ValueError) as exc:
+        _raise_native_provider_error(exc, timeout_seconds=settings.timeout_seconds)
+        return  # pragma: no cover - helper always raises
+
+    if (
+        not _is_meaningful_final_answer(retry_text)
+        or _has_react_protocol_leak(retry_text)
+    ):
+        logger.error(
+            "Plain-evidence fallback returned no displayable answer: model=%s length=%s protocol_leak=%s",
+            settings.model,
+            len(retry_text),
+            _has_react_protocol_leak(retry_text),
+        )
+        raise _empty_answer_error()
+    yield {"type": "token", "text": retry_text}
+
+
 async def stream_research_reply(
     *,
     user_prompt: str,
@@ -459,14 +740,14 @@ async def stream_research_reply(
     has_current_vision_images: bool = False,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Yield guarded provider tokens plus a final persisted memory state."""
-    api_key = os.getenv("SHENNONG_API_KEY", "").strip()
+    settings = ProviderSettings.from_environment()
+    api_key = settings.api_key
     if not api_key:
-        raise ResearchAgentError("尚未配置神农 API Key。请在部署服务器的 .env 中设置 SHENNONG_API_KEY 后重启服务。")
+        raise ResearchAgentError("尚未配置统一模型服务凭证，请设置 LONGYUN_LLM_API_KEY 后重启服务。")
 
     # AgentScope 1.0's generic OpenAI formatter does not reliably preserve
     # image_url blocks for this provider. Native image turns therefore use the
-    # provider's OpenAI-compatible multimodal endpoint directly; text turns
-    # retain AgentScope memory, compression, orchestration, and streaming.
+    # provider's OpenAI-compatible multimodal endpoint directly.
     if vision_images:
         output_guard = _StreamingOutputGuard()
         async for event in _stream_native_vision_reply(
@@ -513,6 +794,39 @@ async def stream_research_reply(
         }
         return
 
+    text_protocol = os.getenv(
+        "LONGYUN_RESEARCH_TEXT_PROTOCOL",
+        DEFAULT_TEXT_PROTOCOL,
+    ).strip().lower()
+    if text_protocol != "agentscope_react":
+        final_text_parts: list[str] = []
+        async for event in _stream_plain_evidence_reply(
+            api_key=api_key,
+            user_prompt=user_prompt,
+            evidence_context=evidence_context,
+            public_web_context=public_web_context,
+            conversation_history=conversation_history or [],
+        ):
+            if event["type"] == "token":
+                text = str(event.get("text") or "")
+                final_text_parts.append(text)
+                yield {"type": "token", "text": text}
+        final_answer = _select_displayable_final_answer("".join(final_text_parts))
+        if not final_answer:
+            raise _empty_answer_error()
+        # PostgreSQL research_messages is the durable, authorization-scoped
+        # conversation log.  Retain a sanitized legacy working state for
+        # rollback compatibility, but do not add provider-specific tool
+        # messages that can destabilize the next external request.
+        state = _strip_binary_attachment_content(memory_state or {})
+        yield {
+            "type": "complete",
+            "content": final_answer,
+            "memory_state": state,
+            "memory_summary": state.get("_compressed_summary") or None,
+        }
+        return
+
     # Imports are intentionally local. The data-governance APIs stay usable
     # while the optional model runtime is being rebuilt or upgraded.
     try:
@@ -523,10 +837,11 @@ async def stream_research_reply(
         from agentscope.model import OpenAIChatModel
         from agentscope.token import CharTokenCounter
     except Exception as exc:  # pragma: no cover - depends on image build
+        logger.exception("Unable to import the AgentScope research runtime")
         raise ResearchAgentError("AgentScope 运行环境不可用，请检查后端依赖安装。") from exc
 
-    base_url = os.getenv("SHENNONG_API_BASE_URL", "https://api.agent-tech.cc/api/v1").rstrip("/")
-    model_name = os.getenv("SHENNONG_MODEL", "sn").strip() or "sn"
+    base_url = settings.base_url
+    model_name = settings.model
     prepared_memory_state = _sanitize_memory_for_react(_compact_memory_state(memory_state))
     token_counter = CharTokenCounter()
     formatter = OpenAIChatFormatter(token_counter=token_counter)
@@ -733,18 +1048,17 @@ async def stream_research_reply(
             len(prepared_memory_state.get("content") or []),
         )
         if "401" in detail or "403" in detail:
-            raise ResearchAgentError("神农 API 鉴权失败，请检查服务器 .env 中的 SHENNONG_API_KEY。") from exc
+            raise ResearchAgentError("统一模型服务鉴权失败，请检查服务器的 LONGYUN_LLM_API_KEY。") from exc
         if "402" in detail or "insufficient_balance" in detail:
-            raise ResearchAgentError("神农 API 账户余额不足，请在神农控制台充值或补充调用额度。") from exc
+            raise ResearchAgentError("统一模型服务账户余额或调用额度不足，请联系平台管理员。") from exc
         if "429" in detail or "rate_limit" in detail:
-            raise ResearchAgentError("神农 API 当前请求过于频繁，请稍后重试。") from exc
+            raise ResearchAgentError("统一模型服务当前请求过于频繁，请稍后重试。") from exc
         if "CERTIFICATE_VERIFY_FAILED" in detail or "Hostname mismatch" in detail:
             raise ResearchAgentError(
-                "无法验证神农 API 的 TLS 证书，请检查 SHENNONG_API_BASE_URL。"
-                "当前项目应使用 https://api.agent-tech.cc/api/v1。"
+                "无法验证统一模型服务的 TLS 证书，请检查 LONGYUN_LLM_BASE_URL。"
             ) from exc
         if "Connection error" in detail or "ConnectError" in detail:
-            raise ResearchAgentError("无法连接神农 API，请检查服务器网络和 SHENNONG_API_BASE_URL。") from exc
+            raise ResearchAgentError("无法连接统一模型服务，请检查服务器网络和 LONGYUN_LLM_BASE_URL。") from exc
         raise ResearchAgentError(
             f"大模型调用未完成（错误编号 {error_id}）。后台已记录详细原因，请稍后重试；"
             "若持续出现，请将该编号提供给管理员。"
@@ -790,10 +1104,11 @@ async def _stream_native_vision_reply(
     try:
         import httpx
     except Exception as exc:  # pragma: no cover - installed in deployment image
-        raise ResearchAgentError("神农多模态运行环境不可用，请检查后端依赖安装。") from exc
+        raise ResearchAgentError("统一模型多模态运行环境不可用，请检查后端依赖安装。") from exc
 
-    base_url = os.getenv("SHENNONG_API_BASE_URL", "https://api.agent-tech.cc/api/v1").rstrip("/")
-    model_name = os.getenv("SHENNONG_MODEL", "sn").strip() or "sn"
+    settings = ProviderSettings.from_environment()
+    base_url = settings.base_url
+    model_name = settings.model
     history: list[dict[str, str]] = []
     for item in conversation_history[-8:]:
         role = item.get("role")

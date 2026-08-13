@@ -1,7 +1,10 @@
 [CmdletBinding()]
 param(
-    [string]$ReleaseTag = "v1.5.1",
-    [string]$OutputDirectory = "release-packages"
+    [string]$ReleaseTag = "v1.11.0-rc1",
+    [string]$OutputDirectory = "release-packages",
+    [string]$PythonCommand = "python",
+    [switch]$SkipValidation,
+    [switch]$SkipDockerValidation
 )
 
 $ErrorActionPreference = "Stop"
@@ -15,6 +18,7 @@ $hashPath = "$archivePath.sha256"
 $tempRoot = [System.IO.Path]::GetTempPath()
 $stageRoot = Join-Path $tempRoot ("longyun-agent-package-" + [guid]::NewGuid().ToString("N"))
 $stagePath = Join-Path $stageRoot $bundleName
+$validationScript = Join-Path $PSScriptRoot "validate-release.ps1"
 
 function Remove-StageDirectory {
     if (Test-Path -LiteralPath $stageRoot) {
@@ -38,6 +42,16 @@ function Remove-StageDirectory {
 }
 
 try {
+    if (-not $SkipValidation) {
+        & $validationScript `
+            -ReleaseTag $ReleaseTag `
+            -PythonCommand $PythonCommand `
+            -SkipDockerBuild:$SkipDockerValidation
+        if ($LASTEXITCODE -ne 0) {
+            throw "Release validation failed. No package was created."
+        }
+    }
+
     New-Item -ItemType Directory -Path $outputPath -Force | Out-Null
     New-Item -ItemType Directory -Path $stagePath -Force | Out-Null
 
@@ -46,10 +60,12 @@ try {
     # absolute /XD paths across the Windows robocopy builds used by developers.
     $excludedDirectories = @(
         ".git",
+        ".codex_tmp",
         "node_modules",
         "dist",
         "__pycache__",
         "tmp",
+        "docs",
         "raw",
         "research",
         "backups",
@@ -85,7 +101,11 @@ try {
         "backend\\.env",
         "backend\\.env.production",
         "frontend\\.env",
-        "frontend\\.env.production"
+        "frontend\\.env.production",
+        # Local development Realm imports may contain real demo passwords.
+        # Release archives use only deploy/keycloak Realm templates whose
+        # credential values are environment placeholders.
+        "keycloak\\rice-research-realm.json"
     )
     foreach ($relativePath in $explicitSecretFiles) {
         $candidate = Join-Path $stagePath $relativePath
@@ -114,11 +134,16 @@ try {
         throw "The Keycloak realm import is missing from the package. Demo accounts would not be created."
     }
 
+    $gitCommit = (& git -C $projectRoot rev-parse HEAD 2>$null)
+    $gitDirty = [bool](& git -C $projectRoot status --porcelain 2>$null)
     @(
         "Product: Longyun Agent Breeding Intelligence",
         "Release: $ReleaseTag",
+        "Git commit: $gitCommit",
+        "Source working tree dirty at package time: $gitDirty",
         "Build time: $(Get-Date -Format s)",
         "Deployment guide: deploy/LAN-DEPLOYMENT.md",
+        "Model data profile: external API + desensitized sandbox (configured at deployment)",
         "This package intentionally excludes .env files, TLS certificates, local databases, raw uploads, and research attachments."
     ) | Set-Content -LiteralPath (Join-Path $stagePath "RELEASE-MANIFEST.txt") -Encoding utf8
 
@@ -137,6 +162,7 @@ try {
         $_ -match '(^|/)\.env$' -or
         $_ -match '(^|/)deploy/\.env\.(production|lan)$' -or
         $_ -match '(^|/)deploy/certs/' -or
+        $_ -match '^[^/]+/keycloak/rice-research-realm\.json$' -or
         $_ -match '(^|/)data/(raw|research)/' -or
         $_ -match '\.(key|pem|pfx|p12)$'
     }

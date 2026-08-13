@@ -37,6 +37,8 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from .object_storage import ObjectStore, project_object_key
+
 
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024
 UPLOAD_CHUNK_BYTES = 10 * 1024 * 1024
@@ -56,6 +58,7 @@ class GenotypeAssetError(ValueError):
 
 
 class CreateGenotypeAssetRequest(BaseModel):
+    project_id: str = Field(min_length=36, max_length=36)
     title: str = Field(min_length=1, max_length=300)
     source_format: str = Field(pattern="^(vcf|plink_zip)$")
     reference_assembly: str = Field(default="IRGSP-1.0", min_length=1, max_length=120)
@@ -92,6 +95,14 @@ def _now() -> datetime:
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while block := handle.read(1024 * 1024):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _safe_name(value: str, fallback: str) -> str:
@@ -147,6 +158,7 @@ def ensure_genotype_asset_schema(session: Session) -> None:
         CREATE TABLE IF NOT EXISTS genotype_asset (
           id VARCHAR(36) PRIMARY KEY,
           owner_id VARCHAR(120) NOT NULL,
+          project_id VARCHAR(36),
           title VARCHAR(300) NOT NULL,
           source_format VARCHAR(30) NOT NULL,
           reference_assembly VARCHAR(120) NOT NULL,
@@ -253,6 +265,14 @@ def ensure_genotype_asset_schema(session: Session) -> None:
     )
     for statement in statements:
         session.execute(text(statement))
+    # Historical installations already have genotype_asset without project_id.
+    # Add the compatibility column before creating its index; otherwise startup
+    # fails before Alembic can upgrade the institution database.
+    session.execute(text("ALTER TABLE genotype_asset ADD COLUMN IF NOT EXISTS project_id VARCHAR(36)"))
+    session.execute(text(
+        "CREATE INDEX IF NOT EXISTS ix_genotype_asset_project_updated "
+        "ON genotype_asset(project_id, updated_at DESC)"
+    ))
     # Governance requests intentionally carry only the minimal asset label that
     # a data processor needs. This keeps the processor queue independent from
     # raw-file metadata and private genotype storage.
@@ -284,18 +304,62 @@ def ensure_genotype_asset_schema(session: Session) -> None:
             "summary": "首版水稻常规育种材料质控：MAF、样本/SNP 缺失率为硬过滤；杂合率异常仅标记；HWE 仅诊断；材料重复映射阻断发布。",
         })
 
-    # Private genotype records are database-isolated by the verified user id.
+    project_predicates = {
+        "genotype_asset": "project_id = current_setting('app.project_id', true)",
+        "genotype_asset_version": (
+            "EXISTS (SELECT 1 FROM genotype_asset a WHERE a.id = genotype_asset_version.asset_id "
+            "AND a.project_id = current_setting('app.project_id', true))"
+        ),
+        "genotype_processing_job": (
+            "EXISTS (SELECT 1 FROM genotype_asset a WHERE a.id = genotype_processing_job.asset_id "
+            "AND a.project_id = current_setting('app.project_id', true))"
+        ),
+        "genotype_upload_session": (
+            "EXISTS (SELECT 1 FROM genotype_asset a WHERE a.id = genotype_upload_session.asset_id "
+            "AND a.project_id = current_setting('app.project_id', true))"
+        ),
+        "genotype_sample_mapping": (
+            "EXISTS (SELECT 1 FROM genotype_asset_version v JOIN genotype_asset a ON a.id = v.asset_id "
+            "WHERE v.id = genotype_sample_mapping.version_id "
+            "AND a.project_id = current_setting('app.project_id', true))"
+        ),
+        "genotype_governance_request": (
+            "EXISTS (SELECT 1 FROM genotype_asset a WHERE a.id = genotype_governance_request.asset_id "
+            "AND a.project_id = current_setting('app.project_id', true))"
+        ),
+    }
+    has_project_access_helper = bool(session.scalar(text(
+        "SELECT to_regprocedure('public.longyun_can_access_project(character varying)') "
+        "IS NOT NULL"
+    )))
+    if has_project_access_helper:
+        project_predicates = {
+            table_name: (
+                f"({predicate}) AND "
+                "longyun_can_access_project(current_setting('app.project_id', true))"
+            )
+            for table_name, predicate in project_predicates.items()
+        }
+    # Private genotype records are isolated by both the verified user and the
+    # active project.  The former database-user bypass made FORCE RLS
+    # ineffective whenever the application connected as the table owner.
     for table_name in (
         "genotype_asset", "genotype_asset_version", "genotype_processing_job",
         "genotype_upload_session", "genotype_sample_mapping", "genotype_governance_request",
     ):
+        project_predicate = project_predicates[table_name]
         session.execute(text(f"ALTER TABLE {table_name} ENABLE ROW LEVEL SECURITY"))
         session.execute(text(f"ALTER TABLE {table_name} FORCE ROW LEVEL SECURITY"))
         session.execute(text(f"DROP POLICY IF EXISTS genotype_owner_only ON {table_name}"))
         session.execute(text(
             f"CREATE POLICY genotype_owner_only ON {table_name} FOR ALL "
-            "USING (owner_id = current_setting('app.research_user_id', true) OR current_user = 'rice') "
-            "WITH CHECK (owner_id = current_setting('app.research_user_id', true) OR current_user = 'rice')"
+            f"USING (owner_id = current_setting('app.research_user_id', true) AND ({project_predicate})) "
+            f"WITH CHECK (owner_id = current_setting('app.research_user_id', true) AND ({project_predicate}))"
+        ))
+    for table_name, predicate in project_predicates.items():
+        session.execute(text(f"DROP POLICY IF EXISTS genotype_project_read ON {table_name}"))
+        session.execute(text(
+            f"CREATE POLICY genotype_project_read ON {table_name} FOR SELECT USING ({predicate})"
         ))
     # A data processor can only read and update governance request summaries.
     # It does not receive a policy on genotype assets, uploads or mappings.
@@ -303,12 +367,15 @@ def ensure_genotype_asset_schema(session: Session) -> None:
     session.execute(text("DROP POLICY IF EXISTS genotype_governance_processor_update ON genotype_governance_request"))
     session.execute(text(
         "CREATE POLICY genotype_governance_processor_read ON genotype_governance_request FOR SELECT "
-        "USING (current_setting('app.genotype_governance_processor', true) = 'true' OR current_user = 'rice')"
+        "USING (current_setting('app.genotype_governance_processor', true) = 'true' AND "
+        f"({project_predicates['genotype_governance_request']}))"
     ))
     session.execute(text(
         "CREATE POLICY genotype_governance_processor_update ON genotype_governance_request FOR UPDATE "
-        "USING (current_setting('app.genotype_governance_processor', true) = 'true' OR current_user = 'rice') "
-        "WITH CHECK (current_setting('app.genotype_governance_processor', true) = 'true' OR current_user = 'rice')"
+        "USING (current_setting('app.genotype_governance_processor', true) = 'true' AND "
+        f"({project_predicates['genotype_governance_request']})) "
+        "WITH CHECK (current_setting('app.genotype_governance_processor', true) = 'true' AND "
+        f"({project_predicates['genotype_governance_request']}))"
     ))
     session.execute(text("ALTER TABLE genotype_qc_template ENABLE ROW LEVEL SECURITY"))
     session.execute(text("ALTER TABLE genotype_qc_template FORCE ROW LEVEL SECURITY"))
@@ -319,7 +386,7 @@ def ensure_genotype_asset_schema(session: Session) -> None:
 
 def _version_summary(session: Session, version_id: str) -> dict[str, Any]:
     version = session.execute(text("""
-        SELECT version.*, asset.title AS asset_title, asset.source_format, asset.population_type,
+        SELECT version.*, asset.title AS asset_title, asset.project_id, asset.source_format, asset.population_type,
                asset.raw_file_name, asset.raw_sha256
         FROM genotype_asset_version version
         JOIN genotype_asset asset ON asset.id = version.asset_id
@@ -328,9 +395,11 @@ def _version_summary(session: Session, version_id: str) -> dict[str, Any]:
     if not version:
         raise GenotypeAssetError("未找到当前账号的基因型版本。")
     mappings = session.execute(text("""
-        SELECT mapping.*, material.material_code, material.material_name, material.aliases
+        SELECT mapping.*, material.material_code, material.material_name, material.aliases,
+               plant.sample_code
         FROM genotype_sample_mapping mapping
         LEFT JOIN breeding_material material ON material.id = mapping.material_id
+        LEFT JOIN biological_sample plant ON plant.id = mapping.sample_id
         WHERE mapping.version_id = :version_id
         ORDER BY mapping.iid, mapping.fid
     """), {"version_id": version_id}).mappings().all()
@@ -343,7 +412,7 @@ def _version_summary(session: Session, version_id: str) -> dict[str, Any]:
     material_ids = [str(item["material_id"]) for item in mappings if item["status"] == "mapped" and item["material_id"]]
     duplicate_material_count = len(material_ids) - len(set(material_ids))
     return {
-        "id": version["id"], "asset_id": version["asset_id"], "title": version["asset_title"],
+        "id": version["id"], "asset_id": version["asset_id"], "project_id": version["project_id"], "title": version["asset_title"],
         "version_number": version["version_number"], "status": version["status"],
         "source_format": version["source_format"], "reference_assembly": version["reference_assembly"],
         "population_type": version["population_type"], "population_type_label": SUPPORTED_POPULATIONS.get(version["population_type"], version["population_type"]),
@@ -360,6 +429,7 @@ def _version_summary(session: Session, version_id: str) -> dict[str, Any]:
         "job": ({**dict(job), "created_at": job["created_at"].isoformat(), "started_at": job["started_at"].isoformat() if job["started_at"] else None, "completed_at": job["completed_at"].isoformat() if job["completed_at"] else None} if job else None),
         "mappings": [{
             "id": item["id"], "fid": item["fid"], "iid": item["iid"], "material_id": item["material_id"],
+            "sample_id": item["sample_id"], "sample_code": item["sample_code"],
             "material_code": item["material_code"], "material_name": item["material_name"],
             "aliases": item["aliases"] or [], "status": item["status"], "note": item["note"] or "",
         } for item in mappings],
@@ -371,11 +441,11 @@ def _version_summary(session: Session, version_id: str) -> dict[str, Any]:
     }
 
 
-def list_assets(session: Session) -> list[dict[str, Any]]:
+def list_assets(session: Session, project_id: str) -> list[dict[str, Any]]:
     rows = session.execute(text("""
         SELECT id, current_version_id FROM genotype_asset
-        WHERE archived_at IS NULL ORDER BY updated_at DESC
-    """)).mappings().all()
+        WHERE archived_at IS NULL AND project_id = :project_id ORDER BY updated_at DESC
+    """), {"project_id": project_id}).mappings().all()
     items: list[dict[str, Any]] = []
     for row in rows:
         if row["current_version_id"]:
@@ -384,7 +454,7 @@ def list_assets(session: Session) -> list[dict[str, Any]]:
             asset = session.execute(text("SELECT * FROM genotype_asset WHERE id = :id"), {"id": row["id"]}).mappings().first()
             if asset:
                 items.append({
-                    "id": None, "asset_id": asset["id"], "title": asset["title"], "version_number": 0,
+                    "id": None, "asset_id": asset["id"], "project_id": asset["project_id"], "title": asset["title"], "version_number": 0,
                     "status": asset["status"], "source_format": asset["source_format"], "reference_assembly": asset["reference_assembly"],
                     "population_type": asset["population_type"], "population_type_label": SUPPORTED_POPULATIONS.get(asset["population_type"], asset["population_type"]),
                     "qc_summary": {}, "mapping_summary": {"total": 0, "mapped": 0, "unmapped": 0}, "job": None,
@@ -409,9 +479,9 @@ def create_asset(session: Session, owner_id: str, payload: CreateGenotypeAssetRe
     asset_id = str(uuid.uuid4())
     session.execute(text("""
         INSERT INTO genotype_asset
-        (id, owner_id, title, source_format, reference_assembly, population_type, status, created_at, updated_at)
-        VALUES (:id, :owner_id, :title, :source_format, :assembly, :population_type, 'awaiting_upload', :now, :now)
-    """), {"id": asset_id, "owner_id": owner_id, "title": payload.title.strip(), "source_format": payload.source_format,
+        (id, owner_id, project_id, title, source_format, reference_assembly, population_type, status, created_at, updated_at)
+        VALUES (:id, :owner_id, :project_id, :title, :source_format, :assembly, :population_type, 'awaiting_upload', :now, :now)
+    """), {"id": asset_id, "owner_id": owner_id, "project_id": payload.project_id, "title": payload.title.strip(), "source_format": payload.source_format,
              "assembly": payload.reference_assembly.strip(), "population_type": payload.population_type, "now": _now()})
     return {"asset_id": asset_id, "status": "awaiting_upload", "upload_chunk_bytes": UPLOAD_CHUNK_BYTES}
 
@@ -480,7 +550,14 @@ def record_upload_chunk(session: Session, upload_id: str, index: int) -> None:
     session.execute(text("UPDATE genotype_upload_session SET received_chunks = CAST(:chunks AS jsonb) WHERE id = :id"), {"id": upload_id, "chunks": _json(sorted(chunks))})
 
 
-def complete_upload(session: Session, owner_id: str, asset_id: str, upload_id: str, storage_dir: Path) -> dict[str, Any]:
+def complete_upload(
+    session: Session,
+    owner_id: str,
+    asset_id: str,
+    upload_id: str,
+    storage_dir: Path,
+    object_store: ObjectStore | None = None,
+) -> dict[str, Any]:
     upload = session.execute(text("SELECT * FROM genotype_upload_session WHERE id = :id AND asset_id = :asset_id"), {"id": upload_id, "asset_id": asset_id}).mappings().first()
     asset = session.execute(text("SELECT * FROM genotype_asset WHERE id = :id"), {"id": asset_id}).mappings().first()
     if not upload or not asset:
@@ -511,6 +588,21 @@ def complete_upload(session: Session, owner_id: str, asset_id: str, upload_id: s
         raise GenotypeAssetError("合并后的文件大小与上传声明不一致，请重新上传。")
     temporary.replace(target)
     shutil.rmtree(upload_dir, ignore_errors=True)
+    raw_storage_path = str(target)
+    if object_store is not None:
+        stored = object_store.put_file(
+            project_object_key(
+                project_id=None,
+                category="genotype-raw",
+                resource_id=asset_id,
+                owner_user_id=owner_id,
+                file_name=target.name,
+            ),
+            target,
+            "application/octet-stream",
+        )
+        raw_storage_path = stored.locator
+        target.unlink(missing_ok=True)
     version_id = str(uuid.uuid4())
     version_number = int(session.execute(text("SELECT COALESCE(MAX(version_number), 0) + 1 FROM genotype_asset_version WHERE asset_id = :asset_id"), {"asset_id": asset_id}).scalar_one())
     session.execute(text("""
@@ -519,7 +611,7 @@ def complete_upload(session: Session, owner_id: str, asset_id: str, upload_id: s
         VALUES (:id, :asset_id, :owner_id, :version_number, 'queued', :template_code, :template_version, :assembly, CAST(:snapshot AS jsonb), :now, :now)
     """), {"id": version_id, "asset_id": asset_id, "owner_id": owner_id, "version_number": version_number,
              "template_code": RICE_QC_TEMPLATE_CODE, "template_version": RICE_QC_TEMPLATE_VERSION, "assembly": asset["reference_assembly"],
-             "snapshot": _json({"raw_file_name": target.name, "raw_storage_path": str(target), "raw_size_bytes": written, "raw_sha256": digest.hexdigest(), "source_format": asset["source_format"]}), "now": _now()})
+             "snapshot": _json({"raw_file_name": target.name, "raw_storage_path": raw_storage_path, "raw_size_bytes": written, "raw_sha256": digest.hexdigest(), "source_format": asset["source_format"]}), "now": _now()})
     job_id = str(uuid.uuid4())
     session.execute(text("""
         INSERT INTO genotype_processing_job(id, asset_id, version_id, owner_id, status, progress_label)
@@ -529,7 +621,7 @@ def complete_upload(session: Session, owner_id: str, asset_id: str, upload_id: s
         UPDATE genotype_asset SET status = 'queued', raw_file_name = :name, raw_storage_path = :path,
           raw_size_bytes = :size, raw_sha256 = :sha, current_version_id = :version_id, updated_at = :now
         WHERE id = :asset_id
-    """), {"name": target.name, "path": str(target), "size": written, "sha": digest.hexdigest(), "version_id": version_id, "now": _now(), "asset_id": asset_id})
+    """), {"name": target.name, "path": raw_storage_path, "size": written, "sha": digest.hexdigest(), "version_id": version_id, "now": _now(), "asset_id": asset_id})
     session.execute(text("UPDATE genotype_upload_session SET completed_at = :now WHERE id = :id"), {"now": _now(), "id": upload_id})
     return {"asset_id": asset_id, "version_id": version_id, "job_id": job_id, "status": "queued"}
 
@@ -887,7 +979,16 @@ def _build_qc_artifacts(
     return pdf_path, package_path, workbook_path, mapping_csv
 
 
-def _archive_qc_result(session: Session, owner_id: str, version_id: str, title: str, package_path: Path, summary: dict[str, Any]) -> None:
+def _archive_qc_result(
+    session: Session,
+    owner_id: str,
+    version_id: str,
+    title: str,
+    package_locator: str,
+    package_file_name: str,
+    package_size: int,
+    summary: dict[str, Any],
+) -> None:
     existing = session.execute(text("""
         SELECT id FROM research_result WHERE owner_id = :owner_id AND analysis_run_id = :version_id AND result_type = 'genotype_qc_package'
     """), {"owner_id": owner_id, "version_id": version_id}).scalar()
@@ -898,7 +999,7 @@ def _archive_qc_result(session: Session, owner_id: str, version_id: str, title: 
                 summary=:summary, metadata=CAST(:metadata AS jsonb)
             WHERE id=:id
         """), {"id": existing, "title": f"{title} · 基因型导入与质控结果包",
-               "file_name": package_path.name, "size": package_path.stat().st_size, "path": str(package_path),
+               "file_name": package_file_name, "size": package_size, "path": package_locator,
                "summary": "材料映射已完整确认后的正式质控结果包，包含 PDF、样本/SNP 质控表、已确认映射表和处理工作簿；PLINK 三件套仅供后续受控分析调用。",
                "metadata": _json({"generated_from": "local_genotype_qc", "formal_analysis_ready": True, "qc_summary": summary})})
         return
@@ -907,12 +1008,16 @@ def _archive_qc_result(session: Session, owner_id: str, version_id: str, title: 
         (id, owner_id, session_id, source_message_id, analysis_run_id, result_type, title, content_type, file_name, size_bytes, storage_path, summary, metadata, created_at)
         VALUES (:id, :owner_id, NULL, NULL, :version_id, 'genotype_qc_package', :title, 'application/zip', :file_name, :size, :path, :summary, CAST(:metadata AS jsonb), :created_at)
     """), {"id": str(uuid.uuid4()), "owner_id": owner_id, "version_id": version_id, "title": f"{title} · 基因型导入与质控结果包",
-             "file_name": package_path.name, "size": package_path.stat().st_size, "path": str(package_path),
+             "file_name": package_file_name, "size": package_size, "path": package_locator,
              "summary": "材料映射已完整确认后的正式质控结果包，包含 PDF、样本/SNP 质控表、已确认映射表和处理工作簿；PLINK 三件套仅供后续受控分析调用。",
              "metadata": _json({"generated_from": "local_genotype_qc", "formal_analysis_ready": True, "qc_summary": summary}), "created_at": _now()})
 
 
-def run_next_job(session: Session, storage_dir: Path) -> bool:
+def run_next_job(
+    session: Session,
+    storage_dir: Path,
+    object_store: ObjectStore | None = None,
+) -> bool:
     """Process one queued conversion/QC job. Designed for the persistent worker."""
     job = session.execute(text("""
         SELECT * FROM genotype_processing_job WHERE status = 'queued'
@@ -928,9 +1033,24 @@ def run_next_job(session: Session, storage_dir: Path) -> bool:
         asset = session.execute(text("SELECT * FROM genotype_asset WHERE id=:id"), {"id": job["asset_id"]}).mappings().one()
         version = session.execute(text("SELECT * FROM genotype_asset_version WHERE id=:id"), {"id": job["version_id"]}).mappings().one()
         snapshot = version["source_snapshot"] or {}
-        raw_path = Path(str(snapshot.get("raw_storage_path") or ""))
-        if not raw_path.is_file(): raise GenotypeAssetError("原始基因型文件不存在，无法继续处理。")
+        raw_locator = str(snapshot.get("raw_storage_path") or "")
         version_dir = _asset_dir(storage_dir, str(job["owner_id"]), str(job["asset_id"])) / f"version-{version['version_number']}"
+        if raw_locator.startswith("s3://"):
+            if object_store is None:
+                raise GenotypeAssetError("The genotype object store is not configured for this tenant worker.")
+            raw_dir = version_dir / "raw-input"
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            raw_path = raw_dir / _safe_name(
+                str(snapshot.get("raw_file_name") or "genotype.bin"),
+                "genotype.bin",
+            )
+            object_store.copy_to(raw_locator, raw_path)
+            expected_sha256 = str(snapshot.get("raw_sha256") or "")
+            if expected_sha256 and _file_sha256(raw_path) != expected_sha256:
+                raise GenotypeAssetError("The genotype object checksum does not match the upload record.")
+        else:
+            raw_path = Path(raw_locator)
+        if not raw_path.is_file(): raise GenotypeAssetError("原始基因型文件不存在，无法继续处理。")
         work_dir = version_dir / "work"; work_dir.mkdir(parents=True, exist_ok=True)
         plink_dir = version_dir / "plink"; plink_dir.mkdir(parents=True, exist_ok=True)
         if asset["source_format"] == "vcf":
@@ -983,6 +1103,20 @@ def run_next_job(session: Session, storage_dir: Path) -> bool:
             version_dir, str(asset["title"]), int(version["version_number"]), summary,
             sample_rows, snp_rows, qc_samples, include_package=False,
         )
+        report_path = str(pdf_path)
+        if object_store is not None:
+            stored_report = object_store.put_file(
+                project_object_key(
+                    project_id=None,
+                    category="genotype-qc-reports",
+                    resource_id=str(version["id"]),
+                    owner_user_id=str(job["owner_id"]),
+                    file_name=pdf_path.name,
+                ),
+                pdf_path,
+                "application/pdf",
+            )
+            report_path = stored_report.locator
         for fid, iid in qc_samples:
             session.execute(text("""
                 INSERT INTO genotype_sample_mapping(id, version_id, owner_id, fid, iid, status, note, updated_at)
@@ -993,7 +1127,7 @@ def run_next_job(session: Session, storage_dir: Path) -> bool:
         session.execute(text("""
             UPDATE genotype_asset_version SET status=:status, qc_summary=CAST(:summary AS jsonb), plink_prefix='qc', plink_directory=:plink_dir,
               report_path=:report_path, package_path=:package_path, updated_at=:now WHERE id=:id
-        """), {"status": next_status, "summary": _json(summary), "plink_dir": str(plink_dir), "report_path": str(pdf_path), "package_path": None, "now": _now(), "id": version["id"]})
+        """), {"status": next_status, "summary": _json(summary), "plink_dir": str(plink_dir), "report_path": report_path, "package_path": None, "now": _now(), "id": version["id"]})
         session.execute(text("UPDATE genotype_asset SET status=:status, updated_at=:now WHERE id=:id"), {"status": next_status, "now": _now(), "id": asset["id"]})
         session.execute(text("UPDATE genotype_processing_job SET status='completed', progress_label='质控已完成，等待科研人员确认材料映射', completed_at=:now WHERE id=:id"), {"now": _now(), "id": job["id"]})
         session.commit()
@@ -1006,15 +1140,17 @@ def run_next_job(session: Session, storage_dir: Path) -> bool:
     return True
 
 
-def list_material_suggestions(session: Session, keyword: str, limit: int = 30) -> list[dict[str, Any]]:
+def list_material_suggestions(session: Session, keyword: str, project_id: str, limit: int = 30) -> list[dict[str, Any]]:
     term = (keyword or "").strip()
     pattern = f"%{term}%"
     rows = session.execute(text("""
-        SELECT id, material_code, material_name, aliases, material_type
-        FROM breeding_material
-        WHERE :term = '' OR material_code ILIKE :pattern OR material_name ILIKE :pattern OR CAST(aliases AS text) ILIKE :pattern
-        ORDER BY material_code LIMIT :limit
-    """), {"term": term, "pattern": pattern, "limit": limit}).mappings().all()
+        SELECT material.id, material.material_code, material.material_name, material.aliases, material.material_type
+        FROM breeding_material material
+        JOIN data_material_project_scope scope ON scope.material_id = material.id
+        WHERE scope.project_id = :project_id
+          AND (:term = '' OR material.material_code ILIKE :pattern OR material.material_name ILIKE :pattern OR CAST(material.aliases AS text) ILIKE :pattern)
+        ORDER BY material.material_code LIMIT :limit
+    """), {"project_id": project_id, "term": term, "pattern": pattern, "limit": limit}).mappings().all()
     return [{"id": row["id"], "material_code": row["material_code"], "material_name": row["material_name"], "aliases": row["aliases"] or [], "material_type": row["material_type"]} for row in rows]
 
 
@@ -1146,7 +1282,12 @@ def build_mapping_template(session: Session, version_id: str) -> bytes:
     return ("\ufeff" + output.getvalue()).encode("utf-8")
 
 
-def publish_analysis_ready(session: Session, owner_id: str, version_id: str) -> dict[str, Any]:
+def publish_analysis_ready(
+    session: Session,
+    owner_id: str,
+    version_id: str,
+    object_store: ObjectStore | None = None,
+) -> dict[str, Any]:
     version = session.execute(text("SELECT * FROM genotype_asset_version WHERE id=:id"), {"id": version_id}).mappings().first()
     if not version:
         raise GenotypeAssetError("未找到当前账号的基因型版本。")
@@ -1183,15 +1324,51 @@ def publish_analysis_ready(session: Session, owner_id: str, version_id: str) -> 
     )
     if package_path is None:
         raise GenotypeAssetError("未能生成正式质控结果包；请稍后重试发布。")
+    report_locator = str(pdf_path)
+    package_locator = str(package_path)
+    if object_store is not None:
+        stored_report = object_store.put_file(
+            project_object_key(
+                project_id=None,
+                category="genotype-qc-reports",
+                resource_id=version_id,
+                owner_user_id=owner_id,
+                file_name=pdf_path.name,
+            ),
+            pdf_path,
+            "application/pdf",
+        )
+        stored_package = object_store.put_file(
+            project_object_key(
+                project_id=None,
+                category="genotype-qc-packages",
+                resource_id=version_id,
+                owner_user_id=owner_id,
+                file_name=package_path.name,
+            ),
+            package_path,
+            "application/zip",
+        )
+        report_locator = stored_report.locator
+        package_locator = stored_package.locator
     now = _now()
     session.execute(text("""
         UPDATE genotype_asset_version
         SET status='analysis_ready', qc_summary=CAST(:summary AS jsonb), report_path=:report_path,
             package_path=:package_path, published_at=:now, published_by=:owner_id, updated_at=:now
         WHERE id=:id
-    """), {"summary": _json(summary), "report_path": str(pdf_path), "package_path": str(package_path), "now": now, "owner_id": owner_id, "id": version_id})
+    """), {"summary": _json(summary), "report_path": report_locator, "package_path": package_locator, "now": now, "owner_id": owner_id, "id": version_id})
     session.execute(text("UPDATE genotype_asset SET status='analysis_ready', current_version_id=:version_id, updated_at=:now WHERE id=:asset_id"), {"version_id": version_id, "now": now, "asset_id": version["asset_id"]})
-    _archive_qc_result(session, owner_id, version_id, str(asset["title"]), package_path, summary)
+    _archive_qc_result(
+        session,
+        owner_id,
+        version_id,
+        str(asset["title"]),
+        package_locator,
+        package_path.name,
+        package_path.stat().st_size,
+        summary,
+    )
     return _version_summary(session, version_id)
 
 
@@ -1245,7 +1422,7 @@ def create_governance_request(session: Session, owner_id: str, asset_id: str, ve
     return {"id": request_id, "status": "submitted", "message": "数据治理申请已提交。原始基因型文件仍保持私有，处理人员仅会看到申请范围与经授权的任务文件。"}
 
 
-def list_governance_requests(session: Session) -> list[dict[str, Any]]:
+def list_governance_requests(session: Session, project_id: str) -> list[dict[str, Any]]:
     """Return metadata-only requests for the data-processing workbench.
 
     This deliberately omits storage paths, hashes and raw-file names. The current
@@ -1259,10 +1436,12 @@ def list_governance_requests(session: Session) -> list[dict[str, Any]]:
                request.resolved_by, request.resolution_note,
                request.asset_title_snapshot, request.version_number_snapshot
         FROM genotype_governance_request request
+        JOIN genotype_asset asset ON asset.id = request.asset_id
+        WHERE asset.project_id = :project_id
         ORDER BY CASE request.status
           WHEN 'submitted' THEN 0 WHEN 'needs_info' THEN 1 WHEN 'accepted' THEN 2 ELSE 3 END,
           request.created_at DESC
-    """)).mappings().all()
+    """), {"project_id": project_id}).mappings().all()
     return [{
         "id": row["id"],
         "asset_id": row["asset_id"],
@@ -1285,8 +1464,14 @@ def resolve_governance_request(
     request_id: str,
     processor: str,
     payload: GovernanceRequestResolution,
+    project_id: str,
 ) -> dict[str, Any]:
-    row = session.execute(text("SELECT id FROM genotype_governance_request WHERE id=:id"), {"id": request_id}).scalar()
+    row = session.execute(text("""
+        SELECT request.id
+        FROM genotype_governance_request request
+        JOIN genotype_asset asset ON asset.id = request.asset_id
+        WHERE request.id = :id AND asset.project_id = :project_id
+    """), {"id": request_id, "project_id": project_id}).scalar()
     if not row:
         raise GenotypeAssetError("未找到该基因型数据治理申请。")
     resolved_at = _now() if payload.status == "resolved" else None
@@ -1304,27 +1489,39 @@ def resolve_governance_request(
     return {"id": request_id, "status": payload.status, "resolution_note": payload.resolution_note.strip()}
 
 
-def analysis_ready_versions(session: Session) -> list[dict[str, Any]]:
+def analysis_ready_versions(session: Session, project_id: str) -> list[dict[str, Any]]:
     rows = session.execute(text("""
-        SELECT id FROM genotype_asset_version WHERE status='analysis_ready' ORDER BY published_at DESC
-    """)).scalars().all()
+        SELECT version.id
+        FROM genotype_asset_version version
+        JOIN genotype_asset asset ON asset.id = version.asset_id
+        WHERE version.status='analysis_ready' AND asset.project_id = :project_id
+        ORDER BY version.published_at DESC
+    """), {"project_id": project_id}).scalars().all()
     return [_version_summary(session, str(version_id)) for version_id in rows]
 
 
-def artifact_path(session: Session, version_id: str, kind: str) -> tuple[Path, str]:
+def artifact_path(session: Session, version_id: str, kind: str) -> tuple[str, str, str]:
     version = session.execute(text("SELECT status, report_path, package_path FROM genotype_asset_version WHERE id=:id"), {"id": version_id}).mappings().first()
     if not version:
         raise GenotypeAssetError("未找到基因型版本。")
     if kind == "package" and version["status"] != "analysis_ready":
         raise GenotypeAssetError("正式结果包将在材料映射全部确认并人工发布后开放下载。当前可下载预质控报告用于核验。")
     key = "report_path" if kind == "report" else "package_path"
-    path = Path(str(version[key] or ""))
-    if not path.is_file():
+    locator = str(version[key] or "")
+    if not locator:
+        raise GenotypeAssetError("The requested genotype QC artifact is not available.")
+    if not locator.startswith("s3://") and not Path(locator).is_file():
         raise GenotypeAssetError("该质控产物尚未生成或已被清理。")
-    return path, "application/pdf" if kind == "report" else "application/zip"
+    file_name = locator.rsplit("/", 1)[-1]
+    return locator, "application/pdf" if kind == "report" else "application/zip", file_name
 
 
-def worker_loop(database_url: str, storage_dir: Path, poll_seconds: float = 2.0) -> None:
+def worker_loop(
+    database_url: str,
+    storage_dir: Path,
+    object_store: ObjectStore | None = None,
+    poll_seconds: float = 2.0,
+) -> None:
     """Run forever inside the compose worker container."""
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
@@ -1333,7 +1530,7 @@ def worker_loop(database_url: str, storage_dir: Path, poll_seconds: float = 2.0)
     while True:
         with maker() as session:
             try:
-                processed = run_next_job(session, storage_dir)
+                processed = run_next_job(session, storage_dir, object_store)
             except Exception:
                 session.rollback()
                 processed = False

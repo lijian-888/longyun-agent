@@ -1,11 +1,14 @@
 beautifulsoup4==4.13.5
+alembic==1.19.1
 agentscope==1.0.21
 asyncpg==0.30.0
 docling==2.113.0
 fastapi==0.115.6
 httpx==0.28.1
 modelscope==1.38.1
+minio>=7.2.15,<8
 openpyxl==3.1.5
+xlrd==2.0.1
 pandas==2.2.3
 paddleocr==3.7.0
 paddlepaddle==3.3.1

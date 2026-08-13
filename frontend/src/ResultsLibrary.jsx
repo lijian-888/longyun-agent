@@ -35,7 +35,7 @@ function startDownload(blob, fileName) {
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-export default function ResultsLibrary({ onNotice }) {
+export default function ResultsLibrary({ onNotice, projectId }) {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState("");
@@ -44,7 +44,11 @@ export default function ResultsLibrary({ onNotice }) {
   async function loadResults() {
     setLoading(true);
     try {
-      setItems(await request("/api/research/results"));
+      if (!projectId) {
+        setItems([]);
+        return;
+      }
+      setItems(await request(`/api/research/results?project_id=${encodeURIComponent(projectId)}`));
     } catch (error) {
       onNotice(error.message || "无法读取结果库。");
     } finally {
@@ -52,7 +56,7 @@ export default function ResultsLibrary({ onNotice }) {
     }
   }
 
-  useEffect(() => { void loadResults(); }, []);
+  useEffect(() => { void loadResults(); }, [projectId]);
 
   const filtered = useMemo(() => activeType === "all"
     ? items
@@ -64,7 +68,7 @@ export default function ResultsLibrary({ onNotice }) {
   async function downloadResult(item) {
     setBusyId(item.id);
     try {
-      const response = await authorizedFetch(`/api/research/results/${item.id}/download`);
+      const response = await authorizedFetch(`/api/research/results/${item.id}/download?project_id=${encodeURIComponent(projectId)}`);
       if (!response.ok) {
         const payload = await response.json().catch(() => ({}));
         throw new Error(payload.detail || "无法下载该研究产物。");
@@ -81,7 +85,7 @@ export default function ResultsLibrary({ onNotice }) {
     if (!window.confirm(`确认删除“${item.title}”吗？此操作只删除当前账号的结果库副本。`)) return;
     setBusyId(item.id);
     try {
-      await request(`/api/research/results/${item.id}`, { method: "DELETE" });
+      await request(`/api/research/results/${item.id}?project_id=${encodeURIComponent(projectId)}`, { method: "DELETE" });
       setItems((current) => current.filter((entry) => entry.id !== item.id));
       onNotice("研究产物已从结果库删除。");
     } catch (error) {

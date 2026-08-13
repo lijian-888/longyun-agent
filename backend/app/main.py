@@ -31,22 +31,64 @@ from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, create_engine, event, func, select, text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, event, func, select, text, update
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 from pgvector.sqlalchemy import Vector
 
 from .auth import (
     CurrentUser,
     audit_actor,
+    get_current_user,
     require_data_platform_user,
     require_data_processor,
     require_field_admin,
+    require_genotype_user,
     require_knowledge_admin,
     require_knowledge_user,
     require_published_data_reader,
     require_researcher,
 )
+from .tenancy import (
+    TenantAccessError,
+    TenantConfigurationError,
+    tenant_database_manager,
+)
+from .object_storage import (
+    ObjectStorageError,
+    object_storage_manager,
+    project_object_key,
+    safe_object_segment,
+)
+from .schema_migrations import run_business_schema_migrations
+from .ai.api import AgentApiDependencies, build_agent_router
+from .ai.model_policy import (
+    ModelDataPolicyError,
+    assert_model_payload_allowed,
+    evidence_classifications,
+    get_model_data_policy,
+)
+from .ai.workflow_store import ensure_agent_workflow_schema, ensure_institution
+from .ai.usage import start_ai_usage, update_ai_usage, utc_milliseconds_since
+from .acps.api import AcpsApiDependencies, build_acps_router
+from .acps.config import AcpsSettings
+from .acps.store import ensure_acps_schema
 from .document_parser import SUPPORTED_SUFFIXES, VISION_IMAGE_SUFFIXES, parse_local_document
+from .data_spine import (
+    DATA_DOMAIN_LABELS,
+    FEATURE_REQUIREMENTS,
+    assess_project_readiness,
+    create_import_batch,
+    ensure_canonical_material,
+    ensure_pedigree_relationships,
+    publish_ready_batches_for_sources,
+    record_entity_lineage,
+    refresh_import_batch_counts,
+    register_import_file,
+    transition_import_batch,
+)
+from .data_spine_api import DataSpineApiDependencies, assert_project_access, build_data_spine_router
+from .research_sessions import DEFAULT_RESEARCH_SESSION_TITLE, summarize_research_session_title
 from .genomics import (
     AttachGenotypeAssetRequest,
     CreateGwasPlanRequest,
@@ -111,6 +153,11 @@ from .published_data_query import (
     plan_query_from_structured_request,
     template_catalog,
 )
+from .project_data_query import (
+    ProjectDataQueryError,
+    project_data_catalog,
+    query_project_data,
+)
 from .research_agent import (
     EmptyResearchAnswerError,
     ResearchAgentError,
@@ -127,7 +174,6 @@ from .breeding_dossier import (
     build_breeding_report_pdf,
     ensure_breeding_dossier_schema,
     is_breeding_report_request,
-    seed_mock_breeding_dossiers,
 )
 from .trial_package import (
     build_published_trial_evidence,
@@ -137,6 +183,30 @@ from .trial_package import (
     publish_trial_package,
     retire_legacy_seeded_trial_demo,
     upload_trial_package,
+)
+from .single_plant import (
+    MAX_IMPORT_BYTES as SINGLE_PLANT_MAX_IMPORT_BYTES,
+    SinglePlantError,
+    SinglePlantGenotypeMappingRequest,
+    SinglePlantImportPayload,
+    SinglePlantObservationRequest,
+    SinglePlantSelectionRequest,
+    ensure_single_plant_schema,
+    get_base_dashboard,
+    get_base_plot_plants,
+    get_single_plant_detail,
+    get_variety_evaluation,
+    list_material_single_plants,
+    lookup_single_plants,
+    map_genotype_to_single_plant,
+    parse_single_plant_package,
+    parse_single_plant_workbook,
+    preview_single_plant_package,
+    preview_single_plant_import,
+    publish_single_plant_package,
+    publish_single_plant_import,
+    record_single_plant_observation,
+    record_single_plant_selection,
 )
 
 
@@ -148,6 +218,7 @@ MIGRATION_DATABASE_URL = os.getenv("MIGRATION_DATABASE_URL", DATABASE_URL)
 APP_DATABASE_ROLE = os.getenv("APP_DATABASE_ROLE", "rice_app")
 APP_DATABASE_PASSWORD = os.getenv("APP_DATABASE_PASSWORD", "rice_app_demo_password")
 DEPLOYMENT_ENV = os.getenv("DEPLOYMENT_ENV", "development").strip().lower()
+ACPS_SETTINGS = AcpsSettings.from_env()
 CORS_ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:5183").split(",")
@@ -162,12 +233,33 @@ RAW_STORAGE_DIR = Path(os.getenv("RAW_STORAGE_DIR", "./data/raw"))
 RESEARCH_STORAGE_DIR = Path(os.getenv("RESEARCH_STORAGE_DIR", "./data/research"))
 
 
+def _tenant_workspace(root: Path, institution_id: str, category: str) -> Path:
+    """Return an institution-exclusive local compute workspace.
+
+    MinIO is the durable file store in multi-tenant deployments.  Tools such as
+    PLINK and the trial-package parser still require local paths, so their
+    temporary and generated files are kept under a tenant-specific directory.
+    """
+    path = root / "workspaces" / safe_object_segment(institution_id) / safe_object_segment(category)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _tenant_raw_workspace(institution_id: str) -> Path:
+    return _tenant_workspace(RAW_STORAGE_DIR, institution_id, "imports")
+
+
+def _tenant_research_workspace(institution_id: str) -> Path:
+    return _tenant_workspace(RESEARCH_STORAGE_DIR, institution_id, "research")
+
+
 def _unsafe_production_value(value: str) -> bool:
     """Identify values that are acceptable in a demo but unsafe for deployment."""
     normalized = (value or "").strip().lower()
     return not normalized or any(marker in normalized for marker in (
         "replace-with",
         "change-me",
+        "change_me",
         "demo_password",
         "rice_demo_password",
         "rice_app_demo_password",
@@ -185,17 +277,40 @@ def validate_runtime_configuration() -> None:
     if DEPLOYMENT_ENV not in {"production", "staging"}:
         return
 
+    if ACPS_SETTINGS.enabled and not ACPS_SETTINGS.require_mtls_proxy:
+        raise RuntimeError("生产环境启用 AIP 时不允许关闭 mTLS 代理验证")
+
     issuer = os.getenv("KEYCLOAK_ISSUER", "")
     jwks_url = os.getenv("KEYCLOAK_JWKS_URL", "")
     checks = {
-        "DATABASE_URL": DATABASE_URL,
-        "MIGRATION_DATABASE_URL": MIGRATION_DATABASE_URL,
-        "APP_DATABASE_PASSWORD": APP_DATABASE_PASSWORD,
         "KEYCLOAK_ISSUER": issuer,
         "KEYCLOAK_JWKS_URL": jwks_url,
         "CORS_ALLOWED_ORIGINS": ",".join(CORS_ALLOWED_ORIGINS),
         "TRUSTED_HOSTS": ",".join(TRUSTED_HOSTS),
     }
+    if tenant_database_manager.mode == "multi":
+        checks["CONTROL_DATABASE_URL"] = tenant_database_manager.control_database_url
+        try:
+            bootstrap_entries = json.loads(os.getenv("TENANT_BOOTSTRAP_JSON", "[]"))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("TENANT_BOOTSTRAP_JSON is not valid JSON") from exc
+        for entry in bootstrap_entries if isinstance(bootstrap_entries, list) else []:
+            institution_id = str(entry.get("institution_id") or "unknown")
+            for field in (
+                "database_url_secret",
+                "migration_database_url_secret",
+                "object_access_key_secret",
+                "object_secret_key_secret",
+            ):
+                secret_name = str(entry.get(field) or "").strip()
+                if secret_name:
+                    checks[f"{institution_id}:{field}"] = os.getenv(secret_name, "")
+    else:
+        checks.update({
+            "DATABASE_URL": DATABASE_URL,
+            "MIGRATION_DATABASE_URL": MIGRATION_DATABASE_URL,
+            "APP_DATABASE_PASSWORD": APP_DATABASE_PASSWORD,
+        })
     invalid = [key for key, value in checks.items() if _unsafe_production_value(value)]
     if invalid:
         raise RuntimeError(f"生产环境配置缺失或仍是演示值: {', '.join(invalid)}")
@@ -225,6 +340,12 @@ def _download_content_disposition(filename: str, fallback_filename: str = "downl
     fallback = f"{fallback_stem}{fallback_suffix}"
     return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(requested, safe='')}"
 ENABLE_SOURCE_DEDUPLICATION = os.getenv("ENABLE_SOURCE_DEDUPLICATION", "false").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_LEGACY_DEMO_SEEDS = os.getenv("ENABLE_LEGACY_DEMO_SEEDS", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 MAX_RESEARCH_ATTACHMENT_BYTES = 10 * 1024 * 1024
 MAX_RESEARCH_CONTEXT_CHARS = 90000
 MAX_NATIVE_VISION_IMAGES = 4
@@ -338,6 +459,9 @@ class SourceReview(Base):
     parsing_status: Mapped[str] = mapped_column(String(30), default="parsed")
     quality_status: Mapped[str] = mapped_column(String(30), default="pending")
     template_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    project_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    file_asset_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    unified_import_batch_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     review_history: Mapped[list] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
@@ -348,6 +472,7 @@ class PhenotypeObservation(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     variety_id: Mapped[str] = mapped_column(ForeignKey("variety_basic.id"), index=True)
     source_review_id: Mapped[str | None] = mapped_column(ForeignKey("source_review.id"), nullable=True)
+    project_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     trait_code: Mapped[str] = mapped_column(String(100), index=True)
     trait_name: Mapped[str] = mapped_column(String(100))
     trait_category: Mapped[str] = mapped_column(String(50))
@@ -439,6 +564,7 @@ class RootPhenotypeObservation(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     variety_id: Mapped[str] = mapped_column(ForeignKey("variety_basic.id"), index=True)
     source_review_id: Mapped[str | None] = mapped_column(ForeignKey("source_review.id"), nullable=True)
+    project_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     trait_code: Mapped[str] = mapped_column(String(100), index=True)
     trait_name: Mapped[str] = mapped_column(String(100))
     trait_category: Mapped[str] = mapped_column(String(80))
@@ -459,7 +585,8 @@ class ResearchSession(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     owner_id: Mapped[str] = mapped_column(String(120), index=True)
-    title: Mapped[str] = mapped_column(String(200), default="新会话")
+    project_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    title: Mapped[str] = mapped_column(String(200), default=DEFAULT_RESEARCH_SESSION_TITLE)
     memory_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     memory_state: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
@@ -490,6 +617,7 @@ class ResearchAttachment(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     session_id: Mapped[str] = mapped_column(ForeignKey("research_session.id", ondelete="CASCADE"), index=True)
     owner_id: Mapped[str] = mapped_column(String(120), index=True)
+    project_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     file_name: Mapped[str] = mapped_column(String(500))
     content_type: Mapped[str | None] = mapped_column(String(120), nullable=True)
     size_bytes: Mapped[int] = mapped_column()
@@ -530,6 +658,7 @@ class ResearchResult(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     owner_id: Mapped[str] = mapped_column(String(120), index=True)
+    project_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     session_id: Mapped[str | None] = mapped_column(ForeignKey("research_session.id", ondelete="SET NULL"), nullable=True, index=True)
     source_message_id: Mapped[str | None] = mapped_column(ForeignKey("research_message.id", ondelete="SET NULL"), nullable=True, index=True)
     analysis_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
@@ -568,6 +697,7 @@ class KnowledgeDocument(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     scope: Mapped[str] = mapped_column(String(20), index=True)
     owner_id: Mapped[str] = mapped_column(String(120), index=True)
+    project_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     folder_id: Mapped[str | None] = mapped_column(ForeignKey("knowledge_folder.id", ondelete="SET NULL"), nullable=True, index=True)
     original_file_name: Mapped[str] = mapped_column(String(500))
     display_title: Mapped[str] = mapped_column(String(500), index=True)
@@ -604,6 +734,7 @@ class KnowledgeChunk(Base):
     document_id: Mapped[str] = mapped_column(ForeignKey("knowledge_document.id", ondelete="CASCADE"), index=True)
     scope: Mapped[str] = mapped_column(String(20), index=True)
     owner_id: Mapped[str] = mapped_column(String(120), index=True)
+    project_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     folder_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     document_status: Mapped[str] = mapped_column(String(30), default="processing", index=True)
     ordinal: Mapped[int] = mapped_column(Integer)
@@ -613,15 +744,29 @@ class KnowledgeChunk(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-migration_engine = create_engine(MIGRATION_DATABASE_URL, pool_pre_ping=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
-MigrationSessionLocal = sessionmaker(bind=migration_engine, autoflush=False, autocommit=False, expire_on_commit=False)
-
-
-def get_session() -> Generator[Session, None, None]:
-    session = SessionLocal()
+def _tenant_session(user: CurrentUser) -> Session:
+    """Open the business database bound to the verified Keycloak institution."""
     try:
+        tenant_database_manager.verify_user_membership(user.id, user.institution_id)
+        return tenant_database_manager.session_factory(user.institution_id)()
+    except TenantAccessError as exc:
+        raise HTTPException(403, "当前机构未开通、已冻结或已进入销毁流程。") from exc
+    except TenantConfigurationError as exc:
+        logger.exception("Tenant resource binding is invalid: institution_id=%s", user.institution_id)
+        raise HTTPException(503, "当前机构的数据资源配置不完整，请联系平台管理员。") from exc
+
+
+def get_session(
+    user: CurrentUser = Depends(get_current_user),
+) -> Generator[Session, None, None]:
+    session = _tenant_session(user)
+    try:
+        _set_research_owner(
+            session,
+            user.id,
+            user.institution_id,
+            institution_admin=bool({"data_processor", "field_admin"}.intersection(user.roles)),
+        )
         yield session
     finally:
         session.close()
@@ -643,6 +788,22 @@ def apply_request_rls_context(session: Session, _transaction: Any, connection: A
             text("SELECT set_config('app.research_user_id', :owner_id, true)"),
             {"owner_id": owner_id},
         )
+    institution_id = session.info.get("institution_id")
+    if institution_id:
+        connection.execute(
+            text("SELECT set_config('app.institution_id', :institution_id, true)"),
+            {"institution_id": institution_id},
+        )
+    if "institution_admin" in session.info:
+        connection.execute(
+            text("SELECT set_config('app.institution_admin', :is_admin, true)"),
+            {"is_admin": session.info["institution_admin"]},
+        )
+    if "project_id" in session.info:
+        connection.execute(
+            text("SELECT set_config('app.project_id', :project_id, true)"),
+            {"project_id": session.info["project_id"]},
+        )
     if "knowledge_is_admin" in session.info:
         connection.execute(
             text("SELECT set_config('app.knowledge_is_admin', :is_admin, true)"),
@@ -650,21 +811,102 @@ def apply_request_rls_context(session: Session, _transaction: Any, connection: A
         )
 
 
-def _set_research_owner(session: Session, owner_id: str) -> None:
+def _set_research_owner(
+    session: Session,
+    owner_id: str,
+    institution_id: str = "longyun-demo",
+    *,
+    institution_admin: bool = False,
+) -> None:
     """Scope PostgreSQL RLS to one verified Keycloak subject for this request."""
     session.info["research_owner_id"] = owner_id
+    session.info["institution_id"] = institution_id
+    session.info["institution_admin"] = "true" if institution_admin else "false"
     session.execute(
         text("SELECT set_config('app.research_user_id', :owner_id, true)"),
         {"owner_id": owner_id},
     )
+    session.execute(
+        text("SELECT set_config('app.institution_id', :institution_id, true)"),
+        {"institution_id": institution_id},
+    )
+    session.execute(
+        text("SELECT set_config('app.institution_admin', :is_admin, true)"),
+        {"is_admin": session.info["institution_admin"]},
+    )
+
+
+def _set_project_context(session: Session, project_id: str | None) -> None:
+    """Bind one already-authorized project to the current database session."""
+    value = str(project_id or "")
+    session.info["project_id"] = value
+    session.execute(
+        text("SELECT set_config('app.project_id', :project_id, true)"),
+        {"project_id": value},
+    )
+
+
+def _bind_research_project(session: Session, user: CurrentUser, project_id: str) -> None:
+    assert_project_access(session, user, project_id)
+    _set_project_context(session, project_id)
 
 
 def get_research_session(
     user: CurrentUser = Depends(require_researcher),
 ) -> Generator[Session, None, None]:
-    session = SessionLocal()
+    session = _tenant_session(user)
     try:
-        _set_research_owner(session, user.id)
+        _set_research_owner(
+            session,
+            user.id,
+            user.institution_id,
+            institution_admin=bool({"data_processor", "field_admin"}.intersection(user.roles)),
+        )
+        yield session
+    finally:
+        session.close()
+
+
+def genotype_owner_id(user: CurrentUser) -> str:
+    """Return the RLS namespace used by genotype intake.
+
+    Existing researcher-owned assets keep their personal namespace.  New
+    imports performed by a data processor use the verified institution id so
+    another processor from the same institution can continue the job.
+    """
+    return user.institution_id if "data_processor" in user.roles else user.id
+
+
+def _bind_genotype_project(
+    session: Session,
+    user: CurrentUser,
+    project_id: str,
+    asset_id: str | None = None,
+) -> None:
+    """Authorize one project and, when supplied, prove the asset belongs to it."""
+    assert_project_access(session, user, project_id)
+    _set_project_context(session, project_id)
+    if asset_id is None:
+        return
+    matched = session.execute(
+        text("SELECT 1 FROM genotype_asset WHERE id = :asset_id AND project_id = :project_id"),
+        {"asset_id": asset_id, "project_id": project_id},
+    ).scalar()
+    if not matched:
+        raise HTTPException(404, "当前课题中不存在该基因型资产。")
+
+
+def get_genotype_session(
+    user: CurrentUser = Depends(require_genotype_user),
+) -> Generator[Session, None, None]:
+    session = _tenant_session(user)
+    try:
+        _set_research_owner(
+            session,
+            genotype_owner_id(user),
+            user.institution_id,
+            institution_admin="data_processor" in user.roles,
+        )
         yield session
     finally:
         session.close()
@@ -672,8 +914,13 @@ def get_research_session(
 
 def _set_knowledge_context(session: Session, user: CurrentUser) -> None:
     """Set RLS variables for both the caller identity and the public-KB admin gate."""
-    _set_research_owner(session, user.id)
-    session.info["knowledge_is_admin"] = "true" if "field_admin" in user.roles else "false"
+    _set_research_owner(
+        session,
+        user.id,
+        user.institution_id,
+        institution_admin=bool({"data_processor", "field_admin"}.intersection(user.roles)),
+    )
+    session.info["knowledge_is_admin"] = "true" if {"data_processor", "field_admin"}.intersection(user.roles) else "false"
     session.execute(
         text("SELECT set_config('app.knowledge_is_admin', :is_admin, true)"),
         {"is_admin": session.info["knowledge_is_admin"]},
@@ -683,12 +930,16 @@ def _set_knowledge_context(session: Session, user: CurrentUser) -> None:
 def get_knowledge_session(
     user: CurrentUser = Depends(require_knowledge_user),
 ) -> Generator[Session, None, None]:
-    session = SessionLocal()
+    session = _tenant_session(user)
     try:
         _set_knowledge_context(session, user)
         yield session
     finally:
         session.close()
+
+
+def is_knowledge_curator(user: CurrentUser) -> bool:
+    return bool({"data_processor", "field_admin"}.intersection(user.roles))
 
 
 TRAITS: dict[str, dict[str, Any]] = {
@@ -729,19 +980,6 @@ ROOT_TRAITS: dict[str, dict[str, Any]] = {
     "root_shoot_ratio": {"name": "根冠比", "category": "根系生物量", "unit": "", "aliases": ["根冠比", "根冠质量比"]},
 }
 
-
-def national_template_fields() -> list[dict[str, Any]]:
-    fields = [{"code": "variety_name", "name": "品种名称", "category": "基础信息", "unit": "", "aliases": ["品种名称", "原始材料名称", "材料名"], "required": True, "kind": "basic"}]
-    for code, trait in TRAITS.items():
-        fields.append({"code": code, "name": trait["name"], "category": trait["category"], "unit": trait["unit"], "aliases": trait["aliases"], "required": False, "kind": "trait"})
-    return fields
-
-
-def root_template_fields() -> list[dict[str, Any]]:
-    fields = [{"code": "variety_name", "name": "材料/品种名称", "category": "基础信息", "unit": "", "aliases": ["品种名称", "材料名称", "样品名称", "材料编号"], "required": True, "kind": "basic"}]
-    for code, trait in ROOT_TRAITS.items():
-        fields.append({"code": code, "name": trait["name"], "category": trait["category"], "unit": trait["unit"], "aliases": trait["aliases"], "required": False, "kind": "trait"})
-    return fields
 
 # First-phase spreadsheet mappings. Institute-specific mappings can later be
 # persisted as versioned templates rather than changing parser code.
@@ -1163,17 +1401,68 @@ def extract_variety_basic_info(text: str) -> dict[str, str | None]:
     }
 
 
-def table_to_candidates(headers: list[str], rows: list[dict[str, Any]], trait_catalog: dict[str, dict[str, Any]] = TRAITS, header_mappings: dict[str, str] | None = None) -> list[dict[str, Any]]:
+IMPORT_BASIC_FIELD_ALIASES: dict[str, list[str]] = {
+    "material_code": ["材料编码", "材料编号", "种质编号", "品系编号", "子代编号", "后代编号"],
+    "variety_name": ["品种名称", "种质名称", "材料名称", "品系名称", "子代", "子代材料"],
+    "aliases": ["别名", "曾用名", "其他名称"],
+    "variety_type": ["品种类型", "种质类型", "材料类型"],
+    "female_parent": ["母本", "母本名称", "母本编号"],
+    "male_parent": ["父本", "父本名称", "父本编号"],
+    "breeding_unit": ["选育单位", "育种单位", "来源单位"],
+    "approval_number": ["审定编号", "审定号"],
+    "approval_year": ["审定年份", "审定年"],
+    "suitable_region": ["适宜区域", "适宜种植区域"],
+}
+
+
+def template_basic_header_mappings(version: TemplateVersion | None) -> dict[str, str]:
+    """Map institution-specific source columns to the business fields we can persist."""
+    mappings = {
+        normalize_name(alias): code
+        for code, aliases in IMPORT_BASIC_FIELD_ALIASES.items()
+        for alias in aliases
+    }
+    for field in (version.field_definitions if version else []) or []:
+        code = str(field.get("code") or "")
+        if code not in IMPORT_BASIC_FIELD_ALIASES:
+            continue
+        for alias in [field.get("name"), *(field.get("aliases") or [])]:
+            if alias:
+                # Canonical identifier aliases (for example 材料编号) must not
+                # be downgraded to a display name by an older template version.
+                mappings.setdefault(normalize_name(str(alias)), code)
+    return mappings
+
+
+def table_to_candidates(
+    headers: list[str],
+    rows: list[dict[str, Any]],
+    trait_catalog: dict[str, dict[str, Any]] = TRAITS,
+    header_mappings: dict[str, str] | None = None,
+    basic_header_mappings: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
-    name_key = next((header for header in headers if any(token in normalize_name(header) for token in EXCEL_NAME_HEADER_TOKENS)), None)
-    alias_key = next((header for header in headers if any(token in normalize_name(header) for token in EXCEL_ALIAS_HEADER_TOKENS)), None)
+    basic_header_mappings = basic_header_mappings or template_basic_header_mappings(None)
+    mapped_basic_headers = {header: basic_header_mappings.get(normalize_name(str(header))) for header in headers}
+    name_key = next((header for header in headers if mapped_basic_headers.get(header) == "variety_name"), None)
+    name_key = name_key or next((header for header in headers if any(token in normalize_name(header) for token in EXCEL_NAME_HEADER_TOKENS)), None)
+    code_key = next((header for header in headers if mapped_basic_headers.get(header) == "material_code"), None)
+    alias_key = next((header for header in headers if mapped_basic_headers.get(header) == "aliases"), None)
+    alias_key = alias_key or next((header for header in headers if any(token in normalize_name(header) for token in EXCEL_ALIAS_HEADER_TOKENS)), None)
     mapped_headers = {header: trait_by_alias(str(header), trait_catalog, header_mappings) for header in headers}
-    unmapped_headers = [header for header in headers if header != name_key and header != alias_key and mapped_headers[header] is None]
+    unmapped_headers = [header for header in headers if header != name_key and header != alias_key and mapped_headers[header] is None and mapped_basic_headers.get(header) is None]
     for index, row in enumerate(rows):
         title = str(row.get(name_key, "") if name_key else "")
+        if not title.strip() and code_key:
+            title = str(row.get(code_key, "") or "")
         name, aliases = parse_title(title)
         if alias_key and row.get(alias_key) not in (None, ""):
             aliases = list(dict.fromkeys([*aliases, *[item.strip() for item in re.split(r"[、,，;/]", str(row[alias_key])) if item.strip()]]))
+        basic_values: dict[str, Any] = {}
+        for header, code in mapped_basic_headers.items():
+            if not code or code in {"variety_name", "aliases"} or row.get(header) in (None, ""):
+                continue
+            basic_values[code] = str(row[header]).strip()
         observations = []
         for header, value in row.items():
             if value in (None, ""):
@@ -1194,18 +1483,18 @@ def table_to_candidates(headers: list[str], rows: list[dict[str, Any]], trait_ca
         warnings = [f"已识别 {len(observations)} 个标准字段；{sum(item['requires_confirmation'] for item in observations)} 个字段需要人工确认单位或换算。"]
         if unmapped_headers:
             warnings.append(f"未映射字段保留在原始来源中：{'、'.join(unmapped_headers)}。")
-        candidates.append({"variety_name": name, "aliases": aliases, "raw_title": title, "observations": observations, "source_locator": f"第 {index + 2} 行", "parser_warnings": warnings, "unmapped_fields": [{"field": header, "sample_value": str(row.get(header, ""))} for header in unmapped_headers if row.get(header) not in (None, "")]})
+        candidates.append({"variety_name": name, "aliases": aliases, "raw_title": title, **basic_values, "observations": observations, "source_locator": f"第 {index + 2} 行", "parser_warnings": warnings, "unmapped_fields": [{"field": header, "sample_value": str(row.get(header, ""))} for header in unmapped_headers if row.get(header) not in (None, "")]})
     return candidates
 
 
 async def parse_uploaded_content(filename: str, content: bytes, template: DataTemplate | None = None, template_version: TemplateVersion | None = None) -> tuple[str, str, list[dict[str, Any]]]:
     suffix = Path(filename).suffix.lower()
-    is_root_template = template and template.template_code == "rice_root_phenotype"
-    trait_catalog, header_mappings = template_parsing_catalog(template, template_version) if template and template_version else (ROOT_TRAITS if is_root_template else TRAITS, {} if is_root_template else EXCEL_HEADER_TRAIT_CODES)
+    trait_catalog, header_mappings = template_parsing_catalog(template, template_version) if template and template_version else (TRAITS, EXCEL_HEADER_TRAIT_CODES)
+    basic_header_mappings = template_basic_header_mappings(template_version)
     if suffix == ".csv":
         text = content.decode("utf-8-sig", errors="replace")
         rows = list(csv.DictReader(io.StringIO(text)))
-        return "csv", text, table_to_candidates(list(rows[0].keys()) if rows else [], rows, trait_catalog, header_mappings)
+        return "csv", text, table_to_candidates(list(rows[0].keys()) if rows else [], rows, trait_catalog, header_mappings, basic_header_mappings)
     if suffix in {".xlsx", ".xls"}:
         workbook = load_workbook(io.BytesIO(content), data_only=True)
         sheet = workbook[workbook.sheetnames[0]]
@@ -1215,14 +1504,12 @@ async def parse_uploaded_content(filename: str, content: bytes, template: DataTe
         headers = [str(item or "") for item in values[0]]
         rows = [dict(zip(headers, row)) for row in values[1:] if any(cell is not None for cell in row)]
         raw = "\n".join(" | ".join(str(cell or "") for cell in row) for row in values)
-        return "excel", raw, table_to_candidates(headers, rows, trait_catalog, header_mappings)
+        return "excel", raw, table_to_candidates(headers, rows, trait_catalog, header_mappings, basic_header_mappings)
     if suffix == ".pdf":
         document = fitz.open(stream=content, filetype="pdf")
         text = "\n\n".join(f"[第 {index + 1} 页]\n{page.get_text()}" for index, page in enumerate(document))
         if not text.strip():
             raise HTTPException(422, "未提取到可复制文字。第一版暂不支持扫描图片型 PDF。")
-        if is_root_template:
-            raise HTTPException(422, "根系表型模板第一版仅支持 Excel 或 CSV；请保留根系 PDF 为原始来源后再补充结构化表格。")
         return "pdf", text, [{"variety_name": "", "aliases": [], "raw_title": "", "observations": extract_text_observations(text), "source_locator": "PDF 正文"}]
     if suffix in {".html", ".htm"}:
         decoded = decode_html_bytes(content)
@@ -1236,8 +1523,6 @@ async def parse_uploaded_content(filename: str, content: bytes, template: DataTe
         text, masked_digits = extract_html_text_with_markers(soup)
         text, approval_context = keep_first_approval_section(text)
         name, aliases = parse_title(raw_title)
-        if is_root_template:
-            raise HTTPException(422, "根系表型模板第一版仅支持 Excel 或 CSV。")
         candidate = {"variety_name": name, "aliases": aliases, "raw_title": raw_title, "observations": extract_text_observations(text), "source_locator": "网页正文", **extract_variety_basic_info(text)}
         parser_warnings: list[str] = []
         if resolved_digits:
@@ -1257,11 +1542,11 @@ async def parse_uploaded_content(filename: str, content: bytes, template: DataTe
 
 
 def serialize_source(source: SourceReview) -> dict[str, Any]:
-    return {"id": source.id, "source_type": source.source_type, "source_name": source.source_name, "source_url": source.source_url, "raw_text": source.raw_text or "", "page_or_locator": source.page_or_locator, "parsing_status": source.parsing_status, "quality_status": source.quality_status, "template_version_id": source.template_version_id, "review_history": source.review_history or [], "created_at": source.created_at.isoformat()}
+    return {"id": source.id, "source_type": source.source_type, "source_name": source.source_name, "source_url": source.source_url, "raw_text": source.raw_text or "", "page_or_locator": source.page_or_locator, "parsing_status": source.parsing_status, "quality_status": source.quality_status, "template_version_id": source.template_version_id, "project_id": source.project_id, "file_asset_id": source.file_asset_id, "import_batch_id": source.unified_import_batch_id, "review_history": source.review_history or [], "created_at": source.created_at.isoformat()}
 
 
 def serialize_observation(observation: PhenotypeObservation) -> dict[str, Any]:
-    return {"id": observation.id, "variety_id": observation.variety_id, "source_review_id": observation.source_review_id, "trait_code": observation.trait_code, "trait_name": observation.trait_name, "trait_category": observation.trait_category, "observation_type": observation.observation_type, "value_numeric": observation.value_numeric, "value_text": observation.value_text, "unit": observation.unit, "original_value": observation.original_value, "original_field": observation.original_field, "source_locator": observation.source_locator, "trial_year": observation.trial_year, "trial_location": observation.trial_location, "evaluation_method": observation.evaluation_method, "rule_version": observation.rule_version, "quality_status": observation.quality_status, "publish_status": observation.publish_status, "review_comment": observation.review_comment, "created_at": observation.created_at.isoformat()}
+    return {"id": observation.id, "variety_id": observation.variety_id, "source_review_id": observation.source_review_id, "project_id": observation.project_id, "trait_code": observation.trait_code, "trait_name": observation.trait_name, "trait_category": observation.trait_category, "observation_type": observation.observation_type, "value_numeric": observation.value_numeric, "value_text": observation.value_text, "unit": observation.unit, "original_value": observation.original_value, "original_field": observation.original_field, "source_locator": observation.source_locator, "trial_year": observation.trial_year, "trial_location": observation.trial_location, "evaluation_method": observation.evaluation_method, "rule_version": observation.rule_version, "quality_status": observation.quality_status, "publish_status": observation.publish_status, "review_comment": observation.review_comment, "created_at": observation.created_at.isoformat()}
 
 
 def serialize_variety(variety: Variety, include_observations: bool = False) -> dict[str, Any]:
@@ -1302,7 +1587,56 @@ def seed_data(session: Session) -> None:
     session.commit()
 
 
+RETIRED_TEMPLATE_CODES = frozenset({"rice_data_center", "rice_root_phenotype"})
+
+
+IMPORT_FLOW_META: dict[str, dict[str, Any]] = {
+    "germplasm_master": {
+        "category": "种质", "import_mode": "germplasm", "accepted_file_types": ["xlsx", "csv"],
+        "business_key_fields": ["variety_name"], "dependency_codes": [], "route_page": "germplasm-import",
+    },
+    "pedigree_relationship": {
+        "category": "系谱", "import_mode": "pedigree", "accepted_file_types": ["xlsx", "csv"],
+        "business_key_fields": ["variety_name", "female_parent", "male_parent"], "dependency_codes": ["germplasm_master"], "route_page": "pedigree-import",
+    },
+    "field_trial_package": {
+        "category": "试验", "import_mode": "trial_package", "accepted_file_types": ["zip"],
+        "business_key_fields": ["trial_code", "site_code", "material_code", "plot_no"], "dependency_codes": ["germplasm_master"], "route_page": "trial-packages",
+    },
+    "single_plant_master": {
+        "category": "单株", "import_mode": "single_plant", "accepted_file_types": ["xlsx"],
+        "business_key_fields": ["sample_code", "material_code"], "dependency_codes": ["germplasm_master", "field_trial_package"], "route_page": "single-plant-import",
+    },
+    "genotype_dataset": {
+        "category": "基因型", "import_mode": "genotype", "accepted_file_types": ["vcf", "vcf.gz", "zip"],
+        "business_key_fields": ["sample_id", "material_code"], "dependency_codes": ["germplasm_master"], "route_page": "genotype-import",
+    },
+    "knowledge_document": {
+        "category": "知识", "import_mode": "knowledge", "accepted_file_types": ["pdf", "docx", "xlsx", "csv", "pptx", "txt", "md", "html", "json", "xml"],
+        "business_key_fields": ["content_hash"], "dependency_codes": [], "route_page": "knowledge-import",
+    },
+}
+
+
+def template_flow_metadata(template: DataTemplate) -> dict[str, Any]:
+    if template.template_code in IMPORT_FLOW_META:
+        return IMPORT_FLOW_META[template.template_code]
+    by_target = {
+        "breeding_material": "germplasm_master",
+        "material_relationship": "pedigree_relationship",
+        "trial_data_package": "field_trial_package",
+        "biological_sample": "single_plant_master",
+        "genotype_asset": "genotype_dataset",
+        "knowledge_document": "knowledge_document",
+    }
+    return IMPORT_FLOW_META.get(by_target.get(template.target_table, ""), {
+        "category": "扩展数据", "import_mode": "staging", "accepted_file_types": ["xlsx", "csv"],
+        "business_key_fields": [], "dependency_codes": [], "route_page": "phenotype-import",
+    })
+
+
 def serialize_template(template: DataTemplate, version: TemplateVersion | None) -> dict[str, Any]:
+    flow = template_flow_metadata(template)
     return {
         "id": template.id,
         "template_code": template.template_code,
@@ -1311,17 +1645,63 @@ def serialize_template(template: DataTemplate, version: TemplateVersion | None) 
         "target_table": template.target_table,
         "description": template.description,
         "status": template.status,
+        "created_at": template.created_at.isoformat() if template.created_at else None,
         "current_version": version.version if version else "-",
         "current_version_id": version.id if version else None,
         "change_summary": version.change_summary if version else "",
+        "current_version_created_by": version.created_by if version else "",
+        "current_version_created_at": version.created_at.isoformat() if version and version.created_at else None,
         "fields": version.field_definitions if version else [],
+        **flow,
     }
 
 
 def seed_templates(session: Session) -> None:
+    germplasm_fields = [
+        {"code": "material_code", "name": "机构内材料编码", "kind": "identifier", "required": False, "aliases": ["种质编号", "材料编号", "品系编号"]},
+        {"code": "variety_name", "name": "机构内材料名称", "kind": "identifier", "required": True, "aliases": ["种质名称", "材料名称", "品种名称", "品系名称"]},
+        {"code": "variety_type", "name": "材料类型", "kind": "attribute", "required": False, "aliases": ["种质类型", "品种类型"]},
+        {"code": "aliases", "name": "别名", "kind": "attribute", "required": False, "aliases": ["曾用名", "其他名称"]},
+        {"code": "breeding_unit", "name": "选育单位", "kind": "attribute", "required": False, "aliases": ["育种单位", "来源单位"]},
+        {"code": "approval_number", "name": "审定编号", "kind": "attribute", "required": False, "aliases": ["审定号"]},
+    ]
+    pedigree_fields = [
+        {"code": "material_code", "name": "子代材料编码", "kind": "identifier", "required": False, "aliases": ["后代编号", "子代编号"]},
+        {"code": "variety_name", "name": "子代材料名称", "kind": "basic", "required": True, "aliases": ["子代", "子代材料"]},
+        {"code": "female_parent", "name": "母本名称或编码", "kind": "basic", "required": False, "aliases": ["母本", "母本编号"]},
+        {"code": "male_parent", "name": "父本名称或编码", "kind": "basic", "required": False, "aliases": ["父本", "父本编号"]},
+    ]
+    trial_fields = [
+        {"code": "trial_code", "name": "试验编号", "kind": "identifier", "required": True, "aliases": ["试验编码"]},
+        {"code": "site_code", "name": "试点编号", "kind": "identifier", "required": True, "aliases": ["地点编号"]},
+        {"code": "material_code", "name": "材料编码", "kind": "identifier", "required": True, "aliases": ["种质编号"]},
+        {"code": "plot_no", "name": "小区号", "kind": "identifier", "required": True, "aliases": ["小区编号"]},
+        {"code": "trial_year", "name": "试验年份", "kind": "attribute", "required": True, "aliases": ["年份"]},
+    ]
+    single_plant_fields = [
+        {"code": "sample_code", "name": "单株编号", "kind": "identifier", "required": True, "aliases": ["样本编号"]},
+        {"code": "material_code", "name": "材料编码", "kind": "identifier", "required": True, "aliases": ["种质编号"]},
+        {"code": "trial_code", "name": "试验编号", "kind": "identifier", "required": False, "aliases": ["试验编码"]},
+        {"code": "plot_no", "name": "小区号", "kind": "identifier", "required": False, "aliases": ["小区编号"]},
+    ]
+    genotype_fields = [
+        {"code": "sample_id", "name": "基因型样本编号", "kind": "identifier", "required": True, "aliases": ["IID", "样本号"]},
+        {"code": "material_code", "name": "材料编码", "kind": "identifier", "required": True, "aliases": ["种质编号"]},
+        {"code": "reference_assembly", "name": "参考基因组版本", "kind": "attribute", "required": True, "aliases": ["参考版本", "GenomeBuild"]},
+    ]
+    knowledge_fields = [
+        {"code": "display_title", "name": "资料标题", "kind": "attribute", "required": True, "aliases": ["标题", "文献标题"]},
+        {"code": "source_organization", "name": "来源单位", "kind": "attribute", "required": True, "aliases": ["发布单位", "机构"]},
+        {"code": "publication_year", "name": "发布年份", "kind": "attribute", "required": False, "aliases": ["年份"]},
+        {"code": "source_url", "name": "来源链接", "kind": "attribute", "required": False, "aliases": ["URL", "DOI"]},
+    ]
     seeds = [
-        ("rice_data_center", "国家水稻数据中心信息标准", "水稻品种与地上部表型", "phenotype_observation", "用于国家水稻数据中心网页、审定资料及同类品种表型数据的归集。", national_template_fields()),
-        ("rice_root_phenotype", "水稻根系表型数据标准", "水稻根系表型", "root_phenotype_observation", "用于根系扫描、根系成像和人工测量等根系表型数据。", root_template_fields()),
+        ("germplasm_master", "机构种质主数据模板", "种质资源主档", "breeding_material", "用于建立机构内稳定材料编码、名称和别名，是跨文件关联的首要基础。", germplasm_fields),
+        ("pedigree_relationship", "材料系谱关系模板", "亲本与后代关系", "variety_basic", "使用子代、母本和父本语义字段表达系谱关系，不要求各机构采用相同原始列名。", pedigree_fields),
+        ("field_trial_package", "多年多点试验资料包模板", "试验、环境、管理与表型", "trial_data_package", "用于导入试验设计、小区布局、环境管理和表型观测组成的关联资料包。", trial_fields),
+        ("single_plant_master", "单株主数据模板", "材料下的单株与样本", "biological_sample", "用于把单株、试验小区、表型照片和后续基因型样本关联起来。", single_plant_fields),
+        ("genotype_dataset", "基因型数据与样本映射模板", "VCF/PLINK 与材料映射", "genotype_asset", "用于登记参考版本，并将基因型样本编号映射到机构种质或单株。", genotype_fields),
+        ("knowledge_document", "育种文献与情报元数据模板", "公共文献与行业情报", "knowledge_document", "用于维护资料来源、版本和可追溯元数据；正文由本地解析与索引流程处理。", knowledge_fields),
     ]
     for code, name, scope, target, description, fields in seeds:
         template = session.scalar(select(DataTemplate).where(DataTemplate.template_code == code))
@@ -1342,15 +1722,19 @@ def get_template_version(session: Session, version_id: str | None) -> tuple[Data
     if not version:
         raise HTTPException(422, "请选择一套已发布的处理标准模板。")
     template = session.get(DataTemplate, version.template_id)
-    if not template or template.status != "published" or version.status != "published":
+    if (
+        not template
+        or template.template_code in RETIRED_TEMPLATE_CODES
+        or template.status != "published"
+        or version.status != "published"
+    ):
         raise HTTPException(422, "所选标准模板不可用，请选择已发布版本。")
     return template, version
 
 
 def template_parsing_catalog(template: DataTemplate, version: TemplateVersion) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
-    base = ROOT_TRAITS if template.template_code == "rice_root_phenotype" else TRAITS
-    catalog = {code: dict(value) for code, value in base.items()}
-    header_mappings: dict[str, str] = {} if template.template_code == "rice_root_phenotype" else dict(EXCEL_HEADER_TRAIT_CODES)
+    catalog = {code: dict(value) for code, value in TRAITS.items()}
+    header_mappings: dict[str, str] = dict(EXCEL_HEADER_TRAIT_CODES)
     for field in version.field_definitions or []:
         if field.get("kind") != "trait":
             continue
@@ -1393,7 +1777,10 @@ def infer_template_from_spreadsheet(session: Session, filename: str, content: by
     if not headers:
         return selected_template, selected_version, False
     candidates: list[tuple[DataTemplate, TemplateVersion]] = []
-    for template in session.scalars(select(DataTemplate).where(DataTemplate.status == "published")).all():
+    for template in session.scalars(select(DataTemplate).where(
+        DataTemplate.status == "published",
+        DataTemplate.template_code.not_in(RETIRED_TEMPLATE_CODES),
+    )).all():
         version = session.get(TemplateVersion, template.current_version_id)
         if version and version.status == "published":
             candidates.append((template, version))
@@ -1434,13 +1821,13 @@ def backfill_missing_variety_basic_info(session: Session) -> None:
 
 
 def consolidate_duplicate_sources(session: Session) -> None:
-    """Merge legacy duplicate imports before enforcing a content-hash unique index."""
-    sources_by_hash: dict[str, list[SourceReview]] = {}
+    """Merge duplicate imports inside one project, never across project boundaries."""
+    sources_by_hash: dict[tuple[str | None, str], list[SourceReview]] = {}
     for source in session.scalars(select(SourceReview).where(SourceReview.file_hash.is_not(None)).order_by(SourceReview.created_at.asc())).all():
-        sources_by_hash.setdefault(source.file_hash, []).append(source)
+        sources_by_hash.setdefault((source.project_id, source.file_hash), []).append(source)
 
     changed = False
-    for file_hash, sources in sources_by_hash.items():
+    for (project_id, file_hash), sources in sources_by_hash.items():
         if len(sources) < 2:
             continue
         scores = {}
@@ -1470,20 +1857,36 @@ def consolidate_duplicate_sources(session: Session) -> None:
                 variety.source_review_id = canonical.id
             session.delete(duplicate)
             changed = True
-        append_history(canonical, "系统", "合并重复导入来源", {"file_hash": file_hash, "merged_source_ids": merged_source_ids, "dropped_duplicate_observations": dropped_observations})
+        append_history(canonical, "系统", "合并同课题重复导入来源", {"project_id": project_id, "file_hash": file_hash, "merged_source_ids": merged_source_ids, "dropped_duplicate_observations": dropped_observations})
 
     if changed:
         session.commit()
-    session.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_source_review_file_hash ON source_review (file_hash) WHERE file_hash IS NOT NULL"))
+    session.execute(text("DROP INDEX IF EXISTS uq_source_review_file_hash"))
+    session.execute(text(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_source_review_project_file_hash "
+        "ON source_review (project_id, file_hash) "
+        "WHERE project_id IS NOT NULL AND file_hash IS NOT NULL"
+    ))
     session.commit()
 
 
-def find_duplicate_source(session: Session, file_hash: str, source_url: str | None = None) -> tuple[SourceReview | None, str | None]:
-    existing = session.scalar(select(SourceReview).where(SourceReview.file_hash == file_hash))
+def find_duplicate_source(
+    session: Session,
+    project_id: str,
+    file_hash: str,
+    source_url: str | None = None,
+) -> tuple[SourceReview | None, str | None]:
+    existing = session.scalar(select(SourceReview).where(
+        SourceReview.project_id == project_id,
+        SourceReview.file_hash == file_hash,
+    ))
     if existing:
         return existing, "相同文件内容"
     if source_url:
-        existing = session.scalar(select(SourceReview).where(SourceReview.source_url == source_url).order_by(SourceReview.created_at.asc()))
+        existing = session.scalar(select(SourceReview).where(
+            SourceReview.project_id == project_id,
+            SourceReview.source_url == source_url,
+        ).order_by(SourceReview.created_at.asc()))
         if existing:
             return existing, "相同原始网页地址"
     return None, None
@@ -1494,14 +1897,14 @@ def reject_duplicate_source(existing: SourceReview, reason: str) -> None:
     raise HTTPException(409, f"{reason}已导入：{existing.source_name}（{created_at}）。系统未创建重复来源记录。")
 
 
-def trait_identity(observation: PhenotypeObservation | RootPhenotypeObservation) -> tuple[str, str]:
+def trait_identity(observation: PhenotypeObservation | RootPhenotypeObservation) -> tuple[str | None, str, str]:
     """Current demo identity: a variety has one value for one standardized trait.
 
     Trial/year/location are not yet modeled as separate experimental contexts. Until
     they are, accepting another value would make research queries ambiguous, so the
     formal database deliberately keeps one record per variety and trait.
     """
-    return observation.variety_id, observation.trait_code
+    return observation.project_id, observation.variety_id, observation.trait_code
 
 
 def observation_retention_rank(observation: PhenotypeObservation) -> tuple[int, int, datetime]:
@@ -1520,7 +1923,7 @@ def consolidate_duplicate_traits(session: Session) -> None:
     Raw files and source records are retained. Only repeated standardized field
     records are removed, and their source history records which value was retained.
     """
-    observation_groups: dict[tuple[str, str], list[PhenotypeObservation]] = {}
+    observation_groups: dict[tuple[str | None, str, str], list[PhenotypeObservation]] = {}
     for observation in session.scalars(select(PhenotypeObservation).order_by(PhenotypeObservation.created_at.asc())).all():
         observation_groups.setdefault(trait_identity(observation), []).append(observation)
 
@@ -1539,7 +1942,7 @@ def consolidate_duplicate_traits(session: Session) -> None:
             })
             session.delete(duplicate)
 
-    root_groups: dict[tuple[str, str], list[RootPhenotypeObservation]] = {}
+    root_groups: dict[tuple[str | None, str, str], list[RootPhenotypeObservation]] = {}
     for observation in session.scalars(select(RootPhenotypeObservation).order_by(RootPhenotypeObservation.published_at.asc())).all():
         root_groups.setdefault(trait_identity(observation), []).append(observation)
     for records in root_groups.values():
@@ -1560,14 +1963,24 @@ def consolidate_duplicate_traits(session: Session) -> None:
 
 
 def ensure_trait_uniqueness_constraints(session: Session) -> None:
-    """Make the deduplication rule a PostgreSQL constraint, not a UI convention."""
-    session.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_phenotype_variety_trait ON phenotype_observation (variety_id, trait_code)"))
-    session.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_root_phenotype_variety_trait ON root_phenotype_observation (variety_id, trait_code)"))
+    """Enforce one standardized trait value per variety *inside each project*."""
+    session.execute(text("DROP INDEX IF EXISTS uq_phenotype_variety_trait"))
+    session.execute(text("DROP INDEX IF EXISTS uq_root_phenotype_variety_trait"))
+    session.execute(text(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_phenotype_project_variety_trait "
+        "ON phenotype_observation (project_id, variety_id, trait_code) WHERE project_id IS NOT NULL"
+    ))
+    session.execute(text(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_root_phenotype_project_variety_trait "
+        "ON root_phenotype_observation (project_id, variety_id, trait_code) WHERE project_id IS NOT NULL"
+    ))
     session.commit()
 
 
 class ImportCommit(BaseModel):
+    project_id: str = Field(min_length=36, max_length=36)
     variety_name: str = ""
+    material_code: str | None = None
     aliases: list[str] = Field(default_factory=list)
     raw_title: str = ""
     variety_type: str | None = None
@@ -1578,10 +1991,13 @@ class ImportCommit(BaseModel):
     approval_year: str | None = None
     suitable_region: str | None = None
     observations: list[dict[str, Any]] = Field(default_factory=list)
+    source_row_number: int | None = Field(default=None, ge=1)
+    finalize_batch: bool = True
     actor: str = "数据处理员-张三"
 
 
 class VarietyCreate(BaseModel):
+    project_id: str = Field(min_length=36, max_length=36)
     variety_name: str
     aliases: list[str] = Field(default_factory=list)
     variety_type: str | None = None
@@ -1590,6 +2006,7 @@ class VarietyCreate(BaseModel):
 
 
 class ObservationCreate(BaseModel):
+    project_id: str = Field(min_length=36, max_length=36)
     variety_id: str
     trait_code: str
     value_numeric: float | None = None
@@ -1602,6 +2019,7 @@ class ObservationCreate(BaseModel):
 
 
 class ObservationUpdate(BaseModel):
+    project_id: str = Field(min_length=36, max_length=36)
     value_numeric: float | None = None
     value_text: str | None = None
     unit: str | None = None
@@ -1611,6 +2029,7 @@ class ObservationUpdate(BaseModel):
 
 
 class PublishRequest(BaseModel):
+    project_id: str = Field(min_length=36, max_length=36)
     observation_ids: list[str]
     actor: str = "数据处理员-张三"
 
@@ -1628,15 +2047,18 @@ class RuleCreate(BaseModel):
 class UrlImport(BaseModel):
     url: str
     template_version_id: str
+    project_id: str = Field(min_length=1, max_length=36)
     actor: str = "数据处理员-张三"
 
 
 class PdfReport(BaseModel):
+    project_id: str = Field(min_length=36, max_length=36)
     filters: dict[str, Any] = Field(default_factory=dict)
     rows: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ManualRecord(BaseModel):
+    project_id: str = Field(min_length=36, max_length=36)
     variety_id: str | None = None
     variety_name: str = ""
     aliases: list[str] = Field(default_factory=list)
@@ -1654,6 +2076,7 @@ class ManualRecord(BaseModel):
 class TemplateVersionCreate(BaseModel):
     change_summary: str
     action: str = "add_field"
+    field_kind: str = "attribute"
     field_code: str = ""
     field_name: str
     category: str = "扩展性状"
@@ -1667,7 +2090,23 @@ class TemplateVersionCreate(BaseModel):
     actor: str = "系统管理员"
 
 
+class DataTemplateCreate(BaseModel):
+    template_code: str = Field(min_length=2, max_length=80, pattern=r"^[a-z][a-z0-9_]*$")
+    template_name: str = Field(min_length=2, max_length=200)
+    data_scope: str = Field(min_length=2, max_length=100)
+    target_table: str = Field(min_length=2, max_length=100, pattern=r"^[a-z][a-z0-9_]*$")
+    description: str = Field(min_length=2, max_length=2000)
+    change_summary: str = Field(default="创建首个模板版本", min_length=2, max_length=1000)
+    actor: str = "系统管理员"
+
+
+class DataTemplateStatusUpdate(BaseModel):
+    status: Literal["published", "retired"]
+    actor: str = "系统管理员"
+
+
 class FieldChangeRequestCreate(BaseModel):
+    project_id: str = Field(min_length=36, max_length=36)
     source_review_id: str
     source_field: str
     sample_value: str = ""
@@ -1676,7 +2115,8 @@ class FieldChangeRequestCreate(BaseModel):
 
 
 class ResearchSessionCreate(BaseModel):
-    title: str = Field(default="新会话", min_length=1, max_length=200)
+    project_id: str = Field(min_length=36, max_length=36)
+    title: str = Field(default=DEFAULT_RESEARCH_SESSION_TITLE, min_length=1, max_length=200)
 
 
 class ResearchSessionRename(BaseModel):
@@ -1687,16 +2127,25 @@ class ResearchChatRequest(BaseModel):
     content: str = Field(min_length=1, max_length=12000)
     knowledge_scope: Literal["private", "public", "both"] = "both"
     attachment_ids: list[str] = Field(default_factory=list, max_length=20)
+    external_data_acknowledged: bool = False
+
+
+class ProjectDataFilter(BaseModel):
+    field: str = Field(min_length=1, max_length=100)
+    operator: Literal["eq", "ne", "contains", "gte", "gt", "lte", "lt"] = "eq"
+    value: str | int | float | bool
 
 
 class ResearchStructuredQueryRequest(BaseModel):
-    """User-built query parameters for the public, governed data panel."""
+    """Allowlisted query parameters for one authorized research project."""
 
-    scope: Literal["rice_phenotype", "root_phenotype"] = "rice_phenotype"
-    variety_names: list[str] = Field(default_factory=list, max_length=20)
-    trait_codes: list[str] = Field(default_factory=list, max_length=64)
-    filters: list[NumericFilter] = Field(default_factory=list, max_length=6)
+    project_id: str = Field(min_length=36, max_length=36)
+    dataset: str = Field(min_length=1, max_length=100)
+    fields: list[str] = Field(default_factory=list, max_length=64)
+    search: str = Field(default="", max_length=200)
+    filters: list[ProjectDataFilter] = Field(default_factory=list, max_length=8)
     limit: int = Field(default=100, ge=1, le=100)
+    offset: int = Field(default=0, ge=0, le=100000)
 
 
 class KnowledgeFolderCreate(BaseModel):
@@ -1795,6 +2244,7 @@ def _serialize_research_skill(skill: dict[str, Any], last_opened_at: datetime | 
 def serialize_research_session(item: ResearchSession) -> dict[str, Any]:
     return {
         "id": item.id,
+        "project_id": item.project_id,
         "title": item.title,
         "created_at": item.created_at.isoformat(),
         "updated_at": item.updated_at.isoformat(),
@@ -1826,6 +2276,7 @@ RESEARCH_RESULT_LABELS = {
 def serialize_research_result(item: ResearchResult) -> dict[str, Any]:
     return {
         "id": item.id,
+        "project_id": item.project_id,
         "session_id": item.session_id,
         "source_message_id": item.source_message_id,
         "analysis_run_id": item.analysis_run_id,
@@ -1864,7 +2315,9 @@ def _result_summary(analysis: dict[str, Any] | None, result_type: str) -> str:
 def _store_research_result(
     session: Session,
     *,
+    institution_id: str,
     owner_id: str,
+    project_id: str,
     source_message_id: str,
     session_id: str | None,
     analysis_run_id: str | None,
@@ -1875,7 +2328,7 @@ def _store_research_result(
     content: bytes,
     analysis: dict[str, Any] | None = None,
 ) -> ResearchResult:
-    """Upsert one private output and write it under the local research volume."""
+    """Upsert one private output in the institution's durable object store."""
     existing = session.scalar(select(ResearchResult).where(
         ResearchResult.owner_id == owner_id,
         ResearchResult.source_message_id == source_message_id,
@@ -1883,6 +2336,7 @@ def _store_research_result(
     ))
     result = existing or ResearchResult(
         owner_id=owner_id,
+        project_id=project_id,
         source_message_id=source_message_id,
         session_id=session_id,
         analysis_run_id=analysis_run_id,
@@ -1896,20 +2350,27 @@ def _store_research_result(
         session.add(result)
         session.flush()
 
-    directory = RESULT_STORAGE_DIR / owner_id / result.id
-    directory.mkdir(parents=True, exist_ok=True)
-    target_path = directory / _safe_result_filename(file_name, "research_result")
-    temporary_path = target_path.with_suffix(f"{target_path.suffix}.tmp")
-    temporary_path.write_bytes(content)
-    temporary_path.replace(target_path)
+    result_file_name = _safe_result_filename(file_name, "research_result")
+    stored = object_storage_manager.for_institution(institution_id).put_bytes(
+        project_object_key(
+            project_id=project_id,
+            category="research-results",
+            resource_id=result.id,
+            owner_user_id=owner_id,
+            file_name=result_file_name,
+        ),
+        content,
+        content_type,
+    )
 
     result.session_id = session_id
+    result.project_id = project_id
     result.analysis_run_id = analysis_run_id
     result.title = title
     result.content_type = content_type
-    result.file_name = target_path.name
+    result.file_name = result_file_name
     result.size_bytes = len(content)
-    result.storage_path = str(target_path)
+    result.storage_path = stored.locator
     result.summary = _result_summary(analysis, result_type)
     result.result_metadata = {
         "analysis_type": (analysis or {}).get("analysis_type"),
@@ -1923,8 +2384,10 @@ def _store_research_result(
 def _store_gwas_result_bundle(
     session: Session,
     *,
+    institution_id: str,
     owner_id: str,
     plan_id: str,
+    project_id: str,
     content: bytes,
     file_name: str,
     metadata: dict[str, Any],
@@ -1938,6 +2401,7 @@ def _store_gwas_result_bundle(
     if not result:
         result = ResearchResult(
             owner_id=owner_id,
+            project_id=project_id,
             session_id=None,
             source_message_id=None,
             analysis_run_id=plan_id,
@@ -1949,17 +2413,24 @@ def _store_gwas_result_bundle(
         )
         session.add(result)
         session.flush()
-    directory = RESULT_STORAGE_DIR / owner_id / result.id
-    directory.mkdir(parents=True, exist_ok=True)
-    target = directory / _safe_result_filename(file_name, "rice_gwas_results")
-    temporary = target.with_suffix(f"{target.suffix}.tmp")
-    temporary.write_bytes(content)
-    temporary.replace(target)
+    result_file_name = _safe_result_filename(file_name, "rice_gwas_results")
+    stored = object_storage_manager.for_institution(institution_id).put_bytes(
+        project_object_key(
+            project_id=project_id,
+            category="gwas-results",
+            resource_id=result.id,
+            owner_user_id=owner_id,
+            file_name=result_file_name,
+        ),
+        content,
+        "application/zip",
+    )
     result.title = f"{metadata.get('trait_name') or '水稻性状'} GWAS 分析结果包"
+    result.project_id = project_id
     result.content_type = "application/zip"
-    result.file_name = target.name
+    result.file_name = result_file_name
     result.size_bytes = len(content)
-    result.storage_path = str(target)
+    result.storage_path = stored.locator
     result.summary = f"包含 {metadata.get('file_count', 0)} 个已完成的 GWAS 输出：质控、PCA、Manhattan、QQ、候选位点及可复核数据。"
     result.result_metadata = {**metadata, "generated_from": "local_rice_gwas"}
     return result
@@ -1985,7 +2456,9 @@ def _load_trial_analysis(session: Session, analysis_run_id: str | None) -> dict[
 def _save_structured_result_artifacts(
     session: Session,
     *,
+    institution_id: str,
     owner_id: str,
+    project_id: str,
     message: ResearchMessage,
     question: str,
     analysis_run_id: str | None,
@@ -2002,7 +2475,9 @@ def _save_structured_result_artifacts(
     }, ensure_ascii=False, indent=2).encode("utf-8")
     saved = [_store_research_result(
         session,
+        institution_id=institution_id,
         owner_id=owner_id,
+        project_id=project_id,
         source_message_id=message.id,
         session_id=message.session_id,
         analysis_run_id=analysis_run_id,
@@ -2021,7 +2496,9 @@ def _save_structured_result_artifacts(
     if chart_png:
         saved.append(_store_research_result(
             session,
+            institution_id=institution_id,
             owner_id=owner_id,
+            project_id=project_id,
             source_message_id=message.id,
             session_id=message.session_id,
             analysis_run_id=analysis_run_id,
@@ -2073,6 +2550,7 @@ def serialize_knowledge_folder(item: KnowledgeFolder) -> dict[str, Any]:
 def serialize_knowledge_document(item: KnowledgeDocument, folder: KnowledgeFolder | None = None) -> dict[str, Any]:
     return {
         "id": item.id,
+        "project_id": item.project_id,
         "scope": item.scope,
         "folder_id": item.folder_id,
         "folder_name": folder.folder_name if folder else "未分类",
@@ -2100,62 +2578,7 @@ def serialize_knowledge_document(item: KnowledgeDocument, folder: KnowledgeFolde
     }
 
 
-def public_standard_field_catalog() -> dict[str, Any]:
-    """The two queryable public templates exposed by the research assistant."""
-    return {
-        "datasets": [
-            {
-                "scope": "rice_phenotype",
-                "title": "国家水稻数据中心信息标准",
-                "description": "品种基础名称加 22 个已发布水稻表型标准字段。",
-                "fields": national_template_fields(),
-            },
-            {
-                "scope": "root_phenotype",
-                "title": "水稻根系表型数据标准",
-                "description": "材料/品种名称加 10 个已发布根系表型标准字段。",
-                "fields": root_template_fields(),
-            },
-        ]
-    }
-
-
-def serialize_public_query_execution(execution: Any) -> dict[str, Any]:
-    """Turn long-table rows into a stable field-oriented result for the UI."""
-    records_by_variety: dict[str, dict[str, Any]] = {}
-    for row in execution.records:
-        variety_id = str(row["variety_id"])
-        record = records_by_variety.setdefault(variety_id, {
-            "id": variety_id,
-            "variety_name": row["variety_name"],
-            "aliases": row["alias_names"] or [],
-            "variety_type": row["variety_type"],
-            "approval_number": row["approval_number"],
-            "approval_year": row["approval_year"],
-            "suitable_region": row["suitable_region"],
-            "traits": {},
-        })
-        record["traits"][row["trait_code"]] = {
-            "name": row["trait_name"],
-            "value": row["value_numeric"] if row["value_numeric"] is not None else row["value_text"],
-            "unit": row["unit"] or "",
-            "trial_year": row["trial_year"],
-            "trial_location": row["trial_location"],
-            "evaluation_method": row["evaluation_method"],
-        }
-    records = list(records_by_variety.values())
-    return {
-        "template_code": execution.template_code,
-        "parameters": execution.parameters,
-        "record_count": len(records),
-        "observation_count": len(execution.records),
-        "matched_variety_names": execution.matched_variety_names,
-        "unresolved_variety_names": execution.unresolved_variety_names,
-        "records": records,
-    }
-
-
-app = FastAPI(title="隆耘 Agent 育种智能体", version="1.5.0")
+app = FastAPI(title="隆耘 Agent 育种智能体", version="1.6.0")
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
 app.add_middleware(
     CORSMiddleware,
@@ -2166,16 +2589,22 @@ app.add_middleware(
 )
 
 
-def ensure_application_database_role(session: Session) -> None:
+def ensure_application_database_role(
+    session: Session,
+    *,
+    role: str = APP_DATABASE_ROLE,
+    password: str = APP_DATABASE_PASSWORD,
+) -> None:
     """Create the least-privileged API role before application tables exist.
 
     Database migrations run through the bootstrap account. The web API never
     connects as that superuser, otherwise PostgreSQL would bypass RLS.
     """
-    if not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", APP_DATABASE_ROLE):
+    if not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", role):
         raise RuntimeError("APP_DATABASE_ROLE must be a simple PostgreSQL role name")
-    escaped_password = APP_DATABASE_PASSWORD.replace("'", "''")
-    role = APP_DATABASE_ROLE
+    if not password:
+        raise RuntimeError("The application database password cannot be empty")
+    escaped_password = password.replace("'", "''")
     exists = session.scalar(text("SELECT 1 FROM pg_roles WHERE rolname = :role"), {"role": role})
     if not exists:
         session.execute(text(
@@ -2187,6 +2616,24 @@ def ensure_application_database_role(session: Session) -> None:
     session.execute(text(f"GRANT USAGE ON SCHEMA public TO {role}"))
     session.execute(text(f"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {role}"))
     session.execute(text(f"GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {role}"))
+    if session.scalar(
+        text(
+            "SELECT to_regprocedure('public.current_institution_active_agent_workflow_count()') "
+            "IS NOT NULL"
+        )
+    ):
+        session.execute(
+            text(
+                f"GRANT EXECUTE ON FUNCTION "
+                f"current_institution_active_agent_workflow_count() TO {role}"
+            )
+        )
+    if session.scalar(
+        text("SELECT to_regprocedure('public.longyun_can_access_project(character varying)') IS NOT NULL")
+    ):
+        session.execute(
+            text(f"GRANT EXECUTE ON FUNCTION longyun_can_access_project(VARCHAR) TO {role}")
+        )
     session.execute(text(f"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {role}"))
     session.execute(text(f"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO {role}"))
     session.commit()
@@ -2232,18 +2679,42 @@ def normalize_legacy_range_markers(session: Session) -> None:
         session.commit()
 
 
-@app.on_event("startup")
-def startup() -> None:
-    validate_runtime_configuration()
-    with MigrationSessionLocal() as session:
-        ensure_application_database_role(session)
+def initialize_tenant_database(institution_id: str) -> None:
+    """Create or upgrade exactly one institution business database."""
+    binding = tenant_database_manager.resolve(institution_id)
+    if tenant_database_manager.mode == "multi":
+        application_url = make_url(binding.database_url)
+        application_role = application_url.username or ""
+        application_password = application_url.password or ""
+    else:
+        application_role = APP_DATABASE_ROLE
+        application_password = APP_DATABASE_PASSWORD
+    tenant_database_manager.verify_tenant_database(institution_id)
+    tenant_migration_engine = tenant_database_manager.engine_for(institution_id, migration=True)
+    tenant_migration_factory = sessionmaker(
+        bind=tenant_migration_engine,
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+    )
+    with tenant_migration_factory() as session:
+        ensure_application_database_role(
+            session,
+            role=application_role,
+            password=application_password,
+        )
         try:
             session.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
             session.commit()
         except Exception as exc:
             raise RuntimeError("PostgreSQL pgvector 扩展不可用，请使用包含 pgvector 的数据库镜像。") from exc
-    Base.metadata.create_all(migration_engine)
-    with MigrationSessionLocal() as session:
+    Base.metadata.create_all(tenant_migration_engine)
+    with tenant_migration_factory() as session:
+        # Build the tenant/project spine before any domain compatibility table.
+        # Several domain tables have a foreign key to research_project, and a
+        # brand-new institution database does not contain that table yet.
+        ensure_agent_workflow_schema(session)
+        ensure_institution(session, institution_id)
         # Trial data remains separate from legacy variety-level records.  A
         # measurement is meaningful only together with trial, treatment,
         # replicate, environment and raw-source location.
@@ -2251,18 +2722,40 @@ def startup() -> None:
         ensure_breeding_dossier_schema(session)
         ensure_genomics_schema(session)
         ensure_genotype_asset_schema(session)
+        ensure_single_plant_schema(session)
+        ensure_acps_schema(session)
+        # The helpers above create the compatibility tables required by the
+        # Alembic baseline. Commit that foundation, then upgrade every existing
+        # table before ORM-backed data repair reads newly declared columns.
+        session.commit()
+    run_business_schema_migrations(binding.migration_database_url)
+    with tenant_migration_factory() as session:
         retire_legacy_seeded_trial_demo(session)
         session.execute(text("ALTER TABLE source_review ADD COLUMN IF NOT EXISTS template_version_id VARCHAR(36)"))
         session.execute(text("ALTER TABLE research_session ADD COLUMN IF NOT EXISTS memory_state JSONB NOT NULL DEFAULT '{}'::jsonb"))
+        session.execute(text("ALTER TABLE research_attachment ADD COLUMN IF NOT EXISTS project_id VARCHAR(36)"))
+        session.execute(text("ALTER TABLE research_result ADD COLUMN IF NOT EXISTS project_id VARCHAR(36)"))
+        # Existing installations can predate project-scoped knowledge. Ensure
+        # both sides of the backfill exist before referencing document.project_id.
+        session.execute(text("ALTER TABLE knowledge_document ADD COLUMN IF NOT EXISTS project_id VARCHAR(36)"))
+        session.execute(text("ALTER TABLE knowledge_chunk ADD COLUMN IF NOT EXISTS project_id VARCHAR(36)"))
+        session.execute(text("CREATE INDEX IF NOT EXISTS ix_knowledge_chunk_project_id ON knowledge_chunk(project_id)"))
+        session.execute(text(
+            "UPDATE knowledge_chunk chunk SET project_id = document.project_id "
+            "FROM knowledge_document document "
+            "WHERE chunk.document_id = document.id AND chunk.project_id IS DISTINCT FROM document.project_id"
+        ))
         session.execute(text("ALTER TABLE knowledge_document ADD COLUMN IF NOT EXISTS version_change_summary TEXT"))
         session.commit()
         backfill_image_ready_research_attachments(session)
         normalize_legacy_range_markers(session)
         seed_templates(session)
-        seed_data(session)
-        # The dossier seed is intentionally dependent on the material table.
-        # It becomes active once the regional-trial package has been published.
-        seed_mock_breeding_dossiers(session)
+        # Formal institution databases must start empty.  The historical
+        # variety/dossier fixtures are available only for an explicitly
+        # isolated developer environment; tenant name and single-DB mode must
+        # never silently enable them.
+        if ENABLE_LEGACY_DEMO_SEEDS:
+            seed_data(session)
         backfill_missing_variety_basic_info(session)
         # Demo defaults to retaining every import. Future deployments can enable
         # request-level source de-duplication without changing the import flow.
@@ -2273,8 +2766,43 @@ def startup() -> None:
         ensure_research_rls(session)
         seed_public_knowledge_folders(session)
         ensure_knowledge_rls(session)
-        ensure_application_database_role(session)
-    resume_interrupted_knowledge_documents()
+        ensure_application_database_role(
+            session,
+            role=application_role,
+            password=application_password,
+        )
+    # Refresh runtime-managed helpers and grants after every versioned schema
+    # upgrade so the application role receives access to newly created tables.
+    with tenant_migration_factory() as session:
+        # The project membership helper is migration-owned, so AI accounting
+        # and genotype RLS can only receive their final project boundary after
+        # Alembic completes.
+        ensure_agent_workflow_schema(session)
+        ensure_genotype_asset_schema(session)
+        ensure_research_rls(session)
+        ensure_knowledge_rls(session)
+        # Migration-created tables and SECURITY DEFINER helpers are not covered
+        # by grants issued before the migration, so refresh least-privilege
+        # grants only after a successful upgrade.
+        ensure_application_database_role(
+            session,
+            role=application_role,
+            password=application_password,
+        )
+
+
+@app.on_event("startup")
+def startup() -> None:
+    validate_runtime_configuration()
+    ACPS_SETTINGS.assert_ready()
+    tenant_database_manager.ensure_control_schema()
+    bindings = tenant_database_manager.active_bindings()
+    if not bindings:
+        raise RuntimeError("No active institution is registered")
+    for binding in bindings:
+        initialize_tenant_database(binding.institution_id)
+    for binding in bindings:
+        resume_interrupted_knowledge_documents(binding.institution_id)
 
 
 @app.get("/api/health")
@@ -2282,40 +2810,315 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/tenant-context")
+def tenant_context(user: CurrentUser = Depends(get_current_user)) -> dict[str, Any]:
+    """Expose the authenticated tenant context without resource credentials."""
+    try:
+        tenant_database_manager.verify_user_membership(user.id, user.institution_id)
+        binding = tenant_database_manager.resolve(user.institution_id)
+    except TenantAccessError as exc:
+        raise HTTPException(403, "The institution is not active for this account.") from exc
+    return {
+        "institution_id": binding.institution_id,
+        "display_name": binding.display_name,
+        "status": binding.status,
+        "storage_backend": binding.storage_backend,
+        "workflow_queue_namespace": binding.queue_prefix,
+        "deployment_mode": tenant_database_manager.mode,
+    }
+
+
+app.include_router(build_agent_router(AgentApiDependencies(
+    get_session=get_research_session,
+    get_owned_research_session=lambda session, session_id: get_owned_research_session(
+        session, session_id
+    ),
+    research_attachment_model=ResearchAttachment,
+    set_research_owner=_set_research_owner,
+)))
+
+app.include_router(build_acps_router(
+    AcpsApiDependencies(
+        get_session=get_session,
+        set_research_owner=_set_research_owner,
+    ),
+    ACPS_SETTINGS,
+))
+
+app.include_router(build_data_spine_router(DataSpineApiDependencies(
+    get_session=get_session,
+    object_storage_manager=object_storage_manager,
+)))
+
+
+@app.post("/api/single-plants/import/preview")
+async def preview_single_plant_workbook_import(
+    file: UploadFile = File(...),
+    project_id: str = Query(..., min_length=36, max_length=36),
+    mode: Literal["create_only", "upsert"] = Query(default="create_only"),
+    user: CurrentUser = Depends(require_data_processor),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    """Validate an XLSX in memory; preview never creates database rows."""
+    _bind_research_project(session, user, project_id)
+    if not (file.filename or "").lower().endswith(".xlsx"):
+        raise HTTPException(400, "单株导入仅支持 .xlsx 文件。")
+    content = await file.read(SINGLE_PLANT_MAX_IMPORT_BYTES + 1)
+    try:
+        package = parse_single_plant_package(content)
+        return preview_single_plant_package(
+            session, package["single_plants"], package["phenotypes"], project_id, mode
+        )
+    except SinglePlantError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/single-plants/import/publish")
+async def publish_single_plant_workbook_import(
+    file: UploadFile = File(...),
+    project_id: str = Query(..., min_length=36, max_length=36),
+    mode: Literal["create_only", "upsert"] = Query(default="create_only"),
+    user: CurrentUser = Depends(require_data_processor),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    """Revalidate and atomically publish a single-plant master workbook."""
+    _bind_research_project(session, user, project_id)
+    if not (file.filename or "").lower().endswith(".xlsx"):
+        raise HTTPException(400, "单株导入仅支持 .xlsx 文件。")
+    content = await file.read(SINGLE_PLANT_MAX_IMPORT_BYTES + 1)
+    try:
+        package = parse_single_plant_package(content)
+        return publish_single_plant_package(
+            session,
+            package["single_plants"],
+            package["phenotypes"],
+            audit_actor(user),
+            project_id,
+            mode,
+        )
+    except SinglePlantError as exc:
+        session.rollback()
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/single-plants/import/preview-json")
+def preview_single_plant_json_import(
+    payload: SinglePlantImportPayload,
+    user: CurrentUser = Depends(require_data_processor),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    """JSON counterpart used by editable import grids before final publication."""
+    _bind_research_project(session, user, payload.project_id)
+    try:
+        return preview_single_plant_import(session, payload.records, payload.project_id, payload.mode)
+    except SinglePlantError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/single-plants/import/publish-json")
+def publish_single_plant_json_import(
+    payload: SinglePlantImportPayload,
+    user: CurrentUser = Depends(require_data_processor),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    _bind_research_project(session, user, payload.project_id)
+    try:
+        return publish_single_plant_import(session, payload.records, audit_actor(user), payload.project_id, payload.mode)
+    except SinglePlantError as exc:
+        session.rollback()
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/materials/{material_id}/single-plants")
+def get_material_single_plants(
+    material_id: str,
+    project_id: str = Query(..., min_length=36, max_length=36),
+    program_id: str | None = Query(default=None, max_length=36),
+    selection_status: Literal["candidate", "retained", "observed", "eliminated", "promoted"] | None = Query(default=None),
+    include_archived: bool = Query(default=False),
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> list[dict[str, Any]]:
+    try:
+        _bind_research_project(session, user, project_id)
+        visible = session.execute(text("""
+            SELECT 1 FROM data_material_project_scope
+            WHERE material_id = :material_id AND project_id = :project_id
+        """), {"material_id": material_id, "project_id": project_id}).scalar()
+        if not visible:
+            raise HTTPException(404, "当前课题中不存在该材料。")
+        return list_material_single_plants(
+            session, material_id, project_id, program_id, selection_status, include_archived
+        )
+    except SinglePlantError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.get("/api/single-plants/lookup")
+def find_single_plants_for_field_entry(
+    keyword: str = Query(min_length=1, max_length=160),
+    project_id: str = Query(..., min_length=36, max_length=36),
+    program_code: str | None = Query(default=None, max_length=100),
+    limit: int = Query(default=20, ge=1, le=50),
+    user: CurrentUser = Depends(require_data_platform_user),
+    session: Session = Depends(get_session),
+) -> list[dict[str, Any]]:
+    try:
+        _bind_research_project(session, user, project_id)
+        return lookup_single_plants(session, keyword, project_id, program_code, limit)
+    except SinglePlantError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/single-plants/variety-evaluation")
+def get_single_plant_variety_evaluation(
+    project_id: str = Query(..., min_length=36, max_length=36),
+    program_code: str | None = Query(default=None, max_length=100),
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> dict[str, Any]:
+    _bind_research_project(session, user, project_id)
+    return get_variety_evaluation(session, project_id, program_code)
+
+
+@app.get("/api/single-plants/base-dashboard")
+def get_single_plant_base_dashboard(
+    project_id: str = Query(..., min_length=36, max_length=36),
+    program_code: str | None = Query(default=None, max_length=100),
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> dict[str, Any]:
+    _bind_research_project(session, user, project_id)
+    return get_base_dashboard(session, project_id, program_code)
+
+
+@app.get("/api/single-plants/base-dashboard/plots/{trial_entry_id}/plants")
+def get_single_plant_base_plot_plants(
+    trial_entry_id: str,
+    project_id: str = Query(..., min_length=36, max_length=36),
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> dict[str, Any]:
+    try:
+        _bind_research_project(session, user, project_id)
+        return get_base_plot_plants(session, trial_entry_id, project_id)
+    except SinglePlantError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.get("/api/single-plants/{sample_id}")
+def get_single_plant_evidence(
+    sample_id: str,
+    project_id: str = Query(..., min_length=36, max_length=36),
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> dict[str, Any]:
+    try:
+        _bind_research_project(session, user, project_id)
+        return get_single_plant_detail(session, sample_id, project_id)
+    except SinglePlantError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/single-plants/{sample_id}/observations")
+def create_single_plant_observation(
+    sample_id: str,
+    payload: SinglePlantObservationRequest,
+    project_id: str = Query(..., min_length=36, max_length=36),
+    user: CurrentUser = Depends(require_data_platform_user),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    try:
+        _bind_research_project(session, user, project_id)
+        return record_single_plant_observation(session, sample_id, payload, audit_actor(user), project_id)
+    except SinglePlantError as exc:
+        session.rollback()
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.patch(
+    "/api/genotype-assets/{asset_id}/versions/{version_id}/mappings/{fid}/{iid}/single-plant"
+)
+def save_genotype_single_plant_mapping(
+    asset_id: str,
+    version_id: str,
+    fid: str,
+    iid: str,
+    payload: SinglePlantGenotypeMappingRequest,
+    project_id: str = Query(..., min_length=36, max_length=36),
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> dict[str, Any]:
+    try:
+        _bind_genotype_project(session, user, project_id, asset_id)
+        get_genotype_asset_version(session, asset_id, version_id)
+        return map_genotype_to_single_plant(session, user.id, version_id, fid, iid, payload, project_id)
+    except (SinglePlantError, GenotypeAssetError) as exc:
+        session.rollback()
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/single-plants/{sample_id}/selection-decisions")
+def create_single_plant_selection_decision(
+    sample_id: str,
+    payload: SinglePlantSelectionRequest,
+    project_id: str = Query(..., min_length=36, max_length=36),
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> dict[str, Any]:
+    try:
+        _bind_research_project(session, user, project_id)
+        return record_single_plant_selection(session, sample_id, payload, audit_actor(user), project_id)
+    except SinglePlantError as exc:
+        session.rollback()
+        raise HTTPException(400, str(exc)) from exc
+
+
 @app.get("/api/trial-packages")
 def get_trial_packages(
+    project_id: str = Query(..., min_length=36, max_length=36),
     user: CurrentUser = Depends(require_data_processor),
     session: Session = Depends(get_session),
 ) -> list[dict[str, Any]]:
     """List regional-trial packages visible to the data processor."""
-    return list_trial_import_batches(session)
+    assert_project_access(session, user, project_id)
+    _set_project_context(session, project_id)
+    return list_trial_import_batches(session, project_id)
 
 
 @app.get("/api/trial-packages/{batch_id}")
 def get_trial_package(
     batch_id: str,
+    project_id: str = Query(..., min_length=36, max_length=36),
     user: CurrentUser = Depends(require_data_processor),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
     try:
-        return get_trial_import_batch(session, batch_id)
+        assert_project_access(session, user, project_id)
+        _set_project_context(session, project_id)
+        return get_trial_import_batch(session, batch_id, project_id)
     except ValueError as exc:
         raise HTTPException(404, str(exc)) from exc
 
 
 @app.post("/api/trial-packages/upload")
 async def upload_trial_package_endpoint(
+    project_id: str = Query(..., min_length=36, max_length=36),
     file: UploadFile = File(...),
     user: CurrentUser = Depends(require_data_processor),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
     try:
+        assert_project_access(session, user, project_id)
+        _set_project_context(session, project_id)
         return upload_trial_package(
             session,
             file.filename or "regional-trial-package.zip",
             await file.read(),
             audit_actor(user),
-            RAW_STORAGE_DIR,
+            _tenant_raw_workspace(user.institution_id),
+            object_storage_manager.for_institution(user.institution_id),
+            project_id,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -2324,15 +3127,15 @@ async def upload_trial_package_endpoint(
 @app.post("/api/trial-packages/{batch_id}/publish")
 def publish_trial_package_endpoint(
     batch_id: str,
+    project_id: str = Query(..., min_length=36, max_length=36),
     user: CurrentUser = Depends(require_data_processor),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
     try:
-        result = publish_trial_package(session, batch_id, audit_actor(user))
-        dossier_count = seed_mock_breeding_dossiers(session)
+        assert_project_access(session, user, project_id)
+        _set_project_context(session, project_id)
+        result = publish_trial_package(session, batch_id, audit_actor(user), project_id)
         session.commit()
-        if dossier_count:
-            result["simulated_breeding_dossiers"] = dossier_count
         return result
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -2346,7 +3149,16 @@ def research_current_user(user: CurrentUser = Depends(require_researcher)) -> di
         "username": user.username,
         "display_name": user.display_name,
         "roles": sorted(user.roles),
+        "institution_id": user.institution_id,
     }
+
+
+@app.get("/api/research/model-policy")
+def research_model_policy(
+    _user: CurrentUser = Depends(require_researcher),
+) -> dict[str, object]:
+    """Expose only non-secret model-boundary settings to the web client."""
+    return get_model_data_policy().public_view()
 
 
 @app.get("/api/research/skills")
@@ -2421,47 +3233,56 @@ def launch_research_skill(
 
 @app.get("/api/gwas/plans")
 def list_gwas_analysis_plans(
+    project_id: str = Query(..., min_length=36, max_length=36),
     user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
 ) -> list[dict[str, Any]]:
     """List only the authenticated researcher's controlled GWAS plans."""
-    return list_gwas_plans(session)
+    _bind_research_project(session, user, project_id)
+    return list_gwas_plans(session, project_id)
 
 
 @app.get("/api/genotype-assets")
 def list_private_genotype_assets(
-    user: CurrentUser = Depends(require_researcher),
-    session: Session = Depends(get_research_session),
+    project_id: str = Query(..., min_length=36, max_length=36),
+    user: CurrentUser = Depends(require_genotype_user),
+    session: Session = Depends(get_genotype_session),
 ) -> list[dict[str, Any]]:
     """Only list genotype assets owned by the authenticated researcher."""
-    return list_genotype_assets(session)
+    _bind_genotype_project(session, user, project_id)
+    return list_genotype_assets(session, project_id)
 
 
 @app.get("/api/genotype-assets/analysis-ready")
 def list_analysis_ready_genotype_assets(
-    user: CurrentUser = Depends(require_researcher),
-    session: Session = Depends(get_research_session),
+    project_id: str = Query(..., min_length=36, max_length=36),
+    user: CurrentUser = Depends(require_genotype_user),
+    session: Session = Depends(get_genotype_session),
 ) -> list[dict[str, Any]]:
-    return analysis_ready_versions(session)
+    _bind_genotype_project(session, user, project_id)
+    return analysis_ready_versions(session, project_id)
 
 
 @app.get("/api/genotype-assets/materials")
 def search_genotype_material_master(
     keyword: str = Query(default="", max_length=200),
-    user: CurrentUser = Depends(require_researcher),
-    session: Session = Depends(get_research_session),
+    project_id: str = Query(..., min_length=36, max_length=36),
+    user: CurrentUser = Depends(require_genotype_user),
+    session: Session = Depends(get_genotype_session),
 ) -> list[dict[str, Any]]:
-    return list_genotype_material_suggestions(session, keyword)
+    _bind_genotype_project(session, user, project_id)
+    return list_genotype_material_suggestions(session, keyword, project_id)
 
 
 @app.post("/api/genotype-assets")
 def create_private_genotype_asset(
     payload: CreateGenotypeAssetRequest,
-    user: CurrentUser = Depends(require_researcher),
-    session: Session = Depends(get_research_session),
+    user: CurrentUser = Depends(require_data_processor),
+    session: Session = Depends(get_genotype_session),
 ) -> dict[str, Any]:
     try:
-        result = create_genotype_asset(session, user.id, payload)
+        _bind_genotype_project(session, user, payload.project_id)
+        result = create_genotype_asset(session, genotype_owner_id(user), payload)
         session.commit()
         return result
     except GenotypeAssetError as exc:
@@ -2473,11 +3294,19 @@ def create_private_genotype_asset(
 def initialize_genotype_asset_upload(
     asset_id: str,
     payload: UploadInitRequest,
-    user: CurrentUser = Depends(require_researcher),
-    session: Session = Depends(get_research_session),
+    project_id: str = Query(..., min_length=36, max_length=36),
+    user: CurrentUser = Depends(require_data_processor),
+    session: Session = Depends(get_genotype_session),
 ) -> dict[str, Any]:
     try:
-        result = create_genotype_upload_session(session, user.id, asset_id, payload, RESEARCH_STORAGE_DIR)
+        _bind_genotype_project(session, user, project_id, asset_id)
+        result = create_genotype_upload_session(
+            session,
+            genotype_owner_id(user),
+            asset_id,
+            payload,
+            _tenant_research_workspace(user.institution_id),
+        )
         session.commit()
         return result
     except GenotypeAssetError as exc:
@@ -2489,10 +3318,12 @@ def initialize_genotype_asset_upload(
 def get_private_genotype_upload(
     asset_id: str,
     upload_id: str,
-    user: CurrentUser = Depends(require_researcher),
-    session: Session = Depends(get_research_session),
+    project_id: str = Query(..., min_length=36, max_length=36),
+    user: CurrentUser = Depends(require_genotype_user),
+    session: Session = Depends(get_genotype_session),
 ) -> dict[str, Any]:
     try:
+        _bind_genotype_project(session, user, project_id, asset_id)
         return get_genotype_upload_session(session, asset_id, upload_id)
     except GenotypeAssetError as exc:
         raise HTTPException(404, str(exc)) from exc
@@ -2504,13 +3335,21 @@ async def upload_genotype_asset_chunk(
     upload_id: str,
     chunk_index: int,
     file: UploadFile = File(...),
-    user: CurrentUser = Depends(require_researcher),
-    session: Session = Depends(get_research_session),
+    project_id: str = Query(..., min_length=36, max_length=36),
+    user: CurrentUser = Depends(require_data_processor),
+    session: Session = Depends(get_genotype_session),
 ) -> dict[str, Any]:
     if chunk_index < 0:
         raise HTTPException(400, "上传分片编号不能为负数。")
     try:
-        destination = genotype_upload_chunk_path(RESEARCH_STORAGE_DIR, user.id, asset_id, upload_id, chunk_index)
+        _bind_genotype_project(session, user, project_id, asset_id)
+        destination = genotype_upload_chunk_path(
+            _tenant_research_workspace(user.institution_id),
+            genotype_owner_id(user),
+            asset_id,
+            upload_id,
+            chunk_index,
+        )
         written = 0
         with destination.open("wb") as sink:
             while block := await file.read(1024 * 1024):
@@ -2531,11 +3370,20 @@ async def upload_genotype_asset_chunk(
 def complete_genotype_asset_upload(
     asset_id: str,
     upload_id: str,
-    user: CurrentUser = Depends(require_researcher),
-    session: Session = Depends(get_research_session),
+    project_id: str = Query(..., min_length=36, max_length=36),
+    user: CurrentUser = Depends(require_data_processor),
+    session: Session = Depends(get_genotype_session),
 ) -> dict[str, Any]:
     try:
-        result = complete_genotype_upload(session, user.id, asset_id, upload_id, RESEARCH_STORAGE_DIR)
+        _bind_genotype_project(session, user, project_id, asset_id)
+        result = complete_genotype_upload(
+            session,
+            genotype_owner_id(user),
+            asset_id,
+            upload_id,
+            _tenant_research_workspace(user.institution_id),
+            object_storage_manager.for_institution(user.institution_id),
+        )
         session.commit()
         return result
     except GenotypeAssetError as exc:
@@ -2547,10 +3395,12 @@ def complete_genotype_asset_upload(
 def get_private_genotype_asset(
     asset_id: str,
     version_id: str | None = Query(default=None),
-    user: CurrentUser = Depends(require_researcher),
-    session: Session = Depends(get_research_session),
+    project_id: str = Query(..., min_length=36, max_length=36),
+    user: CurrentUser = Depends(require_genotype_user),
+    session: Session = Depends(get_genotype_session),
 ) -> dict[str, Any]:
     try:
+        _bind_genotype_project(session, user, project_id, asset_id)
         return get_genotype_asset_version(session, asset_id, version_id)
     except GenotypeAssetError as exc:
         raise HTTPException(404, str(exc)) from exc
@@ -2563,12 +3413,14 @@ def save_genotype_sample_mapping(
     fid: str,
     iid: str,
     payload: MappingUpdateRequest,
-    user: CurrentUser = Depends(require_researcher),
-    session: Session = Depends(get_research_session),
+    project_id: str = Query(..., min_length=36, max_length=36),
+    user: CurrentUser = Depends(require_data_processor),
+    session: Session = Depends(get_genotype_session),
 ) -> dict[str, Any]:
     try:
+        _bind_genotype_project(session, user, project_id, asset_id)
         get_genotype_asset_version(session, asset_id, version_id)
-        result = update_genotype_mapping(session, user.id, version_id, fid, iid, payload)
+        result = update_genotype_mapping(session, genotype_owner_id(user), version_id, fid, iid, payload)
         session.commit()
         return result
     except GenotypeAssetError as exc:
@@ -2581,12 +3433,14 @@ async def import_genotype_sample_mapping(
     asset_id: str,
     version_id: str,
     file: UploadFile = File(...),
-    user: CurrentUser = Depends(require_researcher),
-    session: Session = Depends(get_research_session),
+    project_id: str = Query(..., min_length=36, max_length=36),
+    user: CurrentUser = Depends(require_data_processor),
+    session: Session = Depends(get_genotype_session),
 ) -> dict[str, Any]:
     try:
+        _bind_genotype_project(session, user, project_id, asset_id)
         get_genotype_asset_version(session, asset_id, version_id)
-        result = batch_update_genotype_mapping(session, user.id, version_id, await file.read())
+        result = batch_update_genotype_mapping(session, genotype_owner_id(user), version_id, await file.read())
         session.commit()
         return result
     except GenotypeAssetError as exc:
@@ -2598,11 +3452,13 @@ async def import_genotype_sample_mapping(
 def create_genotype_mapping_revision_endpoint(
     asset_id: str,
     version_id: str,
-    user: CurrentUser = Depends(require_researcher),
-    session: Session = Depends(get_research_session),
+    project_id: str = Query(..., min_length=36, max_length=36),
+    user: CurrentUser = Depends(require_data_processor),
+    session: Session = Depends(get_genotype_session),
 ) -> dict[str, Any]:
     try:
-        result = create_genotype_mapping_revision(session, user.id, asset_id, version_id)
+        _bind_genotype_project(session, user, project_id, asset_id)
+        result = create_genotype_mapping_revision(session, genotype_owner_id(user), asset_id, version_id)
         session.commit()
         return result
     except GenotypeAssetError as exc:
@@ -2614,12 +3470,19 @@ def create_genotype_mapping_revision_endpoint(
 def publish_genotype_analysis_version(
     asset_id: str,
     version_id: str,
-    user: CurrentUser = Depends(require_researcher),
-    session: Session = Depends(get_research_session),
+    project_id: str = Query(..., min_length=36, max_length=36),
+    user: CurrentUser = Depends(require_data_processor),
+    session: Session = Depends(get_genotype_session),
 ) -> dict[str, Any]:
     try:
+        _bind_genotype_project(session, user, project_id, asset_id)
         get_genotype_asset_version(session, asset_id, version_id)
-        result = publish_genotype_analysis_ready(session, user.id, version_id)
+        result = publish_genotype_analysis_ready(
+            session,
+            genotype_owner_id(user),
+            version_id,
+            object_storage_manager.for_institution(user.institution_id),
+        )
         session.commit()
         return result
     except GenotypeAssetError as exc:
@@ -2632,12 +3495,14 @@ def submit_genotype_governance_request(
     asset_id: str,
     version_id: str,
     payload: GovernanceRequestCreate,
-    user: CurrentUser = Depends(require_researcher),
-    session: Session = Depends(get_research_session),
+    project_id: str = Query(..., min_length=36, max_length=36),
+    user: CurrentUser = Depends(require_data_processor),
+    session: Session = Depends(get_genotype_session),
 ) -> dict[str, Any]:
     try:
+        _bind_genotype_project(session, user, project_id, asset_id)
         get_genotype_asset_version(session, asset_id, version_id)
-        result = create_genotype_governance_request(session, user.id, asset_id, version_id, payload)
+        result = create_genotype_governance_request(session, genotype_owner_id(user), asset_id, version_id, payload)
         session.commit()
         return result
     except GenotypeAssetError as exc:
@@ -2647,24 +3512,30 @@ def submit_genotype_governance_request(
 
 @app.get("/api/genotype-governance-requests")
 def get_genotype_governance_requests(
+    project_id: str = Query(..., min_length=36, max_length=36),
     user: CurrentUser = Depends(require_data_processor),
     session: Session = Depends(get_session),
 ) -> list[dict[str, Any]]:
     """Metadata-only queue for data processors; raw genotype files stay private."""
     session.execute(text("SELECT set_config('app.genotype_governance_processor', 'true', true)"))
-    return list_genotype_governance_requests(session)
+    assert_project_access(session, user, project_id)
+    _set_project_context(session, project_id)
+    return list_genotype_governance_requests(session, project_id)
 
 
 @app.patch("/api/genotype-governance-requests/{request_id}")
 def resolve_genotype_governance_request_endpoint(
     request_id: str,
     payload: GovernanceRequestResolution,
+    project_id: str = Query(..., min_length=36, max_length=36),
     user: CurrentUser = Depends(require_data_processor),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
     try:
         session.execute(text("SELECT set_config('app.genotype_governance_processor', 'true', true)"))
-        result = resolve_genotype_governance_request(session, request_id, audit_actor(user), payload)
+        assert_project_access(session, user, project_id)
+        _set_project_context(session, project_id)
+        result = resolve_genotype_governance_request(session, request_id, audit_actor(user), payload, project_id)
         session.commit()
         return result
     except GenotypeAssetError as exc:
@@ -2676,10 +3547,12 @@ def resolve_genotype_governance_request_endpoint(
 def download_genotype_phenotype_template(
     asset_id: str,
     version_id: str,
-    user: CurrentUser = Depends(require_researcher),
-    session: Session = Depends(get_research_session),
+    project_id: str = Query(..., min_length=36, max_length=36),
+    user: CurrentUser = Depends(require_genotype_user),
+    session: Session = Depends(get_genotype_session),
 ) -> Response:
     try:
+        _bind_genotype_project(session, user, project_id, asset_id)
         get_genotype_asset_version(session, asset_id, version_id)
         content = build_genotype_phenotype_template(session, version_id)
         filename = quote(f"{asset_id}-v{version_id[:8]}-连续性状表型模板.xlsx")
@@ -2692,10 +3565,12 @@ def download_genotype_phenotype_template(
 def download_genotype_mapping_template(
     asset_id: str,
     version_id: str,
-    user: CurrentUser = Depends(require_researcher),
-    session: Session = Depends(get_research_session),
+    project_id: str = Query(..., min_length=36, max_length=36),
+    user: CurrentUser = Depends(require_genotype_user),
+    session: Session = Depends(get_genotype_session),
 ) -> Response:
     try:
+        _bind_genotype_project(session, user, project_id, asset_id)
         get_genotype_asset_version(session, asset_id, version_id)
         content = build_genotype_mapping_template(session, version_id)
         filename = quote(f"{asset_id}-v{version_id[:8]}-样本材料映射模板.csv")
@@ -2709,13 +3584,25 @@ def download_genotype_qc_artifact(
     asset_id: str,
     version_id: str,
     kind: Literal["report", "package"],
-    user: CurrentUser = Depends(require_researcher),
-    session: Session = Depends(get_research_session),
-) -> FileResponse:
+    project_id: str = Query(..., min_length=36, max_length=36),
+    user: CurrentUser = Depends(require_genotype_user),
+    session: Session = Depends(get_genotype_session),
+) -> Response:
     try:
+        _bind_genotype_project(session, user, project_id, asset_id)
         get_genotype_asset_version(session, asset_id, version_id)
-        path, media_type = genotype_artifact_path(session, version_id, kind)
-        return FileResponse(path, media_type=media_type, filename=path.name)
+        locator, media_type, file_name = genotype_artifact_path(session, version_id, kind)
+        if locator.startswith("s3://"):
+            store = object_storage_manager.for_institution(user.institution_id)
+            if not store.exists(locator):
+                raise GenotypeAssetError("The requested genotype QC artifact has been removed.")
+            return Response(
+                content=store.read_bytes(locator),
+                media_type=media_type,
+                headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(file_name)}"},
+            )
+        path = Path(locator)
+        return FileResponse(path, media_type=media_type, filename=file_name)
     except GenotypeAssetError as exc:
         raise HTTPException(404, str(exc)) from exc
 
@@ -2727,6 +3614,7 @@ def create_gwas_analysis_plan(
     session: Session = Depends(get_research_session),
 ) -> dict[str, Any]:
     try:
+        _bind_research_project(session, user, payload.project_id)
         result = create_gwas_plan(session, user.id, payload)
         session.commit()
         return result
@@ -2738,10 +3626,12 @@ def create_gwas_analysis_plan(
 @app.get("/api/gwas/plans/{plan_id}")
 def get_gwas_analysis_plan(
     plan_id: str,
+    project_id: str = Query(..., min_length=36, max_length=36),
     user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
 ) -> dict[str, Any]:
     try:
+        _bind_research_project(session, user, project_id)
         return get_gwas_plan(session, plan_id)
     except GenomicsError as exc:
         raise HTTPException(404, str(exc)) from exc
@@ -2751,18 +3641,21 @@ def get_gwas_analysis_plan(
 def attach_genotype_asset_to_gwas_plan(
     plan_id: str,
     payload: AttachGenotypeAssetRequest,
+    project_id: str = Query(..., min_length=36, max_length=36),
     user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
 ) -> dict[str, Any]:
     """Attach one immutable, analysis-ready genotype version to a collecting GWAS plan."""
     try:
+        _bind_research_project(session, user, project_id)
         result = attach_analysis_ready_genotype(
             session,
             user.id,
             plan_id,
             payload.asset_id,
             payload.version_id,
-            RESEARCH_STORAGE_DIR,
+            _tenant_research_workspace(user.institution_id),
+            object_storage_manager.for_institution(user.institution_id),
         )
         session.commit()
         return result
@@ -2775,11 +3668,21 @@ def attach_genotype_asset_to_gwas_plan(
 async def upload_gwas_genotype_package(
     plan_id: str,
     file: UploadFile = File(...),
+    project_id: str = Query(..., min_length=36, max_length=36),
     user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
 ) -> dict[str, Any]:
     try:
-        result = upload_gwas_genotype(session, user.id, plan_id, file.filename or "genotype.zip", await file.read(), RESEARCH_STORAGE_DIR)
+        _bind_research_project(session, user, project_id)
+        result = upload_gwas_genotype(
+            session,
+            user.id,
+            plan_id,
+            file.filename or "genotype.zip",
+            await file.read(),
+            _tenant_research_workspace(user.institution_id),
+            object_storage_manager.for_institution(user.institution_id),
+        )
         session.commit()
         return result
     except GenomicsError as exc:
@@ -2792,11 +3695,22 @@ async def upload_gwas_phenotype_table(
     plan_id: str,
     trait_column: str = Query(..., min_length=1, max_length=120),
     file: UploadFile = File(...),
+    project_id: str = Query(..., min_length=36, max_length=36),
     user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
 ) -> dict[str, Any]:
     try:
-        result = upload_gwas_phenotype(session, user.id, plan_id, file.filename or "phenotype.csv", trait_column, await file.read(), RESEARCH_STORAGE_DIR)
+        _bind_research_project(session, user, project_id)
+        result = upload_gwas_phenotype(
+            session,
+            user.id,
+            plan_id,
+            file.filename or "phenotype.csv",
+            trait_column,
+            await file.read(),
+            _tenant_research_workspace(user.institution_id),
+            object_storage_manager.for_institution(user.institution_id),
+        )
         session.commit()
         return result
     except GenomicsError as exc:
@@ -2808,11 +3722,21 @@ async def upload_gwas_phenotype_table(
 async def upload_gwas_covariate_table(
     plan_id: str,
     file: UploadFile = File(...),
+    project_id: str = Query(..., min_length=36, max_length=36),
     user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
 ) -> dict[str, Any]:
     try:
-        result = upload_gwas_covariates(session, user.id, plan_id, file.filename or "covariates.csv", await file.read(), RESEARCH_STORAGE_DIR)
+        _bind_research_project(session, user, project_id)
+        result = upload_gwas_covariates(
+            session,
+            user.id,
+            plan_id,
+            file.filename or "covariates.csv",
+            await file.read(),
+            _tenant_research_workspace(user.institution_id),
+            object_storage_manager.for_institution(user.institution_id),
+        )
         session.commit()
         return result
     except GenomicsError as exc:
@@ -2823,10 +3747,12 @@ async def upload_gwas_covariate_table(
 @app.post("/api/gwas/plans/{plan_id}/confirm")
 def confirm_gwas_analysis_plan(
     plan_id: str,
+    project_id: str = Query(..., min_length=36, max_length=36),
     user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
 ) -> dict[str, Any]:
     try:
+        _bind_research_project(session, user, project_id)
         result = confirm_gwas_plan(session, user.id, plan_id)
         session.commit()
         return result
@@ -2838,19 +3764,29 @@ def confirm_gwas_analysis_plan(
 @app.post("/api/gwas/plans/{plan_id}/run")
 def queue_gwas_analysis_plan(
     plan_id: str,
+    project_id: str = Query(..., min_length=36, max_length=36),
     user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
 ) -> dict[str, Any]:
     try:
+        _bind_research_project(session, user, project_id)
         request_gwas_execution(session, plan_id)
         session.commit()
-        result = run_requested_local_execution(session, plan_id, RESEARCH_STORAGE_DIR)
+        workspace = _tenant_research_workspace(user.institution_id)
+        result = run_requested_local_execution(
+            session,
+            plan_id,
+            workspace,
+            object_storage_manager.for_institution(user.institution_id),
+        )
         if result["status"] == "completed":
-            content, file_name, metadata = build_local_gwas_result_bundle(session, plan_id, RESEARCH_STORAGE_DIR)
+            content, file_name, metadata = build_local_gwas_result_bundle(session, plan_id, workspace)
             saved = _store_gwas_result_bundle(
                 session,
+                institution_id=user.institution_id,
                 owner_id=user.id,
                 plan_id=plan_id,
+                project_id=project_id,
                 content=content,
                 file_name=file_name,
                 metadata=metadata,
@@ -2868,11 +3804,18 @@ def queue_gwas_analysis_plan(
 def download_local_gwas_result(
     plan_id: str,
     file_key: str,
+    project_id: str = Query(..., min_length=36, max_length=36),
     user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
 ) -> FileResponse:
     try:
-        path, media_type = get_local_gwas_result_file(session, plan_id, file_key, RESEARCH_STORAGE_DIR)
+        _bind_research_project(session, user, project_id)
+        path, media_type = get_local_gwas_result_file(
+            session,
+            plan_id,
+            file_key,
+            _tenant_research_workspace(user.institution_id),
+        )
         return FileResponse(path, media_type=media_type, filename=path.name)
     except GenomicsError as exc:
         raise HTTPException(404, str(exc)) from exc
@@ -2881,16 +3824,24 @@ def download_local_gwas_result(
 @app.post("/api/gwas/plans/{plan_id}/archive")
 def archive_completed_gwas_result(
     plan_id: str,
+    project_id: str = Query(..., min_length=36, max_length=36),
     user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
 ) -> dict[str, Any]:
     """Archive an already-completed plan, including runs completed before auto-archive existed."""
     try:
-        content, file_name, metadata = build_local_gwas_result_bundle(session, plan_id, RESEARCH_STORAGE_DIR)
+        _bind_research_project(session, user, project_id)
+        content, file_name, metadata = build_local_gwas_result_bundle(
+            session,
+            plan_id,
+            _tenant_research_workspace(user.institution_id),
+        )
         saved = _store_gwas_result_bundle(
             session,
+            institution_id=user.institution_id,
             owner_id=user.id,
             plan_id=plan_id,
+            project_id=project_id,
             content=content,
             file_name=file_name,
             metadata=metadata,
@@ -2908,106 +3859,60 @@ def research_query_templates(user: CurrentUser = Depends(require_researcher)) ->
     return template_catalog()
 
 
-@app.get("/api/research/standard-fields")
-def research_standard_fields(user: CurrentUser = Depends(require_researcher)) -> dict[str, Any]:
-    """Return every field available in the two public structured-query templates."""
-    return public_standard_field_catalog()
-
-
-@app.get("/api/research/published-data/varieties")
-def research_published_variety_options(
-    q: str = Query(default="", max_length=100),
-    scope: Literal["rice_phenotype", "root_phenotype"] = Query(default="rice_phenotype"),
+@app.get("/api/research/project-data/catalog")
+def research_project_data_catalog(
+    project_id: str = Query(..., min_length=36, max_length=36),
     user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
-) -> list[dict[str, Any]]:
-    """Search only the published varieties that belong to the active standard template."""
-    keyword = q.strip()
-    if scope == "root_phenotype":
-        observation_filter = """
-            EXISTS (
-                SELECT 1
-                FROM root_phenotype_observation observation
-                WHERE observation.variety_id = v.id
-            )
-        """
-    else:
-        observation_filter = """
-            EXISTS (
-                SELECT 1
-                FROM phenotype_observation observation
-                WHERE observation.variety_id = v.id
-                  AND observation.publish_status = 'published'
-            )
-        """
-    rows = session.execute(text(f"""
-        SELECT v.id, v.variety_name, v.alias_names, v.variety_type, v.approval_number
-        FROM variety_basic v
-        WHERE v.data_status = 'published'
-          AND {observation_filter}
-          AND (
-              :keyword = ''
-              OR v.variety_name ILIKE :pattern
-              OR v.normalized_name ILIKE :pattern
-              OR COALESCE(v.alias_names::text, '') ILIKE :pattern
-          )
-        ORDER BY
-            CASE WHEN :keyword <> '' AND v.variety_name ILIKE :exact THEN 0 ELSE 1 END,
-            v.variety_name
-        LIMIT 20
-    """), {
-        "keyword": keyword,
-        "pattern": f"%{keyword}%",
-        "exact": keyword,
-    }).mappings().all()
-    return [{
-        "id": str(row["id"]),
-        "variety_name": row["variety_name"],
-        "aliases": row["alias_names"] or [],
-        "variety_type": row["variety_type"],
-        "approval_number": row["approval_number"],
-    } for row in rows]
+) -> dict[str, Any]:
+    """Return the allowlisted data domains for one project the user may access."""
+    assert_project_access(session, user, project_id)
+    _set_project_context(session, project_id)
+    catalog = project_data_catalog()
+    project = session.execute(text(
+        "SELECT id, project_name, research_direction FROM research_project WHERE id=:project_id"
+    ), {"project_id": project_id}).mappings().one()
+    return {"project": dict(project), **catalog}
 
 
-@app.post("/api/research/published-data/query")
-def research_published_data_query(
+@app.post("/api/research/project-data/query")
+def research_project_data_query(
     payload: ResearchStructuredQueryRequest,
     user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
 ) -> dict[str, Any]:
-    """Run a user-built query plan through the same guarded templates as the agent."""
-    normalized_names = [name.strip() for name in payload.variety_names if name.strip()]
-    request = StructuredQueryRequest(
-        query_needed=True,
-        scope=payload.scope,
-        variety_names=normalized_names,
-        trait_codes=payload.trait_codes,
-        filters=payload.filters,
-    )
-    plan, unresolved_names = plan_query_from_structured_request(
-        session,
-        request,
-        TRAITS,
-        ROOT_TRAITS,
-    )
-    if not plan:
-        if unresolved_names:
-            raise HTTPException(404, f"未在已发布标准数据中找到：{'、'.join(unresolved_names)}")
-        raise HTTPException(422, "请至少选择一个标准字段、填写一个品种/材料名称，或添加一个数值筛选条件。")
-    plan = plan.model_copy(update={"limit": payload.limit})
-    execution = execute_published_data_query(session, plan)
-    execution.unresolved_variety_names = unresolved_names
-    return serialize_public_query_execution(execution)
+    """Query an allowlisted business dataset inside the selected project."""
+    assert_project_access(session, user, payload.project_id)
+    _set_project_context(session, payload.project_id)
+    try:
+        return query_project_data(
+            session,
+            project_id=payload.project_id,
+            dataset_code=payload.dataset,
+            selected_field_codes=payload.fields,
+            search=payload.search,
+            filters=[item.model_dump() for item in payload.filters],
+            limit=payload.limit,
+            offset=payload.offset,
+        )
+    except ProjectDataQueryError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
 
 @app.get("/api/research/sessions")
 def list_research_sessions(
+    project_id: str = Query(min_length=36, max_length=36),
     user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
 ) -> list[dict[str, Any]]:
+    assert_project_access(session, user, project_id)
+    _set_project_context(session, project_id)
     items = session.scalars(
         select(ResearchSession)
-        .where(ResearchSession.owner_id == user.id)
+        .where(
+            ResearchSession.owner_id == user.id,
+            ResearchSession.project_id == project_id,
+        )
         .order_by(ResearchSession.updated_at.desc())
     ).all()
     return [serialize_research_session(item) for item in items]
@@ -3019,7 +3924,13 @@ def create_research_session(
     user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
 ) -> dict[str, Any]:
-    item = ResearchSession(owner_id=user.id, title=payload.title.strip())
+    assert_project_access(session, user, payload.project_id)
+    _set_project_context(session, payload.project_id)
+    item = ResearchSession(
+        owner_id=user.id,
+        project_id=payload.project_id,
+        title=payload.title.strip(),
+    )
     session.add(item)
     session.flush()
     result = serialize_research_session(item)
@@ -3038,8 +3949,11 @@ def get_owned_research_session(session: Session, session_id: str) -> ResearchSes
 def rename_research_session(
     research_session_id: str,
     payload: ResearchSessionRename,
+    project_id: str = Query(..., min_length=36, max_length=36),
+    user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
 ) -> dict[str, Any]:
+    _bind_research_project(session, user, project_id)
     item = get_owned_research_session(session, research_session_id)
     item.title = payload.title.strip()
     item.updated_at = datetime.now(timezone.utc)
@@ -3052,14 +3966,16 @@ def rename_research_session(
 @app.delete("/api/research/sessions/{research_session_id}")
 def delete_research_session(
     research_session_id: str,
+    project_id: str = Query(..., min_length=36, max_length=36),
     user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
 ) -> dict[str, bool]:
+    _bind_research_project(session, user, project_id)
     item = get_owned_research_session(session, research_session_id)
     attachments = session.scalars(
         select(ResearchAttachment).where(ResearchAttachment.session_id == item.id)
     ).all()
-    paths = [Path(attachment.storage_path) for attachment in attachments]
+    object_locators = [attachment.storage_path for attachment in attachments]
     for attachment in attachments:
         session.delete(attachment)
     for message in session.scalars(
@@ -3072,26 +3988,25 @@ def delete_research_session(
         session.delete(audit)
     session.delete(item)
     session.commit()
-    for path in paths:
+    store = object_storage_manager.for_institution(user.institution_id)
+    for locator in object_locators:
         try:
-            path.unlink(missing_ok=True)
-        except OSError:
+            store.delete(locator)
+        except (OSError, ObjectStorageError):
             # The database record is gone. A future local maintenance job can
             # remove an orphaned file without retaining research content.
             pass
-    session_dir = RESEARCH_STORAGE_DIR / user.id / research_session_id
-    try:
-        session_dir.rmdir()
-    except OSError:
-        pass
     return {"deleted": True}
 
 
 @app.get("/api/research/sessions/{research_session_id}/messages")
 def list_research_messages(
     research_session_id: str,
+    project_id: str = Query(..., min_length=36, max_length=36),
+    user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
 ) -> list[dict[str, Any]]:
+    _bind_research_project(session, user, project_id)
     get_owned_research_session(session, research_session_id)
     items = session.scalars(
         select(ResearchMessage)
@@ -3104,8 +4019,11 @@ def list_research_messages(
 @app.get("/api/research/sessions/{research_session_id}/attachments")
 def list_research_attachments(
     research_session_id: str,
+    project_id: str = Query(..., min_length=36, max_length=36),
+    user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
 ) -> list[dict[str, Any]]:
+    _bind_research_project(session, user, project_id)
     get_owned_research_session(session, research_session_id)
     items = session.scalars(
         select(ResearchAttachment)
@@ -3119,10 +4037,16 @@ def list_research_attachments(
 async def upload_research_attachment(
     research_session_id: str,
     file: UploadFile = File(...),
+    project_id: str = Query(..., min_length=36, max_length=36),
     user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
 ) -> dict[str, Any]:
-    get_owned_research_session(session, research_session_id)
+    _bind_research_project(session, user, project_id)
+    research_session = get_owned_research_session(session, research_session_id)
+    if not research_session.project_id:
+        raise HTTPException(409, "旧会话尚未归属课题，请在选定课题后新建会话再上传资料。")
+    assert_project_access(session, user, research_session.project_id)
+    _set_project_context(session, research_session.project_id)
     original_name = (file.filename or "附件").strip()
     suffix = Path(original_name).suffix.lower()
     if suffix not in SUPPORTED_SUFFIXES and suffix not in VISION_IMAGE_SUFFIXES:
@@ -3135,35 +4059,50 @@ async def upload_research_attachment(
 
     safe_name = re.sub(r"[^\w.\-()（）]+", "_", original_name).strip("._") or f"attachment{suffix}"
     attachment_id = str(uuid.uuid4())
-    directory = RESEARCH_STORAGE_DIR / user.id / research_session_id
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{attachment_id}_{safe_name}"
-    path.write_bytes(content)
+    store = object_storage_manager.for_institution(user.institution_id)
+    object_key = project_object_key(
+        project_id=research_session.project_id,
+        category="research-sessions",
+        resource_id=research_session_id,
+        owner_user_id=user.id,
+        file_name=f"{attachment_id}_{safe_name}",
+    )
+    try:
+        stored = store.put_bytes(
+            object_key,
+            content,
+            file.content_type or "application/octet-stream",
+        )
+    except ObjectStorageError as exc:
+        raise HTTPException(503, "机构文件存储暂不可用，附件未保存。") from exc
 
     if suffix in VISION_IMAGE_SUFFIXES:
         attachment = ResearchAttachment(
             id=attachment_id,
             session_id=research_session_id,
             owner_id=user.id,
+            project_id=research_session.project_id,
             file_name=original_name,
             content_type=file.content_type,
             size_bytes=len(content),
-            storage_path=str(path),
+            storage_path=stored.locator,
             parser_name="native_image",
             parsing_status="image_ready",
             parser_warnings=["图片不进行本地 Docling 或 OCR 文字解析；提问时将原图直接提交给当前配置的大模型进行多模态分析。"],
         )
     else:
         try:
-            parsed = await parse_local_document(path)
+            with store.materialize(stored.locator, suffix=suffix) as parse_path:
+                parsed = await parse_local_document(parse_path)
             attachment = ResearchAttachment(
                 id=attachment_id,
                 session_id=research_session_id,
                 owner_id=user.id,
+                project_id=research_session.project_id,
                 file_name=original_name,
                 content_type=file.content_type,
                 size_bytes=len(content),
-                storage_path=str(path),
+                storage_path=stored.locator,
                 parser_name=parsed.parser,
                 parsing_status="parsed",
                 parsed_markdown=parsed.markdown,
@@ -3175,10 +4114,11 @@ async def upload_research_attachment(
                 id=attachment_id,
                 session_id=research_session_id,
                 owner_id=user.id,
+                project_id=research_session.project_id,
                 file_name=original_name,
                 content_type=file.content_type,
                 size_bytes=len(content),
-                storage_path=str(path),
+                storage_path=stored.locator,
                 parsing_status="failed",
                 parser_warnings=[str(exc)[:500]],
             )
@@ -3198,8 +4138,11 @@ async def upload_research_attachment(
 @app.get("/api/research/attachments/{attachment_id}/preview")
 def preview_research_attachment(
     attachment_id: str,
+    project_id: str = Query(..., min_length=36, max_length=36),
+    user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
 ) -> dict[str, Any]:
+    _bind_research_project(session, user, project_id)
     attachment = session.get(ResearchAttachment, attachment_id)
     if not attachment:
         raise HTTPException(404, "未找到该私有附件，或当前账号无权访问。")
@@ -3209,9 +4152,12 @@ def preview_research_attachment(
 @app.get("/api/research/attachments/{attachment_id}/image")
 def read_research_attachment_image(
     attachment_id: str,
+    project_id: str = Query(..., min_length=36, max_length=36),
+    user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
-) -> FileResponse:
+) -> Response:
     """Return an authorized private image for inline assistant preview only."""
+    _bind_research_project(session, user, project_id)
     attachment = session.get(ResearchAttachment, attachment_id)
     if not attachment:
         raise HTTPException(404, "未找到该私有图片，或当前账号无权访问。")
@@ -3226,27 +4172,34 @@ def read_research_attachment_image(
     if suffix not in mime_by_suffix:
         raise HTTPException(415, "该附件不是可预览的图片。")
 
-    path = Path(attachment.storage_path)
-    if not path.is_file():
+    store = object_storage_manager.for_institution(user.institution_id)
+    if not store.exists(attachment.storage_path):
         raise HTTPException(409, "图片原文件已不存在，请重新上传。")
     media_type = attachment.content_type if attachment.content_type in mime_by_suffix.values() else mime_by_suffix[suffix]
-    return FileResponse(path, media_type=media_type, headers={"Content-Disposition": "inline"})
+    return Response(
+        content=store.read_bytes(attachment.storage_path),
+        media_type=media_type,
+        headers={"Content-Disposition": "inline"},
+    )
 
 
 @app.delete("/api/research/attachments/{attachment_id}")
 def delete_research_attachment(
     attachment_id: str,
+    project_id: str = Query(..., min_length=36, max_length=36),
+    user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
 ) -> dict[str, bool]:
+    _bind_research_project(session, user, project_id)
     attachment = session.get(ResearchAttachment, attachment_id)
     if not attachment:
         raise HTTPException(404, "未找到该私有附件，或当前账号无权访问。")
-    path = Path(attachment.storage_path)
+    locator = attachment.storage_path
     session.delete(attachment)
     session.commit()
     try:
-        path.unlink(missing_ok=True)
-    except OSError:
+        object_storage_manager.for_institution(user.institution_id).delete(locator)
+    except (OSError, ObjectStorageError):
         pass
     return {"deleted": True}
 
@@ -3287,14 +4240,14 @@ def safe_knowledge_filename(name: str) -> str:
     return f"{stem}{suffix}"
 
 
-def delete_knowledge_file(path: str) -> None:
+def delete_knowledge_file(path: str, institution_id: str) -> None:
     try:
-        Path(path).unlink(missing_ok=True)
-    except OSError:
+        object_storage_manager.for_institution(institution_id).delete(path)
+    except (OSError, ObjectStorageError):
         pass
 
 
-def process_knowledge_document(document_id: str) -> None:
+def process_knowledge_document(document_id: str, institution_id: str) -> None:
     """Parse and index an authorized on-host file in a background task."""
     queued_at = time.monotonic()
     logger.info(
@@ -3307,7 +4260,7 @@ def process_knowledge_document(document_id: str) -> None:
     # explicitly been configured to sustain; by default the work is serial.
     with KNOWLEDGE_DOCUMENT_SEMAPHORE:
         queue_wait_seconds = time.monotonic() - queued_at
-        with MigrationSessionLocal() as session:
+        with tenant_database_manager.migration_session(institution_id) as session:
             document = session.get(KnowledgeDocument, document_id)
             if not document or document.status in {"withdrawn", "superseded", "deleted"}:
                 logger.info("Knowledge document skipped: document_id=%s", document_id)
@@ -3328,7 +4281,10 @@ def process_knowledge_document(document_id: str) -> None:
             total_started_at = time.monotonic()
             try:
                 parse_started_at = time.monotonic()
-                parsed = asyncio.run(parse_local_document(Path(document.storage_path)))
+                store = object_storage_manager.for_institution(institution_id)
+                suffix = Path(document.original_file_name).suffix.lower()
+                with store.materialize(document.storage_path, suffix=suffix) as local_path:
+                    parsed = asyncio.run(parse_local_document(local_path))
                 parse_elapsed_seconds = time.monotonic() - parse_started_at
                 chunks = split_markdown(parsed.markdown)
                 session.execute(
@@ -3359,6 +4315,7 @@ def process_knowledge_document(document_id: str) -> None:
                         document_id=document.id,
                         scope=document.scope,
                         owner_id=document.owner_id,
+                        project_id=document.project_id,
                         folder_id=document.folder_id,
                         document_status=document.status,
                         ordinal=ordinal,
@@ -3417,16 +4374,16 @@ def process_knowledge_document(document_id: str) -> None:
                     session.commit()
 
 
-def resume_interrupted_knowledge_documents() -> None:
+def resume_interrupted_knowledge_documents(institution_id: str) -> None:
     """Resume durable knowledge jobs that were interrupted by an API restart."""
-    with MigrationSessionLocal() as session:
+    with tenant_database_manager.migration_session(institution_id) as session:
         document_ids = list(session.scalars(
             select(KnowledgeDocument.id).where(KnowledgeDocument.status == "processing")
         ))
     for document_id in document_ids:
         threading.Thread(
             target=process_knowledge_document,
-            args=(document_id,),
+            args=(document_id, institution_id),
             daemon=True,
             name=f"knowledge-resume-{document_id[:8]}",
         ).start()
@@ -3434,11 +4391,18 @@ def resume_interrupted_knowledge_documents() -> None:
 
 @app.get("/api/knowledge/summary")
 def knowledge_summary(
+    project_id: str | None = Query(default=None, min_length=36, max_length=36),
     user: CurrentUser = Depends(require_knowledge_user),
     session: Session = Depends(get_knowledge_session),
 ) -> dict[str, Any]:
-    private_count = session.scalar(select(func.count(KnowledgeDocument.id)).where(KnowledgeDocument.scope == "private")) or 0
-    private_bytes = session.scalar(select(func.coalesce(func.sum(KnowledgeDocument.size_bytes), 0)).where(KnowledgeDocument.scope == "private")) or 0
+    private_conditions = [KnowledgeDocument.scope == "private"]
+    if project_id:
+        _bind_research_project(session, user, project_id)
+        private_conditions.append(KnowledgeDocument.project_id == project_id)
+    else:
+        private_conditions.append(KnowledgeDocument.id == "__no_project_selected__")
+    private_count = session.scalar(select(func.count(KnowledgeDocument.id)).where(*private_conditions)) or 0
+    private_bytes = session.scalar(select(func.coalesce(func.sum(KnowledgeDocument.size_bytes), 0)).where(*private_conditions)) or 0
     public_count = session.scalar(
         select(func.count(KnowledgeDocument.id)).where(KnowledgeDocument.scope == "public", KnowledgeDocument.status == "published")
     ) or 0
@@ -3446,9 +4410,9 @@ def knowledge_summary(
         "private_document_count": private_count,
         "private_size_bytes": int(private_bytes),
         "public_published_count": public_count,
-        "is_public_admin": "field_admin" in user.roles,
+        "is_public_admin": is_knowledge_curator(user),
     }
-    if "field_admin" in user.roles:
+    if is_knowledge_curator(user):
         result["public_review_count"] = session.scalar(
             select(func.count(KnowledgeDocument.id)).where(KnowledgeDocument.scope == "public", KnowledgeDocument.status.in_(("processing", "review", "failed")))
         ) or 0
@@ -3478,8 +4442,8 @@ def create_knowledge_folder(
     user: CurrentUser = Depends(require_knowledge_user),
     session: Session = Depends(get_knowledge_session),
 ) -> dict[str, Any]:
-    if scope == "public" and "field_admin" not in user.roles:
-        raise HTTPException(403, "公共知识库分类仅允许字段管理员维护。")
+    if scope == "public" and not is_knowledge_curator(user):
+        raise HTTPException(403, "公共知识库分类仅允许数据处理员维护。")
     parent = None
     if payload.parent_id:
         parent = session.get(KnowledgeFolder, payload.parent_id)
@@ -3522,8 +4486,8 @@ def update_knowledge_folder(
     folder = session.get(KnowledgeFolder, folder_id)
     if not folder:
         raise HTTPException(404, "未找到该文件夹。")
-    if folder.scope == "public" and "field_admin" not in user.roles:
-        raise HTTPException(403, "公共知识库分类仅允许字段管理员维护。")
+    if folder.scope == "public" and not is_knowledge_curator(user):
+        raise HTTPException(403, "公共知识库分类仅允许数据处理员维护。")
     if folder.scope == "private" and folder.owner_id != user.id:
         raise HTTPException(403, "不能修改其他科研人员的私人文件夹。")
     if payload.parent_id == folder.id:
@@ -3567,8 +4531,8 @@ def delete_knowledge_folder(
     folder = session.get(KnowledgeFolder, folder_id)
     if not folder:
         raise HTTPException(404, "未找到该文件夹。")
-    if folder.scope == "public" and "field_admin" not in user.roles:
-        raise HTTPException(403, "公共知识库分类仅允许字段管理员维护。")
+    if folder.scope == "public" and not is_knowledge_curator(user):
+        raise HTTPException(403, "公共知识库分类仅允许数据处理员维护。")
     if folder.scope == "private" and folder.owner_id != user.id:
         raise HTTPException(403, "不能删除其他科研人员的私人文件夹。")
     child_count = session.scalar(select(func.count(KnowledgeFolder.id)).where(KnowledgeFolder.parent_id == folder.id)) or 0
@@ -3583,6 +4547,7 @@ def delete_knowledge_folder(
 @app.get("/api/knowledge/documents")
 def list_knowledge_documents(
     scope: Literal["private", "public"] = Query(...),
+    project_id: str | None = Query(default=None, min_length=36, max_length=36),
     folder_id: str | None = Query(default=None),
     q: str = Query(default="", max_length=200),
     include_unpublished: bool = Query(default=False),
@@ -3590,7 +4555,12 @@ def list_knowledge_documents(
     session: Session = Depends(get_knowledge_session),
 ) -> list[dict[str, Any]]:
     statement = select(KnowledgeDocument).where(KnowledgeDocument.scope == scope)
-    if scope == "public" and not (include_unpublished and "field_admin" in user.roles):
+    if scope == "private":
+        if not project_id:
+            raise HTTPException(422, "查询私有知识资料时必须先选择课题。")
+        _bind_research_project(session, user, project_id)
+        statement = statement.where(KnowledgeDocument.project_id == project_id)
+    if scope == "public" and not (include_unpublished and is_knowledge_curator(user)):
         statement = statement.where(KnowledgeDocument.status == "published")
     if folder_id:
         statement = statement.where(KnowledgeDocument.folder_id == folder_id)
@@ -3613,6 +4583,7 @@ async def upload_knowledge_documents(
     background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(...),
     scope: Literal["private", "public"] = Query(...),
+    project_id: str | None = Query(default=None, min_length=36, max_length=36),
     folder_id: str | None = Query(default=None),
     source_organization: str = Query(default="", max_length=300),
     author: str = Query(default="", max_length=300),
@@ -3626,9 +4597,13 @@ async def upload_knowledge_documents(
 ) -> list[dict[str, Any]]:
     if not files or len(files) > MAX_KNOWLEDGE_BATCH_FILES:
         raise HTTPException(422, f"每次最多上传 {MAX_KNOWLEDGE_BATCH_FILES} 个知识库文件。")
-    if scope == "public" and "field_admin" not in user.roles:
-        raise HTTPException(403, "公共知识库仅允许字段管理员上传和维护。")
-    if supersedes_document_id and (scope != "public" or "field_admin" not in user.roles or len(files) != 1):
+    if scope == "public" and not is_knowledge_curator(user):
+        raise HTTPException(403, "公共知识库仅允许数据处理员上传和维护。")
+    if scope == "private":
+        if not project_id:
+            raise HTTPException(422, "上传私有知识资料时必须先选择归属课题。")
+        _bind_research_project(session, user, project_id)
+    if supersedes_document_id and (scope != "public" or not is_knowledge_curator(user) or len(files) != 1):
         raise HTTPException(422, "公共资料的新版本一次只能上传一个文件，并且只能由字段管理员操作。")
     folder = validate_knowledge_folder(session, folder_id=folder_id, scope=scope, user=user)
     previous: KnowledgeDocument | None = None
@@ -3641,6 +4616,7 @@ async def upload_knowledge_documents(
 
     created: list[KnowledgeDocument] = []
     total_size = 0
+    store = object_storage_manager.for_institution(user.institution_id)
     for file in files:
         original_name = (file.filename or "knowledge-document").strip()
         suffix = Path(original_name).suffix.lower()
@@ -3662,25 +4638,38 @@ async def upload_knowledge_documents(
         ]
         if scope == "private":
             duplicate_conditions.append(KnowledgeDocument.owner_id == user.id)
+            duplicate_conditions.append(KnowledgeDocument.project_id == project_id)
         duplicate = session.scalar(select(KnowledgeDocument).where(*duplicate_conditions))
         if duplicate:
             raise HTTPException(409, f"{original_name} 的相同内容已存在于当前知识库，未重复保存。")
         document_id = str(uuid.uuid4())
-        directory = KNOWLEDGE_STORAGE_DIR / scope / (user.id if scope == "private" else "public") / document_id
-        directory.mkdir(parents=True, exist_ok=True)
-        path = directory / safe_knowledge_filename(original_name)
-        path.write_bytes(content)
+        object_key = project_object_key(
+            project_id=project_id if scope == "private" else None,
+            category=f"knowledge-{scope}",
+            resource_id=document_id,
+            owner_user_id=user.id if scope == "private" else None,
+            file_name=safe_knowledge_filename(original_name),
+        )
+        try:
+            stored = store.put_bytes(
+                object_key,
+                content,
+                file.content_type or "application/octet-stream",
+            )
+        except ObjectStorageError as exc:
+            raise HTTPException(503, "机构文件存储暂不可用，知识资料未保存。") from exc
         item = KnowledgeDocument(
             id=document_id,
             scope=scope,
             owner_id=user.id,
+            project_id=project_id if scope == "private" else None,
             folder_id=folder.id,
             original_file_name=original_name,
             display_title=Path(original_name).stem or original_name,
             content_type=file.content_type,
             size_bytes=len(content),
             content_hash=content_hash,
-            storage_path=str(path),
+            storage_path=stored.locator,
             source_organization=source_organization.strip() or None,
             author=author.strip() or None,
             publication_year=publication_year.strip() or None,
@@ -3697,7 +4686,7 @@ async def upload_knowledge_documents(
     response = [serialize_knowledge_document(item, folder) for item in created]
     session.commit()
     for item in created:
-        background_tasks.add_task(process_knowledge_document, item.id)
+        background_tasks.add_task(process_knowledge_document, item.id, user.institution_id)
     return response
 
 
@@ -3709,8 +4698,8 @@ def update_knowledge_document(
     session: Session = Depends(get_knowledge_session),
 ) -> dict[str, Any]:
     document = get_visible_knowledge_document(session, document_id)
-    if document.scope == "public" and "field_admin" not in user.roles:
-        raise HTTPException(403, "公共知识库资料仅允许字段管理员维护。")
+    if document.scope == "public" and not is_knowledge_curator(user):
+        raise HTTPException(403, "公共知识库资料仅允许数据处理员维护。")
     if document.scope == "private" and document.owner_id != user.id:
         raise HTTPException(403, "不能修改其他科研人员的私人资料。")
     folder = validate_knowledge_folder(session, folder_id=payload.folder_id, scope=document.scope, user=user)
@@ -3770,8 +4759,8 @@ def reindex_knowledge_document(
     session: Session = Depends(get_knowledge_session),
 ) -> dict[str, Any]:
     document = get_visible_knowledge_document(session, document_id)
-    if document.scope == "public" and "field_admin" not in user.roles:
-        raise HTTPException(403, "公共知识库资料仅允许字段管理员重新处理。")
+    if document.scope == "public" and not is_knowledge_curator(user):
+        raise HTTPException(403, "公共知识库资料仅允许数据处理员重新处理。")
     if document.scope == "private" and document.owner_id != user.id:
         raise HTTPException(403, "不能重新处理其他科研人员的私人资料。")
     if document.status == "processing" or document.parsing_status == "processing":
@@ -3780,7 +4769,7 @@ def reindex_knowledge_document(
     document.indexing_status = "pending"
     document.status = "processing"
     session.commit()
-    background_tasks.add_task(process_knowledge_document, document.id)
+    background_tasks.add_task(process_knowledge_document, document.id, user.institution_id)
     return {"queued": True}
 
 
@@ -3848,11 +4837,7 @@ def delete_private_knowledge_document(
     storage_path = document.storage_path
     session.delete(document)
     session.commit()
-    delete_knowledge_file(storage_path)
-    try:
-        Path(storage_path).parent.rmdir()
-    except OSError:
-        pass
+    delete_knowledge_file(storage_path, user.institution_id)
     return {"deleted": True}
 
 
@@ -3870,14 +4855,35 @@ def ensure_research_rls(session: Session) -> None:
         "research_audit",
         "research_result",
     ]
+    has_project_helper = bool(session.execute(
+        text("SELECT to_regprocedure('longyun_can_access_project(character varying)') IS NOT NULL")
+    ).scalar())
     for table_name in table_names:
         session.execute(text(f"ALTER TABLE {table_name} ENABLE ROW LEVEL SECURITY"))
         session.execute(text(f"ALTER TABLE {table_name} FORCE ROW LEVEL SECURITY"))
         session.execute(text(f"DROP POLICY IF EXISTS research_owner_only ON {table_name}"))
+        if has_project_helper and table_name in {
+            "research_session", "research_attachment", "research_result"
+        }:
+            predicate = (
+                "owner_id = current_setting('app.research_user_id', true) "
+                "AND project_id IS NOT NULL "
+                "AND project_id = current_setting('app.project_id', true) "
+                "AND longyun_can_access_project(project_id)"
+            )
+        elif has_project_helper and table_name == "research_message":
+            predicate = (
+                "owner_id = current_setting('app.research_user_id', true) "
+                "AND EXISTS (SELECT 1 FROM research_session parent "
+                f"WHERE parent.id = {table_name}.session_id "
+                "AND parent.project_id = current_setting('app.project_id', true) "
+                "AND longyun_can_access_project(parent.project_id))"
+            )
+        else:
+            predicate = "owner_id = current_setting('app.research_user_id', true)"
         session.execute(text(
             f"CREATE POLICY research_owner_only ON {table_name} "
-            "FOR ALL USING (owner_id = current_setting('app.research_user_id', true)) "
-            "WITH CHECK (owner_id = current_setting('app.research_user_id', true))"
+            f"FOR ALL USING ({predicate}) WITH CHECK ({predicate})"
         ))
     session.commit()
 
@@ -3947,18 +4953,38 @@ def ensure_knowledge_rls(session: Session) -> None:
             "OR COALESCE(current_setting('app.knowledge_is_admin', true), 'false') = 'true')",
         ),
         "knowledge_document": (
-            "(owner_id = current_setting('app.research_user_id', true) "
+            "((scope = 'private' "
+            "AND (owner_id = current_setting('app.research_user_id', true) "
+            "OR COALESCE(current_setting('app.knowledge_is_admin', true), 'false') = 'true') "
+            "AND project_id IS NOT NULL "
+            "AND project_id = current_setting('app.project_id', true) "
+            "AND longyun_can_access_project(project_id)) "
             "OR (scope = 'public' AND status = 'published') "
-            "OR COALESCE(current_setting('app.knowledge_is_admin', true), 'false') = 'true')",
-            "((scope = 'private' AND owner_id = current_setting('app.research_user_id', true)) "
-            "OR COALESCE(current_setting('app.knowledge_is_admin', true), 'false') = 'true')",
+            "OR (scope = 'public' AND COALESCE(current_setting('app.knowledge_is_admin', true), 'false') = 'true'))",
+            "((scope = 'private' "
+            "AND (owner_id = current_setting('app.research_user_id', true) "
+            "OR COALESCE(current_setting('app.knowledge_is_admin', true), 'false') = 'true') "
+            "AND project_id IS NOT NULL "
+            "AND project_id = current_setting('app.project_id', true) "
+            "AND longyun_can_access_project(project_id)) "
+            "OR (scope = 'public' AND COALESCE(current_setting('app.knowledge_is_admin', true), 'false') = 'true'))",
         ),
         "knowledge_chunk": (
-            "(owner_id = current_setting('app.research_user_id', true) "
+            "((scope = 'private' "
+            "AND (owner_id = current_setting('app.research_user_id', true) "
+            "OR COALESCE(current_setting('app.knowledge_is_admin', true), 'false') = 'true') "
+            "AND project_id IS NOT NULL "
+            "AND project_id = current_setting('app.project_id', true) "
+            "AND longyun_can_access_project(project_id)) "
             "OR (scope = 'public' AND document_status = 'published') "
-            "OR COALESCE(current_setting('app.knowledge_is_admin', true), 'false') = 'true')",
-            "((scope = 'private' AND owner_id = current_setting('app.research_user_id', true)) "
-            "OR COALESCE(current_setting('app.knowledge_is_admin', true), 'false') = 'true')",
+            "OR (scope = 'public' AND COALESCE(current_setting('app.knowledge_is_admin', true), 'false') = 'true'))",
+            "((scope = 'private' "
+            "AND (owner_id = current_setting('app.research_user_id', true) "
+            "OR COALESCE(current_setting('app.knowledge_is_admin', true), 'false') = 'true') "
+            "AND project_id IS NOT NULL "
+            "AND project_id = current_setting('app.project_id', true) "
+            "AND longyun_can_access_project(project_id)) "
+            "OR (scope = 'public' AND COALESCE(current_setting('app.knowledge_is_admin', true), 'false') = 'true'))",
         ),
     }
     for table_name, (using_clause, check_clause) in policies.items():
@@ -3977,9 +5003,19 @@ def ensure_knowledge_rls(session: Session) -> None:
     session.commit()
 
 
-async def build_published_evidence_context(session: Session, question: str, requested_by: str = "系统") -> tuple[str, list[dict[str, Any]]]:
+async def build_published_evidence_context(
+    session: Session,
+    question: str,
+    requested_by: str = "系统",
+    project_id: str | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
     """Use controlled templates instead of sending a bulk database snapshot to the model."""
-    trial_context, trial_cards = build_published_trial_evidence(session, question, requested_by)
+    trial_context, trial_cards = build_published_trial_evidence(
+        session,
+        question,
+        requested_by,
+        project_id=project_id,
+    )
     if trial_context:
         return trial_context, trial_cards
     query_plan = plan_query_from_question(session, question, TRAITS, ROOT_TRAITS)
@@ -4118,19 +5154,26 @@ def build_knowledge_evidence_context(
     user: CurrentUser,
     knowledge_scope: Literal["private", "public", "both"],
     question: str,
+    project_id: str,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Retrieve only local BGE-M3 chunks that PostgreSQL RLS already authorizes."""
     document_conditions = [
         KnowledgeDocument.parsing_status == "parsed",
         KnowledgeDocument.indexing_status == "ready",
     ]
+    private_document_condition = (
+        (KnowledgeDocument.scope == "private")
+        & (KnowledgeDocument.owner_id == user.id)
+        & (KnowledgeDocument.project_id == project_id)
+        & (KnowledgeDocument.status == "ready")
+    )
     if knowledge_scope == "private":
-        document_conditions.extend((KnowledgeDocument.scope == "private", KnowledgeDocument.owner_id == user.id, KnowledgeDocument.status == "ready"))
+        document_conditions.append(private_document_condition)
     elif knowledge_scope == "public":
         document_conditions.extend((KnowledgeDocument.scope == "public", KnowledgeDocument.status == "published"))
     else:
         document_conditions.append(
-            ((KnowledgeDocument.scope == "private") & (KnowledgeDocument.owner_id == user.id) & (KnowledgeDocument.status == "ready"))
+            private_document_condition
             | ((KnowledgeDocument.scope == "public") & (KnowledgeDocument.status == "published"))
         )
 
@@ -4237,6 +5280,7 @@ def build_knowledge_evidence_context(
 
 def build_native_vision_blocks(
     attachments: list[ResearchAttachment],
+    institution_id: str,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Load local images as compact, temporary multimodal model blocks.
 
@@ -4254,11 +5298,15 @@ def build_native_vision_blocks(
 
     blocks: list[dict[str, Any]] = []
     cards: list[dict[str, Any]] = []
+    store = object_storage_manager.for_institution(institution_id)
     for index, item in enumerate(images, start=1):
-        path = Path(item.storage_path)
-        if not path.is_file():
+        if not store.exists(item.storage_path):
             raise HTTPException(409, f"图片附件“{item.file_name}”已不在本地存储中，请重新上传后再分析。")
-        image_url, model_size, normalized = build_native_vision_image_url(path)
+        with store.materialize(
+            item.storage_path,
+            suffix=Path(item.file_name).suffix.lower(),
+        ) as path:
+            image_url, model_size, normalized = build_native_vision_image_url(path)
         blocks.append({
             "type": "text",
             "text": f"本轮图片 {index}（文件名：{item.file_name}）。",
@@ -4465,10 +5513,27 @@ def _report_fallback_content(
 async def research_chat_stream(
     research_session_id: str,
     payload: ResearchChatRequest,
+    project_id: str = Query(..., min_length=36, max_length=36),
     user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
 ) -> StreamingResponse:
+    _bind_research_project(session, user, project_id)
     research_session = get_owned_research_session(session, research_session_id)
+    if not research_session.project_id:
+        raise HTTPException(409, "该历史会话尚未归属课题，请新建已绑定课题的会话。")
+    _bind_research_project(session, user, research_session.project_id)
+    model_policy = get_model_data_policy()
+    model_request_id = f"chat:{uuid.uuid4()}"
+    model_request_started_at = datetime.now(timezone.utc)
+    try:
+        assert_model_payload_allowed(
+            model_policy,
+            acknowledged=payload.external_data_acknowledged,
+            classifications=("desensitized",),
+            context_label="本轮问题",
+        )
+    except ModelDataPolicyError as exc:
+        raise HTTPException(422, str(exc)) from exc
     breeding_report_requested = is_breeding_report_request(payload.content)
     report_requested = is_report_request(payload.content) or breeding_report_requested
     breeding_report_context: dict[str, Any] | None = None
@@ -4497,28 +5562,64 @@ async def research_chat_stream(
         .order_by(ResearchMessage.created_at.desc())
         .limit(8)
     ).all()
+    if (
+        research_session.title == DEFAULT_RESEARCH_SESSION_TITLE
+        and not any(item.role == "user" for item in history_items)
+    ):
+        generated_title = summarize_research_session_title(payload.content)
+        # The conditional update makes first-message races safe and prevents a
+        # concurrent manual rename from being overwritten.
+        session.execute(
+            update(ResearchSession)
+            .where(
+                ResearchSession.id == research_session_id,
+                ResearchSession.owner_id == user.id,
+                ResearchSession.title == DEFAULT_RESEARCH_SESSION_TITLE,
+            )
+            .values(title=generated_title)
+            .execution_options(synchronize_session=False)
+        )
+        # Keep the loaded ORM attribute untouched.  A later flush then cannot
+        # turn this guarded update into an unconditional title overwrite.
     context_attachment_ids = referenced_attachment_ids(history_items) | set(current_turn_attachment_ids)
     context_attachments = [item for item in attachments if item.id in context_attachment_ids]
-    published_context, published_cards = await build_published_evidence_context(session, payload.content, audit_actor(user))
+    published_context, published_cards = await build_published_evidence_context(
+        session,
+        payload.content,
+        audit_actor(user),
+        project_id=research_session.project_id,
+    )
     analysis_run_id = _trial_analysis_run_id_from_context(published_context)
     attachment_context, attachment_cards = build_attachment_evidence_context(context_attachments)
+    # Researchers do not choose a retrieval scope.  "both" remains bounded by
+    # authorization: the current owner's private documents in this project,
+    # plus institution-published public documents.
+    effective_knowledge_scope: Literal["private", "public", "both"] = "both"
     knowledge_context, knowledge_cards = build_knowledge_evidence_context(
         session,
         user,
-        payload.knowledge_scope,
+        effective_knowledge_scope,
         payload.content,
+        research_session.project_id,
     )
     vision_attachments, has_current_vision_images = select_vision_attachments(
         current_turn_attachments=current_turn_attachments,
         history_items=history_items,
         attachments_by_id=attachments_by_id,
     )
-    vision_blocks, vision_cards = build_native_vision_blocks(vision_attachments)
+    vision_blocks, vision_cards = build_native_vision_blocks(
+        vision_attachments,
+        user.institution_id,
+    )
     conversation_history = [
         {"role": item.role, "content": item.content}
         for item in reversed(history_items)
         if item.role in {"user", "assistant"}
     ]
+    if not model_policy.history_allowed:
+        # Legacy turns have no per-transfer attestation.  Keeping them in the
+        # local database is safe; forwarding them to an external relay is not.
+        conversation_history = []
     static_evidence_context = f"{published_context}\n\n{breeding_context}\n\n{attachment_context}\n\n{knowledge_context}"
     if len(static_evidence_context) > MAX_RESEARCH_CONTEXT_CHARS:
         raise HTTPException(
@@ -4526,6 +5627,17 @@ async def research_chat_stream(
             "当前会话附件与证据材料过长，未向模型截断。请移除部分附件或拆分后再分析。",
         )
     static_evidence = [*published_cards, *breeding_cards, *attachment_cards, *knowledge_cards, *vision_cards]
+    try:
+        assert_model_payload_allowed(
+            model_policy,
+            acknowledged=payload.external_data_acknowledged,
+            classifications=(
+                evidence_classifications(static_evidence) or {"desensitized"}
+            ),
+            context_label="本轮附件、知识库和受控数据证据",
+        )
+    except ModelDataPolicyError as exc:
+        raise HTTPException(403, str(exc)) from exc
     user_message = ResearchMessage(
         session_id=research_session_id,
         owner_id=user.id,
@@ -4534,6 +5646,10 @@ async def research_chat_stream(
         evidence=message_attachment_evidence(current_turn_attachments),
         operation_state=[
             {"state": "accepted", "label": "已接收问题"},
+            *([{
+                "state": "external_transfer_acknowledged",
+                "label": "已确认本轮外部模型输入仅含脱敏或公开数据",
+            }] if payload.external_data_acknowledged and not model_policy.is_local else []),
             *([{ "state": "attachments", "label": f"已随本轮提交 {len(current_turn_attachments)} 个附件" }] if current_turn_attachments else []),
             *([{
                 "state": "report_requested",
@@ -4555,11 +5671,67 @@ async def research_chat_stream(
             "published_evidence_count": len(published_cards),
             "breeding_dossier_evidence_count": len(breeding_cards),
             "knowledge_evidence_count": len(knowledge_cards),
-            "knowledge_scope": payload.knowledge_scope,
+            "knowledge_scope": effective_knowledge_scope,
+            "model_deployment_mode": model_policy.deployment_mode,
+            "model_provider_host": model_policy.provider_host,
+            "external_transfer_acknowledged": payload.external_data_acknowledged,
+            "model_request_id": model_request_id,
         },
     ))
-    memory_state = research_session.memory_state or {}
+    start_ai_usage(
+        session,
+        request_id=model_request_id,
+        institution_id=user.institution_id,
+        owner_id=user.id,
+        project_id=research_session.project_id,
+        route="legacy_research_chat",
+        research_session_id=research_session_id,
+        provider_name=model_policy.provider_name,
+        provider_host=model_policy.provider_host,
+        model_alias=(
+            os.getenv("LONGYUN_LLM_MODEL")
+            or os.getenv("SHENNONG_MODEL")
+            or "longyun-research"
+        ),
+        metadata={
+            "attachment_count": len(current_turn_attachments),
+            "evidence_count": len(static_evidence),
+            "vision_attachment_count": len(vision_attachments),
+        },
+    )
+    memory_state = (
+        research_session.memory_state or {}
+        if model_policy.history_allowed
+        else {}
+    )
     session.commit()
+
+    def record_model_usage(
+        status: str,
+        *,
+        error_code: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Finish the privacy-preserving request log without masking chat errors."""
+        try:
+            with tenant_database_manager.session(user.institution_id) as usage_session:
+                _set_research_owner(usage_session, user.id, user.institution_id)
+                update_ai_usage(
+                    usage_session,
+                    model_request_id,
+                    status=status,
+                    latency_ms=utc_milliseconds_since(model_request_started_at),
+                    error_code=error_code,
+                    metadata={
+                        "token_reporting": "unavailable_for_stream_adapter",
+                        **(metadata or {}),
+                    },
+                )
+                usage_session.commit()
+        except Exception:
+            logger.exception(
+                "Unable to finalize AI usage log request_id=%s", model_request_id
+            )
 
     async def event_stream() -> Any:
         yield sse_event("status", {"label": "正在读取已发布标准数据、当前会话附件和本地知识库证据"})
@@ -4572,7 +5744,12 @@ async def research_chat_stream(
             if vision_blocks:
                 yield sse_event("status", {"label": f"正在准备 {len(vision_attachments)} 张本地图片供当前模型进行视觉分析"})
             yield sse_event("status", {"label": "正在判断是否需要检索近期可信公开资料"})
-            web_results, search_note = await search_public_references(payload.content)
+            web_results = []
+            search_note = ""
+            if model_policy.allow_external_web_search and payload.external_data_acknowledged:
+                web_results, search_note = await search_public_references(payload.content)
+            elif model_policy.allow_external_web_search and model_policy.is_local:
+                search_note = "本轮未确认可向外部搜索服务发送问题，已跳过联网检索。"
             if web_results:
                 web_context = "\n\n".join(
                     f"### 可信公开来源：{item.title}\n链接：{item.url}\n摘要：{item.snippet}"
@@ -4591,6 +5768,7 @@ async def research_chat_stream(
                 yield sse_event("status", {"label": search_note})
 
             if len(f"{evidence_context}\n\n{public_web_context}") > MAX_RESEARCH_CONTEXT_CHARS:
+                record_model_usage("failed", error_code="context_too_large")
                 yield sse_event("error", {
                     "detail": "当前会话附件、已发布数据与公开资料合计过长，未向模型截断。请移除部分附件或拆分问题后重试。",
                 })
@@ -4630,8 +5808,9 @@ async def research_chat_stream(
                     yield sse_event("token", {"text": result["text"]})
                     continue
 
-                with SessionLocal() as write_session:
-                    _set_research_owner(write_session, user.id)
+                with tenant_database_manager.session(user.institution_id) as write_session:
+                    _set_research_owner(write_session, user.id, user.institution_id)
+                    _set_project_context(write_session, research_session.project_id)
                     stored_session = get_owned_research_session(write_session, research_session_id)
                     stored_session.memory_state = result["memory_state"]
                     stored_session.memory_summary = result.get("memory_summary")
@@ -4644,6 +5823,10 @@ async def research_chat_stream(
                         evidence=evidence,
                         operation_state=[
                             {"state": "completed", "label": "已完成大模型分析"},
+                            *([{
+                                "state": "external_transfer_acknowledged",
+                                "label": "本回答基于已确认的脱敏/公开外部模型输入",
+                            }] if payload.external_data_acknowledged and not model_policy.is_local else []),
                             *([{ "state": "web_search", "label": f"已补充 {len(web_results)} 条可信公开来源" }] if web_results else []),
                             {"state": "evidence", "label": f"已附带 {len(evidence)} 项证据"},
                             *([{
@@ -4666,13 +5849,18 @@ async def research_chat_stream(
                             "public_web_source_count": len(web_results),
                             "report_requested": report_requested,
                             "report_kind": "breeding_dossier" if breeding_report_requested else None,
+                            "model_deployment_mode": model_policy.deployment_mode,
+                            "model_provider_host": model_policy.provider_host,
+                            "external_transfer_acknowledged": payload.external_data_acknowledged,
                         },
                     ))
                     write_session.flush()
                     analysis = _load_trial_analysis(write_session, analysis_run_id)
                     saved_artifacts = _save_structured_result_artifacts(
                         write_session,
+                        institution_id=user.institution_id,
                         owner_id=user.id,
+                        project_id=research_session.project_id,
                         message=assistant_message,
                         question=payload.content.strip(),
                         analysis_run_id=analysis_run_id,
@@ -4689,12 +5877,21 @@ async def research_chat_stream(
                         ]
                     response_message = serialize_research_message(assistant_message)
                     write_session.commit()
+                record_model_usage(
+                    "completed",
+                    metadata={
+                        "public_web_source_count": len(web_results),
+                        "report_requested": report_requested,
+                    },
+                )
                 yield sse_event("complete", {"message": response_message})
         except HTTPException as exc:
+            record_model_usage("failed", error_code=f"http_{exc.status_code}")
             detail = exc.detail if isinstance(exc.detail, str) else "请求未能完成，请检查输入内容后重试。"
             yield sse_event("error", {"detail": detail})
         except EmptyResearchAnswerError:
             if not report_requested:
+                record_model_usage("failed", error_code="empty_model_answer")
                 yield sse_event("error", {
                     "detail": "大模型未返回可展示的研究结论（仅收到占位符或空内容）。本轮未保存回答，请重新提问。",
                 })
@@ -4707,8 +5904,9 @@ async def research_chat_stream(
                 breeding_report_requested=breeding_report_requested,
                 breeding_report_context=breeding_report_context,
             )
-            with SessionLocal() as write_session:
-                _set_research_owner(write_session, user.id)
+            with tenant_database_manager.session(user.institution_id) as write_session:
+                _set_research_owner(write_session, user.id, user.institution_id)
+                _set_project_context(write_session, research_session.project_id)
                 stored_session = get_owned_research_session(write_session, research_session_id)
                 stored_session.updated_at = datetime.now(timezone.utc)
                 assistant_message = ResearchMessage(
@@ -4749,6 +5947,10 @@ async def research_chat_stream(
                 ))
                 response_message = serialize_research_message(assistant_message)
                 write_session.commit()
+            record_model_usage(
+                "completed",
+                metadata={"model_output": "placeholder_or_empty", "deterministic_report": True},
+            )
             logger.warning(
                 "Completed deterministic report after rejecting placeholder model output: session_id=%s user_id=%s report_kind=%s",
                 research_session_id,
@@ -4758,9 +5960,11 @@ async def research_chat_stream(
             yield sse_event("status", {"label": "大模型未返回可展示的说明，已保留基于受控数据生成的报告"})
             yield sse_event("complete", {"message": response_message})
         except ResearchAgentError as exc:
+            record_model_usage("failed", error_code="research_agent_error")
             yield sse_event("error", {"detail": str(exc)})
         except Exception as exc:
             error_id = uuid.uuid4().hex[:10]
+            record_model_usage("failed", error_code=f"unhandled_{type(exc).__name__}"[:80])
             logger.exception(
                 "Research chat failed: error_id=%s session_id=%s user_id=%s",
                 error_id,
@@ -4784,10 +5988,12 @@ async def research_chat_stream(
 @app.get("/api/research/messages/{message_id}/report.pdf")
 def download_research_message_report(
     message_id: str,
+    project_id: str = Query(..., min_length=36, max_length=36),
     user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
 ) -> Response:
     """Render and archive one requested assistant answer as a private PDF."""
+    _bind_research_project(session, user, project_id)
     message = session.scalar(
         select(ResearchMessage).where(
             ResearchMessage.id == message_id,
@@ -4797,6 +6003,15 @@ def download_research_message_report(
     )
     if not message:
         raise HTTPException(404, "未找到可下载的科研报告。")
+    research_project = session.scalar(
+        select(ResearchSession).where(
+            ResearchSession.id == message.session_id,
+            ResearchSession.owner_id == user.id,
+        )
+    )
+    if not research_project or not research_project.project_id:
+        raise HTTPException(409, "该历史会话尚未归属课题，请新建已绑定课题的会话。")
+    _bind_research_project(session, user, research_project.project_id)
     report_operation = _report_operation(message.operation_state)
     if not report_operation:
         raise HTTPException(409, "该回答未提出生成报告请求，因此未创建报告下载。")
@@ -4806,9 +6021,10 @@ def download_research_message_report(
         ResearchResult.source_message_id == message.id,
         ResearchResult.result_type == "pdf_report",
     ))
-    if existing and Path(existing.storage_path).is_file():
+    result_store = object_storage_manager.for_institution(user.institution_id)
+    if existing and result_store.exists(existing.storage_path):
         return Response(
-            content=Path(existing.storage_path).read_bytes(),
+            content=result_store.read_bytes(existing.storage_path),
             media_type=existing.content_type,
             headers={
                 "Content-Disposition": _download_content_disposition(
@@ -4857,7 +6073,9 @@ def download_research_message_report(
         report_file_name = f"隆耘Agent育种分析报告-{datetime.now().strftime('%Y%m%d-%H%M%S')}.pdf"
     saved = _store_research_result(
         session,
+        institution_id=user.institution_id,
         owner_id=user.id,
+        project_id=research_project.project_id,
         source_message_id=message.id,
         session_id=message.session_id,
         analysis_run_id=str(analysis_run_id) if analysis_run_id else None,
@@ -4903,11 +6121,16 @@ def download_research_message_report(
 @app.get("/api/research/results")
 def list_research_results(
     result_type: str | None = Query(default=None),
+    project_id: str = Query(..., min_length=36, max_length=36),
     user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
 ) -> list[dict[str, Any]]:
     """List durable assistant outputs for the signed-in researcher only."""
-    statement = select(ResearchResult).where(ResearchResult.owner_id == user.id)
+    _bind_research_project(session, user, project_id)
+    statement = select(ResearchResult).where(
+        ResearchResult.owner_id == user.id,
+        ResearchResult.project_id == project_id,
+    )
     if result_type:
         statement = statement.where(ResearchResult.result_type == result_type)
     items = session.scalars(statement.order_by(ResearchResult.created_at.desc())).all()
@@ -4929,12 +6152,15 @@ def list_research_results(
 @app.get("/api/research/results/{result_id}/download")
 def download_research_result(
     result_id: str,
+    project_id: str = Query(..., min_length=36, max_length=36),
     user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
 ) -> Response:
+    _bind_research_project(session, user, project_id)
     result = session.scalar(select(ResearchResult).where(
         ResearchResult.id == result_id,
         ResearchResult.owner_id == user.id,
+        ResearchResult.project_id == project_id,
     ))
     if not result:
         raise HTTPException(404, "未找到该研究产物，或当前账号无权访问。")
@@ -4942,11 +6168,11 @@ def download_research_result(
         status = session.execute(text("SELECT status FROM genotype_asset_version WHERE id=:id"), {"id": result.analysis_run_id}).scalar()
         if status != "analysis_ready":
             raise HTTPException(409, "该基因型版本仍在材料映射确认阶段，尚未形成可下载的正式结果包。")
-    path = Path(result.storage_path)
-    if not path.is_file():
+    result_store = object_storage_manager.for_institution(user.institution_id)
+    if not result_store.exists(result.storage_path):
         raise HTTPException(409, "该研究产物的本地文件已不存在，请重新生成。")
     return Response(
-        content=path.read_bytes(),
+        content=result_store.read_bytes(result.storage_path),
         media_type=result.content_type,
         headers={
             "Content-Disposition": _download_content_disposition(
@@ -4960,16 +6186,19 @@ def download_research_result(
 @app.delete("/api/research/results/{result_id}")
 def delete_research_result(
     result_id: str,
+    project_id: str = Query(..., min_length=36, max_length=36),
     user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
 ) -> dict[str, bool]:
+    _bind_research_project(session, user, project_id)
     result = session.scalar(select(ResearchResult).where(
         ResearchResult.id == result_id,
         ResearchResult.owner_id == user.id,
+        ResearchResult.project_id == project_id,
     ))
     if not result:
         raise HTTPException(404, "未找到该研究产物，或当前账号无权访问。")
-    path = Path(result.storage_path)
+    storage_path = result.storage_path
     session.delete(result)
     session.add(ResearchAudit(
         owner_id=user.id,
@@ -4979,9 +6208,8 @@ def delete_research_result(
     ))
     session.commit()
     try:
-        path.unlink(missing_ok=True)
-        path.parent.rmdir()
-    except OSError:
+        object_storage_manager.for_institution(user.institution_id).delete(storage_path)
+    except (OSError, ObjectStorageError):
         pass
     return {"deleted": True}
 
@@ -4993,8 +6221,179 @@ def catalog(user: CurrentUser = Depends(require_data_platform_user)) -> dict[str
 
 @app.get("/api/templates")
 def list_templates(user: CurrentUser = Depends(require_data_platform_user), session: Session = Depends(get_session)) -> list[dict[str, Any]]:
-    templates = session.scalars(select(DataTemplate).order_by(DataTemplate.template_code)).all()
+    templates = session.scalars(select(DataTemplate).where(
+        DataTemplate.template_code.not_in(RETIRED_TEMPLATE_CODES),
+    ).order_by(DataTemplate.template_code)).all()
     return [serialize_template(item, session.get(TemplateVersion, item.current_version_id)) for item in templates]
+
+
+@app.post("/api/templates")
+def create_data_template(
+    payload: DataTemplateCreate,
+    user: CurrentUser = Depends(require_field_admin),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    if payload.template_code in RETIRED_TEMPLATE_CODES:
+        raise HTTPException(422, "该模板编号已停用，请使用当前正式数据模板。")
+    if session.scalar(select(DataTemplate).where(DataTemplate.template_code == payload.template_code)):
+        raise HTTPException(409, "模板编号已经存在，请在原模板上发布新版本。")
+    payload.actor = audit_actor(user)
+    template = DataTemplate(
+        template_code=payload.template_code,
+        template_name=payload.template_name.strip(),
+        data_scope=payload.data_scope.strip(),
+        target_table=payload.target_table,
+        description=payload.description.strip(),
+    )
+    session.add(template)
+    session.flush()
+    version = TemplateVersion(
+        template_id=template.id,
+        version="v1.0",
+        change_summary=payload.change_summary.strip(),
+        field_definitions=[],
+        created_by=payload.actor,
+    )
+    session.add(version)
+    session.flush()
+    template.current_version_id = version.id
+    session.commit()
+    return serialize_template(template, version)
+
+
+@app.patch("/api/templates/{template_id}/status")
+def update_data_template_status(
+    template_id: str,
+    payload: DataTemplateStatusUpdate,
+    user: CurrentUser = Depends(require_field_admin),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    template = session.get(DataTemplate, template_id)
+    if not template or template.template_code in RETIRED_TEMPLATE_CODES:
+        raise HTTPException(404, "标准模板不存在。")
+    template.status = payload.status
+    session.commit()
+    return serialize_template(template, session.get(TemplateVersion, template.current_version_id))
+
+
+@app.get("/api/templates/{template_id}/sample.csv")
+def download_data_template_sample(
+    template_id: str,
+    user: CurrentUser = Depends(require_data_platform_user),
+    session: Session = Depends(get_session),
+) -> Response:
+    template = session.get(DataTemplate, template_id)
+    version = session.get(TemplateVersion, template.current_version_id) if template else None
+    if not template or template.template_code in RETIRED_TEMPLATE_CODES or not version:
+        raise HTTPException(404, "标准模板不存在。")
+    stream = io.StringIO()
+    writer = csv.writer(stream)
+    fields = version.field_definitions or []
+    writer.writerow([item.get("name") or item.get("code") for item in fields])
+    writer.writerow(["" for _ in fields])
+    content = "\ufeff" + stream.getvalue()
+    filename = quote(f"{template.template_code}-{version.version}-导入示例.csv")
+    return Response(
+        content=content.encode("utf-8"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"},
+    )
+
+
+def _table_count(session: Session, table_name: str, where: str = "TRUE") -> int:
+    allowed = {
+        "variety_basic", "breeding_material", "field_trial", "trial_environment_metric", "trial_management_event",
+        "trial_phenotype_observation", "biological_sample", "genotype_asset_version", "knowledge_document",
+    }
+    if table_name not in allowed:
+        return 0
+    exists = session.execute(text("SELECT to_regclass(:name)"), {"name": table_name}).scalar()
+    if not exists:
+        return 0
+    return int(session.execute(text(f"SELECT count(*) FROM {table_name} WHERE {where}")).scalar() or 0)
+
+
+@app.get("/api/import-readiness")
+def get_import_readiness(
+    project_id: str = Query(..., min_length=36, max_length=36),
+    user: CurrentUser = Depends(require_data_processor),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    _bind_research_project(session, user, project_id)
+    readiness = assess_project_readiness(session, project_id)
+    evidence = readiness[0].get("evidence_summary", {}) if readiness else {}
+    route_pages = {
+        "germplasm": "germplasm-import", "pedigree": "pedigree-import",
+        "trial": "trial-packages", "phenotype": "trial-packages",
+        "environment": "trial-packages", "management": "trial-packages",
+        "genotype": "genotype-import", "literature": "knowledge-import",
+    }
+    datasets = {
+        code: {
+            "label": DATA_DOMAIN_LABELS[code],
+            "count": int((evidence.get(code) or {}).get("linked_entity_count") or 0),
+            "route_page": route_pages.get(code, "import-center"),
+        }
+        for code in route_pages
+    }
+    capabilities = []
+    for item in readiness:
+        requirement = FEATURE_REQUIREMENTS[item["feature_code"]]
+        level = {"blocked": "blocked", "basic_ready": "limited", "fully_ready": "ready"}[item["readiness_status"]]
+        if level == "blocked":
+            impact = "缺少必需数据，当前不能形成可信结果。"
+        elif level == "limited":
+            impact = "可以使用基础功能，但证据维度和解释能力受限。"
+        else:
+            impact = "核心与增强数据均已具备。"
+        capabilities.append({
+            "code": item["feature_code"],
+            "label": item["feature_name"],
+            "level": level,
+            "impact": impact,
+            "required": list(requirement.required),
+            "recommended": list(requirement.recommended),
+            "missing_required": item["missing_required"],
+            "missing_recommended": item["missing_recommended"],
+            "missing_data_effects": item["missing_data_effects"],
+        })
+    return {"institution_id": user.institution_id, "project_id": project_id, "datasets": datasets, "capabilities": capabilities}
+
+
+def _project_variety_ids(session: Session, project_id: str) -> list[str]:
+    """Return legacy variety rows that are actually linked to one project.
+
+    ``variety_basic`` is an institution-wide compatibility table.  Access to
+    it must therefore be derived from project-owned observations or from the
+    canonical material/project bridge, never from the bare variety id.
+    """
+    return [
+        str(value)
+        for value in session.execute(text("""
+            SELECT DISTINCT variety.id
+            FROM variety_basic variety
+            WHERE EXISTS (
+                SELECT 1 FROM phenotype_observation observation
+                WHERE observation.variety_id=variety.id
+                  AND observation.project_id=:project_id
+            ) OR EXISTS (
+                SELECT 1 FROM data_legacy_variety_material_link legacy_link
+                JOIN data_material_project_scope scope
+                  ON scope.material_id=legacy_link.material_id
+                 AND scope.project_id=:project_id
+                WHERE legacy_link.variety_id=variety.id
+                  AND legacy_link.project_id=:project_id
+                  AND legacy_link.status='confirmed'
+            )
+            ORDER BY variety.id
+        """), {"project_id": project_id}).scalars().all()
+    ]
+
+
+def _get_project_variety(session: Session, project_id: str, variety_id: str) -> Variety | None:
+    if variety_id not in set(_project_variety_ids(session, project_id)):
+        return None
+    return session.get(Variety, variety_id)
 
 
 @app.get("/api/template-change-requests")
@@ -5009,7 +6408,7 @@ def create_template_version(template_id: str, payload: TemplateVersionCreate, us
     payload.actor = audit_actor(user)
     template = session.get(DataTemplate, template_id)
     current = session.get(TemplateVersion, template.current_version_id) if template else None
-    if not template or not current:
+    if not template or template.template_code in RETIRED_TEMPLATE_CODES or not current:
         raise HTTPException(404, "标准模板不存在。")
     fields = [dict(item) for item in (current.field_definitions or [])]
     field_code = payload.field_code.strip() or f"custom_{uuid.uuid4().hex[:10]}"
@@ -5017,10 +6416,10 @@ def create_template_version(template_id: str, payload: TemplateVersionCreate, us
     if payload.action == "add_field" and existing:
         raise HTTPException(409, "该标准字段已存在，请选择更新字段或补充别名。")
     if existing:
-        existing.update({"name": payload.field_name, "category": payload.category, "unit": payload.unit, "required": payload.required, "min": payload.min_value, "max": payload.max_value, "severity": payload.severity})
+        existing.update({"name": payload.field_name, "kind": payload.field_kind, "category": payload.category, "unit": payload.unit, "required": payload.required, "min": payload.min_value, "max": payload.max_value, "severity": payload.severity})
         existing["aliases"] = list(dict.fromkeys([*(existing.get("aliases") or []), *payload.aliases]))
     else:
-        fields.append({"code": field_code, "name": payload.field_name, "category": payload.category, "unit": payload.unit, "aliases": payload.aliases, "required": payload.required, "kind": "trait", "min": payload.min_value, "max": payload.max_value, "severity": payload.severity})
+        fields.append({"code": field_code, "name": payload.field_name, "category": payload.category, "unit": payload.unit, "aliases": payload.aliases, "required": payload.required, "kind": payload.field_kind, "min": payload.min_value, "max": payload.max_value, "severity": payload.severity})
     match = re.match(r"v(\d+)\.(\d+)", current.version)
     next_version = f"v{match.group(1)}.{int(match.group(2)) + 1}" if match else "v1.1"
     version = TemplateVersion(template_id=template.id, version=next_version, change_summary=payload.change_summary, field_definitions=fields, created_by=payload.actor)
@@ -5041,7 +6440,11 @@ def create_template_version(template_id: str, payload: TemplateVersionCreate, us
 @app.post("/api/template-change-requests")
 def create_template_change_request(payload: FieldChangeRequestCreate, user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_session)) -> dict[str, Any]:
     payload.actor = audit_actor(user)
-    source = session.get(SourceReview, payload.source_review_id)
+    _bind_research_project(session, user, payload.project_id)
+    source = session.scalar(select(SourceReview).where(
+        SourceReview.id == payload.source_review_id,
+        SourceReview.project_id == payload.project_id,
+    ))
     if not source or not source.template_version_id:
         raise HTTPException(422, "该来源没有关联标准模板，无法提交字段处理请求。")
     version = session.get(TemplateVersion, source.template_version_id)
@@ -5058,18 +6461,34 @@ def create_template_change_request(payload: FieldChangeRequestCreate, user: Curr
 
 
 @app.get("/api/dashboard")
-def dashboard(user: CurrentUser = Depends(require_data_platform_user), session: Session = Depends(get_session)) -> dict[str, Any]:
-    varieties = session.scalar(select(func.count(Variety.id))) or 0
-    published = session.scalar(select(func.count(PhenotypeObservation.id)).where(PhenotypeObservation.publish_status == "published")) or 0
-    pending = session.scalar(select(func.count(PhenotypeObservation.id)).where(PhenotypeObservation.publish_status == "pending")) or 0
-    blocked = session.scalar(select(func.count(PhenotypeObservation.id)).where(PhenotypeObservation.quality_status == "blocked")) or 0
+def dashboard(
+    project_id: str = Query(..., min_length=36, max_length=36),
+    user: CurrentUser = Depends(require_data_platform_user),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    _bind_research_project(session, user, project_id)
+    varieties = session.scalar(text(
+        "SELECT count(DISTINCT material_id) FROM data_material_project_scope WHERE project_id=:project_id"
+    ), {"project_id": project_id}) or 0
+    observation_scope = PhenotypeObservation.project_id == project_id
+    published = session.scalar(select(func.count(PhenotypeObservation.id)).where(observation_scope, PhenotypeObservation.publish_status == "published")) or 0
+    pending = session.scalar(select(func.count(PhenotypeObservation.id)).where(observation_scope, PhenotypeObservation.publish_status == "pending")) or 0
+    blocked = session.scalar(select(func.count(PhenotypeObservation.id)).where(observation_scope, PhenotypeObservation.quality_status == "blocked")) or 0
     return {"varieties": varieties, "published": published, "pending": pending, "blocked": blocked}
 
 
 @app.get("/api/workbench")
-def workbench(user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_session)) -> dict[str, Any]:
-    sources = session.scalars(select(SourceReview).order_by(SourceReview.created_at.desc())).all()
-    observations = session.scalars(select(PhenotypeObservation).where(PhenotypeObservation.publish_status != "published").order_by(PhenotypeObservation.created_at.desc())).all()
+def workbench(
+    project_id: str = Query(..., min_length=36, max_length=36),
+    user: CurrentUser = Depends(require_data_processor),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    _bind_research_project(session, user, project_id)
+    sources = session.scalars(select(SourceReview).where(SourceReview.project_id == project_id).order_by(SourceReview.created_at.desc())).all()
+    observations = session.scalars(select(PhenotypeObservation).where(
+        PhenotypeObservation.project_id == project_id,
+        PhenotypeObservation.publish_status != "published",
+    ).order_by(PhenotypeObservation.created_at.desc())).all()
     variety_map = {item.id: item for item in session.scalars(select(Variety)).all()}
     versions = {item.id: item for item in session.scalars(select(TemplateVersion)).all()}
     templates = {item.id: item for item in session.scalars(select(DataTemplate)).all()}
@@ -5079,14 +6498,15 @@ def workbench(user: CurrentUser = Depends(require_data_processor), session: Sess
 
 
 @app.post("/api/imports/upload")
-async def upload_import(file: UploadFile = File(...), template_version_id: str = Query(...), actor: str = Query("数据处理员-张三"), user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_session)) -> dict[str, Any]:
+async def upload_import(file: UploadFile = File(...), template_version_id: str = Query(...), project_id: str = Query(...), actor: str = Query("数据处理员-张三"), user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_session)) -> dict[str, Any]:
     actor = audit_actor(user)
+    assert_project_access(session, user, project_id)
     template, version = get_template_version(session, template_version_id)
     content = await file.read()
     template, version, template_auto_switched = infer_template_from_spreadsheet(session, file.filename or "upload", content, template, version)
     content_hash = hashlib.sha256(content).hexdigest()
     if ENABLE_SOURCE_DEDUPLICATION:
-        existing, reason = find_duplicate_source(session, content_hash)
+        existing, reason = find_duplicate_source(session, project_id, content_hash)
         if existing:
             reject_duplicate_source(existing, reason or "相同文件内容")
     source_type, raw_text, candidates = await parse_uploaded_content(file.filename or "upload", content, template, version)
@@ -5096,32 +6516,71 @@ async def upload_import(file: UploadFile = File(...), template_version_id: str =
     quality_status = import_metadata.pop("_quality_status", "pending")
     approval_context = import_metadata.pop("_approval_context", {"approval_count": 0, "ignored_approval_count": 0})
     if ENABLE_SOURCE_DEDUPLICATION:
-        existing, reason = find_duplicate_source(session, content_hash, saved_page_url)
+        existing, reason = find_duplicate_source(session, project_id, content_hash, saved_page_url)
         if existing:
             reject_duplicate_source(existing, reason or "相同文件内容")
     source_id = str(uuid.uuid4())
     safe_name = re.sub(r"[^\w.\-]+", "_", file.filename or "upload")
-    target = RAW_STORAGE_DIR / f"{source_id}_{safe_name}"
-    target.write_bytes(content)
-    source = SourceReview(id=source_id, source_type=source_type, source_name=file.filename or "上传文件", source_url=saved_page_url, file_path=str(target), file_hash=content_hash, raw_text=raw_text, page_or_locator="上传文件", parsing_status=parsing_status, quality_status=quality_status, template_version_id=version.id)
+    import_domain = template_flow_metadata(template).get("import_mode", "phenotype")
+    if import_domain not in {"germplasm", "pedigree", "phenotype"}:
+        import_domain = "phenotype"
+    batch = create_import_batch(
+        session,
+        project_id=project_id,
+        display_name=file.filename or "上传文件",
+        data_domain=import_domain,
+        created_by=user.id,
+        template_version_id=version.id,
+    )
+    store = object_storage_manager.for_institution(user.institution_id)
+    stored = store.put_bytes(
+        project_object_key(
+            project_id=project_id,
+            category="imports",
+            resource_id=source_id,
+            file_name=safe_name,
+        ),
+        content,
+        file.content_type or "application/octet-stream",
+    )
+    import_file = register_import_file(
+        session,
+        batch_id=batch["id"],
+        owner_id=user.id,
+        original_file_name=file.filename or "上传文件",
+        content_type=file.content_type or "application/octet-stream",
+        source_role="primary",
+        storage_backend=tenant_database_manager.resolve(user.institution_id).storage_backend,
+        stored=stored,
+    )
+    transition_import_batch(
+        session,
+        batch_id=batch["id"],
+        target_status="validating",
+        row_count=len(candidates),
+        summary={"candidate_count": len(candidates), "template_auto_switched": template_auto_switched},
+    )
+    file_asset_id = import_file["asset"]["id"]
+    source = SourceReview(id=source_id, source_type=source_type, source_name=file.filename or "上传文件", source_url=saved_page_url, file_path=stored.locator, file_hash=content_hash, raw_text=raw_text, page_or_locator="上传文件", parsing_status=parsing_status, quality_status=quality_status, template_version_id=version.id, project_id=project_id, file_asset_id=file_asset_id, unified_import_batch_id=batch["id"])
     append_history(source, actor, "上传并解析文件", {"file_name": file.filename, "template": template.template_name, "template_version": version.version, "template_auto_switched": template_auto_switched, "candidate_count": len(candidates), "saved_page_url": saved_page_url, "approval_context": approval_context})
     session.add(source)
+    session.flush()
+    record_entity_lineage(session, project_id=project_id, import_batch_id=batch["id"], file_asset_id=file_asset_id, entity_type="source_review", entity_id=source.id, relationship_type="source_file")
     session.commit()
     if template_auto_switched:
         for candidate in candidates:
             candidate.setdefault("parser_warnings", []).insert(0, f"已根据文件表头自动切换为“{template.template_name} {version.version}”。")
-    return {"source": serialize_source(source), "template": {"id": template.id, "name": template.template_name, "version": version.version, "version_id": version.id, "auto_switched": template_auto_switched}, "candidates": candidates}
+    return {"source": serialize_source(source), "import_batch": batch, "template": {"id": template.id, "name": template.template_name, "version": version.version, "version_id": version.id, "auto_switched": template_auto_switched}, "candidates": candidates}
 
 
 @app.post("/api/imports/url")
 async def import_url(payload: UrlImport, user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_session)) -> dict[str, Any]:
     payload.actor = audit_actor(user)
+    assert_project_access(session, user, payload.project_id)
     template, version = get_template_version(session, payload.template_version_id)
-    if template.template_code == "rice_root_phenotype":
-        raise HTTPException(422, "根系表型模板请上传 Excel 或 CSV，不支持网页导入。")
     source_url = payload.url.strip()
     if ENABLE_SOURCE_DEDUPLICATION:
-        existing, reason = find_duplicate_source(session, "", source_url)
+        existing, reason = find_duplicate_source(session, payload.project_id, "", source_url)
         if existing:
             reject_duplicate_source(existing, reason or "相同原始网页地址")
     try:
@@ -5133,7 +6592,7 @@ async def import_url(payload: UrlImport, user: CurrentUser = Depends(require_dat
     content = response.content
     content_hash = hashlib.sha256(content).hexdigest()
     if ENABLE_SOURCE_DEDUPLICATION:
-        existing, reason = find_duplicate_source(session, content_hash)
+        existing, reason = find_duplicate_source(session, payload.project_id, content_hash)
         if existing:
             reject_duplicate_source(existing, reason or "相同文件内容")
     html = decode_html_bytes(content)
@@ -5145,11 +6604,45 @@ async def import_url(payload: UrlImport, user: CurrentUser = Depends(require_dat
     raw_text, approval_context = keep_first_approval_section(raw_text)
     name, aliases = parse_title(raw_title)
     source_id = str(uuid.uuid4())
-    target = RAW_STORAGE_DIR / f"{source_id}.html"
-    target.write_bytes(content)
-    source = SourceReview(id=source_id, source_type="webpage", source_name=raw_title or source_url, source_url=source_url, file_path=str(target), file_hash=content_hash, raw_text=raw_text, page_or_locator="网页正文", parsing_status="partial" if masked_digits else "parsed", quality_status="requires_manual_check" if masked_digits else "pending", template_version_id=version.id)
+    import_domain = template_flow_metadata(template).get("import_mode", "phenotype")
+    if import_domain not in {"germplasm", "pedigree", "phenotype"}:
+        import_domain = "phenotype"
+    batch = create_import_batch(
+        session,
+        project_id=payload.project_id,
+        display_name=raw_title or source_url,
+        data_domain=import_domain,
+        created_by=user.id,
+        template_version_id=version.id,
+    )
+    store = object_storage_manager.for_institution(user.institution_id)
+    stored = store.put_bytes(
+        project_object_key(
+            project_id=payload.project_id,
+            category="imports",
+            resource_id=source_id,
+            file_name=f"{source_id}.html",
+        ),
+        content,
+        response.headers.get("content-type", "text/html"),
+    )
+    import_file = register_import_file(
+        session,
+        batch_id=batch["id"],
+        owner_id=user.id,
+        original_file_name=f"{source_id}.html",
+        content_type=response.headers.get("content-type", "text/html"),
+        source_role="primary",
+        storage_backend=tenant_database_manager.resolve(user.institution_id).storage_backend,
+        stored=stored,
+    )
+    transition_import_batch(session, batch_id=batch["id"], target_status="validating", row_count=1, summary={"candidate_count": 1})
+    file_asset_id = import_file["asset"]["id"]
+    source = SourceReview(id=source_id, source_type="webpage", source_name=raw_title or source_url, source_url=source_url, file_path=stored.locator, file_hash=content_hash, raw_text=raw_text, page_or_locator="网页正文", parsing_status="partial" if masked_digits else "parsed", quality_status="requires_manual_check" if masked_digits else "pending", template_version_id=version.id, project_id=payload.project_id, file_asset_id=file_asset_id, unified_import_batch_id=batch["id"])
     append_history(source, payload.actor, "读取单个网页", {"url": source_url, "resolved_digit_glyphs": resolved_digits, "approval_context": approval_context})
     session.add(source)
+    session.flush()
+    record_entity_lineage(session, project_id=payload.project_id, import_batch_id=batch["id"], file_asset_id=file_asset_id, entity_type="source_review", entity_id=source.id, relationship_type="source_file")
     session.commit()
     candidate = {"variety_name": name, "aliases": aliases, "raw_title": raw_title, "observations": extract_text_observations(raw_text), "source_locator": "网页正文", **extract_variety_basic_info(raw_text)}
     parser_warnings: list[str] = []
@@ -5161,13 +6654,23 @@ async def import_url(payload: UrlImport, user: CurrentUser = Depends(require_dat
         parser_warnings.append(f"检测到 {approval_context['approval_count']} 条审定记录。第一版仅处理第一条，后续 {approval_context['ignored_approval_count']} 条未解析、未写入数据库。")
     if parser_warnings:
         candidate["parser_warnings"] = parser_warnings
-    return {"source": serialize_source(source), "candidates": [candidate]}
+    return {"source": serialize_source(source), "import_batch": batch, "candidates": [candidate]}
 
 
 @app.post("/api/imports/{source_id}/reprocess")
-async def reprocess_import(source_id: str, actor: str = Query("数据处理员-张三"), user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_session)) -> dict[str, Any]:
+async def reprocess_import(
+    source_id: str,
+    project_id: str = Query(..., min_length=36, max_length=36),
+    actor: str = Query("数据处理员-张三"),
+    user: CurrentUser = Depends(require_data_processor),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
     actor = audit_actor(user)
-    source = session.get(SourceReview, source_id)
+    _bind_research_project(session, user, project_id)
+    source = session.scalar(select(SourceReview).where(
+        SourceReview.id == source_id,
+        SourceReview.project_id == project_id,
+    ))
     if not source or not source.template_version_id or not source.file_path:
         raise HTTPException(422, "该来源缺少可重新处理的原始文件或模板信息。")
     previous = session.get(TemplateVersion, source.template_version_id)
@@ -5175,10 +6678,10 @@ async def reprocess_import(source_id: str, actor: str = Query("数据处理员-�
     current = session.get(TemplateVersion, template.current_version_id) if template else None
     if not template or not current:
         raise HTTPException(422, "关联标准模板不可用。")
-    path = Path(source.file_path)
-    if not path.exists():
+    store = object_storage_manager.for_institution(user.institution_id)
+    if not store.exists(source.file_path):
         raise HTTPException(422, "未找到本地原始文件，无法重新处理。")
-    content = path.read_bytes()
+    content = store.read_bytes(source.file_path)
     template, current, template_auto_switched = infer_template_from_spreadsheet(session, source.source_name, content, template, current)
     source_type, raw_text, candidates = await parse_uploaded_content(source.source_name, content, template, current)
     source.template_version_id = current.id
@@ -5195,11 +6698,15 @@ async def reprocess_import(source_id: str, actor: str = Query("数据处理员-�
 @app.post("/api/imports/{source_id}/commit")
 def commit_import(source_id: str, payload: ImportCommit, user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_session)) -> dict[str, Any]:
     payload.actor = audit_actor(user)
-    source = session.get(SourceReview, source_id)
+    _bind_research_project(session, user, payload.project_id)
+    source = session.scalar(select(SourceReview).where(
+        SourceReview.id == source_id,
+        SourceReview.project_id == payload.project_id,
+    ))
     if not source:
-        raise HTTPException(404, "来源记录不存在")
+        raise HTTPException(404, "当前课题中不存在该来源记录。")
     template, template_version = get_template_version(session, source.template_version_id)
-    trait_catalog = ROOT_TRAITS if template.template_code == "rice_root_phenotype" else TRAITS
+    trait_catalog = TRAITS
     name, title_aliases = parse_title(payload.variety_name or payload.raw_title)
     aliases = list(dict.fromkeys([*title_aliases, *payload.aliases]))
     if not name:
@@ -5226,21 +6733,18 @@ def commit_import(source_id: str, payload: ImportCommit, user: CurrentUser = Dep
     created: list[tuple[PhenotypeObservation, bool, str | None]] = []
     existing_trait_codes = {
         item.trait_code
-        for item in session.scalars(select(PhenotypeObservation).where(PhenotypeObservation.variety_id == variety.id)).all()
+        for item in session.scalars(select(PhenotypeObservation).where(
+            PhenotypeObservation.project_id == source.project_id,
+            PhenotypeObservation.variety_id == variety.id,
+        )).all()
     }
-    if template.template_code == "rice_root_phenotype":
-        existing_trait_codes.update(
-            session.scalars(
-                select(RootPhenotypeObservation.trait_code).where(RootPhenotypeObservation.variety_id == variety.id)
-            ).all()
-        )
     skipped_duplicates: list[dict[str, str]] = []
     for item in payload.observations:
         code = item.get("trait_code")
         trait = trait_catalog.get(code)
         if not trait:
             continue
-        observation = PhenotypeObservation(variety_id=variety.id, source_review_id=source.id, trait_code=code, trait_name=item.get("trait_name") or trait["name"], trait_category=item.get("trait_category") or trait["category"], observation_type=item.get("observation_type") or "numeric", value_numeric=item.get("value_numeric"), value_text=item.get("value_text"), unit=item.get("unit") if item.get("unit") is not None else trait["unit"], original_value=item.get("original_value") or "", original_field=item.get("original_field"), source_locator=item.get("source_locator"), rule_version=template_version.version, quality_status="pending", publish_status="pending")
+        observation = PhenotypeObservation(variety_id=variety.id, source_review_id=source.id, project_id=source.project_id, trait_code=code, trait_name=item.get("trait_name") or trait["name"], trait_category=item.get("trait_category") or trait["category"], observation_type=item.get("observation_type") or "numeric", value_numeric=item.get("value_numeric"), value_text=item.get("value_text"), unit=item.get("unit") if item.get("unit") is not None else trait["unit"], original_value=item.get("original_value") or "", original_field=item.get("original_field"), source_locator=item.get("source_locator"), rule_version=template_version.version, quality_status="pending", publish_status="pending")
         if code in existing_trait_codes:
             skipped_duplicates.append({
                 "trait_code": code,
@@ -5265,6 +6769,42 @@ def commit_import(source_id: str, payload: ImportCommit, user: CurrentUser = Dep
         else:
             observation.quality_status = "passed"
         session.add(observation)
+    session.flush()
+    material_id: str | None = None
+    relationship_ids: list[str] = []
+    if source.project_id and source.unified_import_batch_id and source.file_asset_id:
+        material_id = ensure_canonical_material(
+            session,
+            project_id=source.project_id,
+            variety_id=variety.id,
+            material_name=variety.variety_name,
+            material_code=payload.material_code,
+            material_type=payload.variety_type,
+            aliases=aliases,
+            female_parent=payload.female_parent,
+            male_parent=payload.male_parent,
+            actor_id=user.id,
+        )
+        relationship_ids = ensure_pedigree_relationships(
+            session,
+            project_id=source.project_id,
+            child_material_id=material_id,
+            female_parent=payload.female_parent,
+            male_parent=payload.male_parent,
+            actor_id=user.id,
+        )
+        lineage_common = {
+            "project_id": source.project_id,
+            "import_batch_id": source.unified_import_batch_id,
+            "file_asset_id": source.file_asset_id,
+            "source_row_number": payload.source_row_number,
+        }
+        record_entity_lineage(session, **lineage_common, entity_type="variety_basic", entity_id=variety.id)
+        record_entity_lineage(session, **lineage_common, entity_type="breeding_material", entity_id=material_id)
+        for relationship_id in relationship_ids:
+            record_entity_lineage(session, **lineage_common, entity_type="breeding_pedigree_relationship", entity_id=relationship_id)
+        for observation, _, _ in created:
+            record_entity_lineage(session, **lineage_common, entity_type="phenotype_observation", entity_id=observation.id)
     append_history(source, payload.actor, "创建待处理草稿", {
         "variety": variety.variety_name,
         "template": template.template_name,
@@ -5275,22 +6815,59 @@ def commit_import(source_id: str, payload: ImportCommit, user: CurrentUser = Dep
         "existing_variety": bool(existing),
     })
     session.commit()
+    import_batch = None
+    if source.unified_import_batch_id:
+        import_batch = refresh_import_batch_counts(
+            session,
+            source.unified_import_batch_id,
+            finalize=payload.finalize_batch,
+            publish_without_review=not created,
+        )
     return {
         "variety": serialize_variety(variety),
+        "material_id": material_id,
+        "pedigree_relationship_ids": relationship_ids,
         "observations": [serialize_observation(item) for item, _, _ in created],
         "skipped_duplicates": skipped_duplicates,
+        "import_batch": import_batch,
     }
 
 
 @app.post("/api/varieties")
 def create_variety(payload: VarietyCreate, user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_session)) -> dict[str, Any]:
     payload.actor = audit_actor(user)
-    if session.scalars(select(Variety).where(Variety.normalized_name == normalize_name(payload.variety_name))).first():
-        raise HTTPException(409, "标准品种名称已存在，请在详情页中补充别名或数据。")
-    variety = Variety(variety_name=payload.variety_name.strip(), normalized_name=normalize_name(payload.variety_name), alias_names=payload.aliases, raw_variety_title=payload.variety_name, variety_type=payload.variety_type, source_review_id=payload.source_review_id, data_status="draft")
-    session.add(variety)
+    _bind_research_project(session, user, payload.project_id)
+    source = None
     if payload.source_review_id:
-        append_history(session.get(SourceReview, payload.source_review_id), payload.actor, "手工新建品种", {"variety": variety.variety_name})
+        source = session.scalar(select(SourceReview).where(
+            SourceReview.id == payload.source_review_id,
+            SourceReview.project_id == payload.project_id,
+        ))
+        if not source:
+            raise HTTPException(404, "当前课题中不存在该来源记录。")
+    variety = session.scalars(select(Variety).where(
+        Variety.normalized_name == normalize_name(payload.variety_name)
+    )).first()
+    if variety and _get_project_variety(session, payload.project_id, variety.id):
+        raise HTTPException(409, "当前课题已经存在该标准品种，请在已有记录中补充别名或数据。")
+    if not variety:
+        variety = Variety(variety_name=payload.variety_name.strip(), normalized_name=normalize_name(payload.variety_name), alias_names=payload.aliases, raw_variety_title=payload.variety_name, variety_type=payload.variety_type, source_review_id=payload.source_review_id, data_status="draft")
+        session.add(variety)
+        session.flush()
+    ensure_canonical_material(
+        session,
+        project_id=payload.project_id,
+        variety_id=variety.id,
+        material_name=variety.variety_name,
+        material_code=None,
+        material_type=payload.variety_type,
+        aliases=payload.aliases,
+        female_parent=None,
+        male_parent=None,
+        actor_id=user.id,
+    )
+    if payload.source_review_id:
+        append_history(source, payload.actor, "手工新建品种", {"project_id": payload.project_id, "variety": variety.variety_name})
     session.commit()
     return serialize_variety(variety)
 
@@ -5298,7 +6875,8 @@ def create_variety(payload: VarietyCreate, user: CurrentUser = Depends(require_d
 @app.post("/api/observations")
 def create_observation(payload: ObservationCreate, user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_session)) -> dict[str, Any]:
     payload.actor = audit_actor(user)
-    variety = session.get(Variety, payload.variety_id)
+    _bind_research_project(session, user, payload.project_id)
+    variety = _get_project_variety(session, payload.project_id, payload.variety_id)
     if not variety:
         raise HTTPException(404, "品种不存在")
     trait = TRAITS.get(payload.trait_code)
@@ -5306,34 +6884,57 @@ def create_observation(payload: ObservationCreate, user: CurrentUser = Depends(r
         raise HTTPException(422, "请选择标准性状；未识别字段应保留为原始文本。")
     if session.scalar(
         select(PhenotypeObservation.id).where(
+            PhenotypeObservation.project_id == payload.project_id,
             PhenotypeObservation.variety_id == variety.id,
             PhenotypeObservation.trait_code == payload.trait_code,
         )
     ):
         raise HTTPException(409, "该品种已存在这个标准字段。请编辑已有记录，不要重复新增。")
-    item = PhenotypeObservation(variety_id=variety.id, source_review_id=payload.source_review_id, trait_code=payload.trait_code, trait_name=trait["name"], trait_category=trait["category"], observation_type="numeric" if payload.value_numeric is not None else "text", value_numeric=payload.value_numeric, value_text=payload.value_text, unit=payload.unit if payload.unit is not None else trait["unit"], original_value=payload.original_value, source_locator=payload.source_locator or "手工录入", rule_version="v1.0", quality_status="pending", publish_status="pending")
+    source = None
+    if payload.source_review_id:
+        source = session.scalar(select(SourceReview).where(
+            SourceReview.id == payload.source_review_id,
+            SourceReview.project_id == payload.project_id,
+        ))
+        if not source:
+            raise HTTPException(404, "当前课题中不存在该来源记录。")
+    item = PhenotypeObservation(variety_id=variety.id, source_review_id=payload.source_review_id, project_id=payload.project_id, trait_code=payload.trait_code, trait_name=trait["name"], trait_category=trait["category"], observation_type="numeric" if payload.value_numeric is not None else "text", value_numeric=payload.value_numeric, value_text=payload.value_text, unit=payload.unit if payload.unit is not None else trait["unit"], original_value=payload.original_value, source_locator=payload.source_locator or "手工录入", rule_version="v1.0", quality_status="pending", publish_status="pending")
     issues = validate_observation(item, custom_quality_rules=active_custom_quality_rules(session))
     item.quality_status = "blocked" if any(issue["severity"] == "block" for issue in issues) else "warning" if issues else "passed"
     session.add(item)
-    append_history(session.get(SourceReview, payload.source_review_id) if payload.source_review_id else None, payload.actor, "手工新增表型", {"trait": trait["name"], "value": payload.original_value})
+    append_history(source, payload.actor, "手工新增表型", {"project_id": payload.project_id, "trait": trait["name"], "value": payload.original_value})
     session.commit()
     return {**serialize_observation(item), "issues": issues}
 
 
 @app.get("/api/manage/varieties")
-def manage_varieties(user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_session)) -> list[dict[str, Any]]:
-    return [serialize_variety(item) for item in session.scalars(select(Variety).order_by(Variety.variety_name)).all()]
+def manage_varieties(
+    project_id: str = Query(..., min_length=36, max_length=36),
+    user: CurrentUser = Depends(require_data_processor),
+    session: Session = Depends(get_session),
+) -> list[dict[str, Any]]:
+    _bind_research_project(session, user, project_id)
+    variety_ids = _project_variety_ids(session, project_id)
+    if not variety_ids:
+        return []
+    items = session.scalars(
+        select(Variety).where(Variety.id.in_(variety_ids)).order_by(Variety.variety_name)
+    ).all()
+    return [serialize_variety(item) for item in items]
 
 
 @app.post("/api/manual/record")
 def create_manual_record(payload: ManualRecord, user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_session)) -> dict[str, Any]:
     payload.actor = audit_actor(user)
+    _bind_research_project(session, user, payload.project_id)
     trait = TRAITS.get(payload.trait_code)
     if not trait:
         raise HTTPException(422, "请选择标准性状；未知字段请在导入流程中保留为原文。")
     if not payload.source_reference.strip():
         raise HTTPException(422, "手工数据必须填写来源说明后才能保存。")
-    variety = session.get(Variety, payload.variety_id) if payload.variety_id else None
+    variety = _get_project_variety(session, payload.project_id, payload.variety_id) if payload.variety_id else None
+    if payload.variety_id and not variety:
+        raise HTTPException(404, "当前课题中不存在该品种，不能跨课题补录数据。")
     if not variety:
         if not payload.variety_name.strip():
             raise HTTPException(422, "请选择已有品种或填写新建品种名称。")
@@ -5343,17 +6944,30 @@ def create_manual_record(payload: ManualRecord, user: CurrentUser = Depends(requ
             variety = Variety(variety_name=payload.variety_name.strip(), normalized_name=normalized, alias_names=payload.aliases, raw_variety_title=payload.variety_name.strip(), variety_type=payload.variety_type, data_status="draft")
             session.add(variety)
             session.flush()
+        ensure_canonical_material(
+            session,
+            project_id=payload.project_id,
+            variety_id=variety.id,
+            material_name=variety.variety_name,
+            material_code=None,
+            material_type=payload.variety_type or variety.variety_type,
+            aliases=payload.aliases or variety.alias_names or [],
+            female_parent=variety.female_parent,
+            male_parent=variety.male_parent,
+            actor_id=user.id,
+        )
     if session.scalar(
         select(PhenotypeObservation.id).where(
+            PhenotypeObservation.project_id == payload.project_id,
             PhenotypeObservation.variety_id == variety.id,
             PhenotypeObservation.trait_code == payload.trait_code,
         )
     ):
         raise HTTPException(409, "该品种已存在这个标准字段。请编辑已有记录，不要重复新增。")
-    source = SourceReview(source_type="manual", source_name=payload.source_reference.strip(), raw_text=payload.source_note or payload.original_value, page_or_locator="手工补录", parsing_status="manual", quality_status="pending")
+    source = SourceReview(source_type="manual", source_name=payload.source_reference.strip(), raw_text=payload.source_note or payload.original_value, page_or_locator="手工补录", parsing_status="manual", quality_status="pending", project_id=payload.project_id)
     session.add(source)
     session.flush()
-    observation = PhenotypeObservation(variety_id=variety.id, source_review_id=source.id, trait_code=payload.trait_code, trait_name=trait["name"], trait_category=trait["category"], observation_type="numeric" if payload.value_numeric is not None else "text", value_numeric=payload.value_numeric, value_text=payload.value_text, unit=payload.unit if payload.unit is not None else trait["unit"], original_value=payload.original_value, source_locator="手工补录", rule_version="v1.0", quality_status="pending", publish_status="pending")
+    observation = PhenotypeObservation(variety_id=variety.id, source_review_id=source.id, project_id=payload.project_id, trait_code=payload.trait_code, trait_name=trait["name"], trait_category=trait["category"], observation_type="numeric" if payload.value_numeric is not None else "text", value_numeric=payload.value_numeric, value_text=payload.value_text, unit=payload.unit if payload.unit is not None else trait["unit"], original_value=payload.original_value, source_locator="手工补录", rule_version="v1.0", quality_status="pending", publish_status="pending")
     issues = validate_observation(observation, custom_quality_rules=active_custom_quality_rules(session))
     observation.quality_status = "blocked" if any(item["severity"] == "block" for item in issues) else "warning" if issues else "passed"
     session.add(observation)
@@ -5365,7 +6979,11 @@ def create_manual_record(payload: ManualRecord, user: CurrentUser = Depends(requ
 @app.patch("/api/observations/{observation_id}")
 def update_observation(observation_id: str, payload: ObservationUpdate, user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_session)) -> dict[str, Any]:
     payload.actor = audit_actor(user)
-    item = session.get(PhenotypeObservation, observation_id)
+    _bind_research_project(session, user, payload.project_id)
+    item = session.scalar(select(PhenotypeObservation).where(
+        PhenotypeObservation.id == observation_id,
+        PhenotypeObservation.project_id == payload.project_id,
+    ))
     if not item:
         raise HTTPException(404, "表型记录不存在")
     before = {"value_numeric": item.value_numeric, "value_text": item.value_text, "unit": item.unit, "original_value": item.original_value}
@@ -5374,7 +6992,10 @@ def update_observation(observation_id: str, payload: ObservationUpdate, user: Cu
     item.unit = payload.unit
     item.original_value = payload.original_value or item.original_value
     item.review_comment = payload.review_comment
-    all_items = session.scalars(select(PhenotypeObservation).where(PhenotypeObservation.variety_id == item.variety_id)).all()
+    all_items = session.scalars(select(PhenotypeObservation).where(
+        PhenotypeObservation.project_id == payload.project_id,
+        PhenotypeObservation.variety_id == item.variety_id,
+    )).all()
     issues = validate_observation(item, all_items, active_custom_quality_rules(session))
     item.quality_status = "blocked" if any(issue["severity"] == "block" for issue in issues) else "warning" if issues else "passed"
     item.publish_status = "pending"
@@ -5386,14 +7007,24 @@ def update_observation(observation_id: str, payload: ObservationUpdate, user: Cu
 @app.post("/api/observations/publish")
 def publish_observations(payload: PublishRequest, user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_session)) -> dict[str, Any]:
     payload.actor = audit_actor(user)
+    _bind_research_project(session, user, payload.project_id)
     published, blocked, skipped_duplicates = [], [], []
+    source_ids: list[str] = []
     quality_rules = active_custom_quality_rules(session)
     for observation_id in payload.observation_ids:
-        item = session.get(PhenotypeObservation, observation_id)
+        item = session.scalar(select(PhenotypeObservation).where(
+            PhenotypeObservation.id == observation_id,
+            PhenotypeObservation.project_id == payload.project_id,
+        ))
         if not item:
             continue
-        siblings = session.scalars(select(PhenotypeObservation).where(PhenotypeObservation.variety_id == item.variety_id)).all()
+        siblings = session.scalars(select(PhenotypeObservation).where(
+            PhenotypeObservation.project_id == payload.project_id,
+            PhenotypeObservation.variety_id == item.variety_id,
+        )).all()
         source = session.get(SourceReview, item.source_review_id)
+        if source:
+            source_ids.append(source.id)
         source_version = session.get(TemplateVersion, source.template_version_id) if source and source.template_version_id else None
         issues = validate_observation(item, siblings, quality_rules) + template_quality_issues(item, source_version)
         if any(issue["severity"] == "block" for issue in issues) or not item.source_review_id:
@@ -5407,28 +7038,11 @@ def publish_observations(payload: PublishRequest, user: CurrentUser = Depends(re
         if variety:
             variety.data_status = "published"
         template = session.get(DataTemplate, session.get(TemplateVersion, source.template_version_id).template_id) if source and source.template_version_id and session.get(TemplateVersion, source.template_version_id) else None
-        if template and template.template_code == "rice_root_phenotype":
-            existing_root = session.scalar(
-                select(RootPhenotypeObservation.id).where(
-                    RootPhenotypeObservation.variety_id == item.variety_id,
-                    RootPhenotypeObservation.trait_code == item.trait_code,
-                )
-            )
-            if existing_root:
-                append_history(source, payload.actor, "跳过重复根系正式字段", {
-                    "observation_id": item.id,
-                    "trait": item.trait_name,
-                    "rule": "同一品种 + 同一标准字段仅保留一条",
-                })
-                session.delete(item)
-                skipped_duplicates.append(item.id)
-                continue
-            session.add(RootPhenotypeObservation(variety_id=item.variety_id, source_review_id=item.source_review_id, trait_code=item.trait_code, trait_name=item.trait_name, trait_category=item.trait_category, value_numeric=item.value_numeric, value_text=item.value_text, unit=item.unit, original_value=item.original_value, original_field=item.original_field, source_locator=item.source_locator, template_version=item.rule_version))
-            session.delete(item)
         append_history(source, payload.actor, "发布表型记录", {"observation_id": item.id, "trait": item.trait_name, "issues": issues, "target_table": template.target_table if template else "phenotype_observation"})
         published.append(item.id)
     session.commit()
-    return {"published": published, "blocked": blocked, "skipped_duplicates": skipped_duplicates}
+    published_batches = publish_ready_batches_for_sources(session, source_ids)
+    return {"published": published, "blocked": blocked, "skipped_duplicates": skipped_duplicates, "published_import_batches": published_batches}
 
 
 @app.get("/api/rules")
@@ -5465,6 +7079,7 @@ def retire_rule(rule_id: str, actor: str = Query("数据处理员-张三"), user
 
 @app.get("/api/varieties")
 def search_varieties(
+    project_id: str = Query(..., min_length=36, max_length=36),
     q: str = "",
     height_max: float | None = None,
     grain_weight_min: float | None = None,
@@ -5472,10 +7087,20 @@ def search_varieties(
     user: CurrentUser = Depends(require_published_data_reader),
     session: Session = Depends(get_session),
 ) -> list[dict[str, Any]]:
-    varieties = session.scalars(select(Variety).order_by(Variety.variety_name)).all()
+    _bind_research_project(session, user, project_id)
+    variety_ids = _project_variety_ids(session, project_id)
+    if not variety_ids:
+        return []
+    varieties = session.scalars(
+        select(Variety).where(Variety.id.in_(variety_ids)).order_by(Variety.variety_name)
+    ).all()
     result = []
     for variety in varieties:
-        obs = session.scalars(select(PhenotypeObservation).where(PhenotypeObservation.variety_id == variety.id, PhenotypeObservation.publish_status == "published")).all()
+        obs = session.scalars(select(PhenotypeObservation).where(
+            PhenotypeObservation.project_id == project_id,
+            PhenotypeObservation.variety_id == variety.id,
+            PhenotypeObservation.publish_status == "published",
+        )).all()
         if not obs:
             continue
         search_text = " ".join([variety.variety_name, *(variety.alias_names or [])]).lower()
@@ -5496,19 +7121,28 @@ def search_varieties(
 @app.get("/api/varieties/{variety_id}")
 def variety_detail(
     variety_id: str,
+    project_id: str = Query(..., min_length=36, max_length=36),
     user: CurrentUser = Depends(require_published_data_reader),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    variety = session.get(Variety, variety_id)
+    _bind_research_project(session, user, project_id)
+    variety = _get_project_variety(session, project_id, variety_id)
     if not variety or variety.data_status != "published":
         raise HTTPException(404, "品种不存在")
     observations = session.scalars(
         select(PhenotypeObservation)
-        .where(PhenotypeObservation.variety_id == variety_id, PhenotypeObservation.publish_status == "published")
+        .where(
+            PhenotypeObservation.project_id == project_id,
+            PhenotypeObservation.variety_id == variety_id,
+            PhenotypeObservation.publish_status == "published",
+        )
         .order_by(PhenotypeObservation.trait_category, PhenotypeObservation.trait_name)
     ).all()
     source_ids = {item.source_review_id for item in observations if item.source_review_id}
-    sources = [session.get(SourceReview, item) for item in source_ids]
+    sources = session.scalars(select(SourceReview).where(
+        SourceReview.project_id == project_id,
+        SourceReview.id.in_(source_ids),
+    )).all() if source_ids else []
     source_summaries = [{
         "id": item.id,
         "source_type": item.source_type,
@@ -5529,7 +7163,12 @@ def raw_source(
 
 
 @app.post("/api/reports/pdf")
-def pdf_report(payload: PdfReport) -> Response:
+def pdf_report(
+    payload: PdfReport,
+    user: CurrentUser = Depends(require_published_data_reader),
+    session: Session = Depends(get_session),
+) -> Response:
+    _bind_research_project(session, user, payload.project_id)
     pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
     buffer = io.BytesIO()
     document = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=14 * mm, leftMargin=14 * mm, topMargin=14 * mm, bottomMargin=14 * mm)

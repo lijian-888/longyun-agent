@@ -240,6 +240,12 @@ def ensure_trial_demo_schema(session: Session) -> None:
     )
     for statement in statements:
         session.execute(text(statement))
+    # The view is queried by the application role.  Without security_invoker,
+    # PostgreSQL evaluates it with the bootstrap owner's privileges and can
+    # bypass the project RLS policies on the underlying trial tables.
+    session.execute(text(
+        "ALTER VIEW v_trial_material_summary SET (security_invoker = true)"
+    ))
     # Existing local deployments predate the RCBD governance and formal-analysis
     # fields.  PostgreSQL keeps their history and adds only the new columns.
     migrations = (

@@ -1,0 +1,143 @@
+{
+  "realm": "rice-research",
+  "enabled": true,
+  "sslRequired": "EXTERNAL",
+  "displayName": "隆耘 Agent 育种智能体",
+  "loginTheme": "rice-research",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": false,
+  "roles": {
+    "realm": [
+      {"name": "researcher", "description": "Researcher access to governed data and private conversations."},
+      {"name": "data_processor", "description": "Institution-level data intake and publication."},
+      {"name": "field_admin", "description": "Platform template and standard management."}
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "rice-research-web",
+      "name": "Longyun Agent Breeding Intelligence Web",
+      "publicClient": true,
+      "protocol": "openid-connect",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": ["${PUBLIC_PLATFORM_URL}/*"],
+      "webOrigins": ["${PUBLIC_PLATFORM_URL}"],
+      "attributes": {"pkce.code.challenge.method": "S256"},
+      "protocolMappers": [
+        {
+          "name": "institution-id",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "institution_id",
+            "claim.name": "institution_id",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "id": "10000000-0000-4000-8000-000000000001",
+      "username": "orga.researcher1",
+      "enabled": true,
+      "firstName": "OrgA",
+      "lastName": "Researcher1",
+      "email": "orga.researcher1@example.local",
+      "emailVerified": true,
+      "attributes": {"institution_id": ["org-a"]},
+      "realmRoles": ["researcher"],
+      "credentials": [{"type": "password", "value": "${INITIAL_RESEARCHER_PASSWORD}", "temporary": true}]
+    },
+    {
+      "id": "10000000-0000-4000-8000-000000000002",
+      "username": "orga.researcher2",
+      "enabled": true,
+      "firstName": "OrgA",
+      "lastName": "Researcher2",
+      "email": "orga.researcher2@example.local",
+      "emailVerified": true,
+      "attributes": {"institution_id": ["org-a"]},
+      "realmRoles": ["researcher"],
+      "credentials": [{"type": "password", "value": "${INITIAL_RESEARCHER_PASSWORD}", "temporary": true}]
+    },
+    {
+      "id": "10000000-0000-4000-8000-000000000003",
+      "username": "orga.processor",
+      "enabled": true,
+      "firstName": "OrgA",
+      "lastName": "Processor",
+      "email": "orga.processor@example.local",
+      "emailVerified": true,
+      "attributes": {"institution_id": ["org-a"]},
+      "realmRoles": ["data_processor"],
+      "credentials": [{"type": "password", "value": "${INITIAL_PROCESSOR_PASSWORD}", "temporary": true}]
+    },
+    {
+      "id": "10000000-0000-4000-8000-000000000004",
+      "username": "orga.fieldadmin",
+      "enabled": true,
+      "firstName": "OrgA",
+      "lastName": "FieldAdmin",
+      "email": "orga.fieldadmin@example.local",
+      "emailVerified": true,
+      "attributes": {"institution_id": ["org-a"]},
+      "realmRoles": ["field_admin"],
+      "credentials": [{"type": "password", "value": "${INITIAL_FIELD_ADMIN_PASSWORD}", "temporary": true}]
+    },
+    {
+      "id": "20000000-0000-4000-8000-000000000001",
+      "username": "orgb.researcher1",
+      "enabled": true,
+      "firstName": "OrgB",
+      "lastName": "Researcher1",
+      "email": "orgb.researcher1@example.local",
+      "emailVerified": true,
+      "attributes": {"institution_id": ["org-b"]},
+      "realmRoles": ["researcher"],
+      "credentials": [{"type": "password", "value": "${INITIAL_RESEARCHER_PASSWORD}", "temporary": true}]
+    },
+    {
+      "id": "20000000-0000-4000-8000-000000000002",
+      "username": "orgb.researcher2",
+      "enabled": true,
+      "firstName": "OrgB",
+      "lastName": "Researcher2",
+      "email": "orgb.researcher2@example.local",
+      "emailVerified": true,
+      "attributes": {"institution_id": ["org-b"]},
+      "realmRoles": ["researcher"],
+      "credentials": [{"type": "password", "value": "${INITIAL_RESEARCHER_PASSWORD}", "temporary": true}]
+    },
+    {
+      "id": "20000000-0000-4000-8000-000000000003",
+      "username": "orgb.processor",
+      "enabled": true,
+      "firstName": "OrgB",
+      "lastName": "Processor",
+      "email": "orgb.processor@example.local",
+      "emailVerified": true,
+      "attributes": {"institution_id": ["org-b"]},
+      "realmRoles": ["data_processor"],
+      "credentials": [{"type": "password", "value": "${INITIAL_PROCESSOR_PASSWORD}", "temporary": true}]
+    },
+    {
+      "id": "20000000-0000-4000-8000-000000000004",
+      "username": "orgb.fieldadmin",
+      "enabled": true,
+      "firstName": "OrgB",
+      "lastName": "FieldAdmin",
+      "email": "orgb.fieldadmin@example.local",
+      "emailVerified": true,
+      "attributes": {"institution_id": ["org-b"]},
+      "realmRoles": ["field_admin"],
+      "credentials": [{"type": "password", "value": "${INITIAL_FIELD_ADMIN_PASSWORD}", "temporary": true}]
+    }
+  ]
+}

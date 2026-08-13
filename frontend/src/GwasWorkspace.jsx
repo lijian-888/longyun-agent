@@ -48,6 +48,11 @@ async function downloadProtected(path, fallbackName, onNotice) {
   }
 }
 
+function withProject(path, projectId) {
+  if (!projectId) return path;
+  return `${path}${path.includes("?") ? "&" : "?"}project_id=${encodeURIComponent(projectId)}`;
+}
+
 function FileState({ title, note, ready, children }) {
   return <article className={`gwas-input-card ${ready ? "ready" : ""}`}>
     <div className="gwas-input-card-head">
@@ -86,7 +91,7 @@ function InputSummary({ manifest, preflight }) {
   </section>;
 }
 
-function ResultFiles({ plan, onNotice }) {
+function ResultFiles({ plan, onNotice, projectId }) {
   const files = plan?.result_manifest?.files || [];
   if (!files.length) return null;
   return <section className="gwas-result-files">
@@ -96,14 +101,14 @@ function ResultFiles({ plan, onNotice }) {
       <span>结果由已锁定的质控基因型版本、表型、协变量和固定参数产生。</span>
     </div>
     <div className="gwas-result-file-list">
-      {files.map((file) => <button type="button" key={file.key} onClick={() => downloadProtected(`/api/gwas/plans/${plan.id}/results/${encodeURIComponent(file.key)}`, file.file_name, onNotice)}>
+      {files.map((file) => <button type="button" key={file.key} onClick={() => downloadProtected(withProject(`/api/gwas/plans/${plan.id}/results/${encodeURIComponent(file.key)}`, projectId), file.file_name, onNotice)}>
         <Download size={15} /><span><strong>{file.title}</strong><small>{file.file_name}</small></span>
       </button>)}
     </div>
   </section>;
 }
 
-export default function GwasWorkspace({ onNotice }) {
+export default function GwasWorkspace({ onNotice, projectId }) {
   const [plans, setPlans] = useState([]);
   const [assets, setAssets] = useState([]);
   const [activePlanId, setActivePlanId] = useState("");
@@ -125,10 +130,17 @@ export default function GwasWorkspace({ onNotice }) {
     : "";
 
   async function load(preferredId = "") {
+    if (!projectId) {
+      setPlans([]);
+      setAssets([]);
+      setActivePlanId("");
+      setSelectedAsset("");
+      return;
+    }
     try {
       const [planRows, assetRows] = await Promise.all([
-        request("/api/gwas/plans"),
-        request("/api/genotype-assets/analysis-ready"),
+        request(withProject("/api/gwas/plans", projectId)),
+        request(withProject("/api/genotype-assets/analysis-ready", projectId)),
       ]);
       setPlans(planRows);
       setAssets(assetRows);
@@ -143,7 +155,7 @@ export default function GwasWorkspace({ onNotice }) {
     }
   }
 
-  useEffect(() => { void load(); }, []);
+  useEffect(() => { void load(); }, [projectId]);
 
   async function createPlan(event) {
     event.preventDefault();
@@ -152,7 +164,7 @@ export default function GwasWorkspace({ onNotice }) {
       const result = await request("/api/gwas/plans", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ trait_name: traitName, reference_assembly: assembly }),
+        body: JSON.stringify({ trait_name: traitName, reference_assembly: assembly, project_id: projectId }),
       });
       await load(result.id);
       onNotice("已创建连续性状 GWAS 计划。请依次选择质控版本、下载表型模板并上传填写后的表型文件。");
@@ -171,7 +183,7 @@ export default function GwasWorkspace({ onNotice }) {
     const [assetId, versionId] = selectedAsset.split(":");
     setBusy("attach");
     try {
-      const result = await request(`/api/gwas/plans/${activePlan.id}/genotype-asset`, {
+      const result = await request(withProject(`/api/gwas/plans/${activePlan.id}/genotype-asset`, projectId), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ asset_id: assetId, version_id: versionId }),
@@ -193,7 +205,7 @@ export default function GwasWorkspace({ onNotice }) {
     }
     const [assetId, versionId] = target.split(":");
     await downloadProtected(
-      `/api/genotype-assets/${assetId}/versions/${versionId}/phenotype-template`,
+      withProject(`/api/genotype-assets/${assetId}/versions/${versionId}/phenotype-template`, projectId),
       "水稻GWAS专用表型模板.xlsx",
       onNotice,
     );
@@ -208,7 +220,7 @@ export default function GwasWorkspace({ onNotice }) {
       const form = new FormData();
       form.append("file", file);
       const suffix = kind === "phenotype" ? `?trait_column=${encodeURIComponent(traitColumn.trim())}` : "";
-      const result = await request(`/api/gwas/plans/${activePlan.id}/${kind}${suffix}`, { method: "POST", body: form });
+      const result = await request(withProject(`/api/gwas/plans/${activePlan.id}/${kind}${suffix}`, projectId), { method: "POST", body: form });
       setPlans((rows) => rows.map((item) => item.id === result.id ? result : item));
       onNotice(kind === "phenotype"
         ? "表型文件已完成样本交集和单环境校验。请核对预检状态后确认计划。"
@@ -226,7 +238,7 @@ export default function GwasWorkspace({ onNotice }) {
     if (!activePlan) return;
     setBusy("confirm");
     try {
-      const result = await request(`/api/gwas/plans/${activePlan.id}/confirm`, { method: "POST" });
+      const result = await request(withProject(`/api/gwas/plans/${activePlan.id}/confirm`, projectId), { method: "POST" });
       setPlans((rows) => rows.map((item) => item.id === result.id ? result : item));
       onNotice("计划已锁定。下一步会使用固定输入快照和参数执行本地受控分析。");
     } catch (error) {
@@ -240,7 +252,7 @@ export default function GwasWorkspace({ onNotice }) {
     if (!activePlan) return;
     setBusy("run");
     try {
-      const result = await request(`/api/gwas/plans/${activePlan.id}/run`, { method: "POST" });
+      const result = await request(withProject(`/api/gwas/plans/${activePlan.id}/run`, projectId), { method: "POST" });
       setPlans((rows) => rows.map((item) => item.id === result.id ? result : item));
       onNotice("已提交本地受控 GWAS 队列，结果将保存在计划与结果库中。");
     } catch (error) {
@@ -254,7 +266,7 @@ export default function GwasWorkspace({ onNotice }) {
     if (!activePlan) return;
     setBusy("archive");
     try {
-      const result = await request(`/api/gwas/plans/${activePlan.id}/archive`, { method: "POST" });
+      const result = await request(withProject(`/api/gwas/plans/${activePlan.id}/archive`, projectId), { method: "POST" });
       setPlans((rows) => rows.map((item) => item.id === result.id ? result : item));
       onNotice("已将可追溯结果摘要保存到结果库。");
     } catch (error) {
@@ -287,7 +299,7 @@ export default function GwasWorkspace({ onNotice }) {
           <strong>新建计划</strong>
           <label>连续性状<input value={traitName} onChange={(event) => setTraitName(event.target.value)} required placeholder="例如：株高" /></label>
           <label>参考基因组/坐标版本<input value={assembly} onChange={(event) => setAssembly(event.target.value)} required /></label>
-          <button className="secondary-button" disabled={busy === "create"}>{busy === "create" ? <LoaderCircle size={15} className="spin" /> : <FlaskConical size={15} />}生成确认计划</button>
+          <button className="secondary-button" disabled={!projectId || busy === "create"}>{busy === "create" ? <LoaderCircle size={15} className="spin" /> : <FlaskConical size={15} />}生成确认计划</button>
         </form>
       </aside>
 
@@ -343,7 +355,7 @@ export default function GwasWorkspace({ onNotice }) {
               <small>确认后会记录输入文件校验值、来源基因型版本、参考版本、固定参数、确认人与时间。</small>
             </div>
           </section>
-          <ResultFiles plan={activePlan} onNotice={onNotice} />
+          <ResultFiles plan={activePlan} onNotice={onNotice} projectId={projectId} />
         </>}
       </section>
     </section>

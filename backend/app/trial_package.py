@@ -29,6 +29,8 @@ from openpyxl import load_workbook
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from .object_storage import ObjectStore, project_object_key
+
 from .trial_demo import ensure_trial_demo_schema
 from .trial_statistics import TrialStatisticsError, run_controlled_trial_analysis
 
@@ -592,6 +594,7 @@ def _serialize_batch(row: Any, include_payload: bool = False) -> dict[str, Any]:
     summary = _as_json(data.get("parse_summary"), {})
     result = {
         "id": str(data["id"]),
+        "project_id": str(data["project_id"]) if data.get("project_id") else None,
         "display_name": data["display_name"],
         "archive_name": data["archive_name"],
         "uploaded_by": data["uploaded_by"],
@@ -617,19 +620,35 @@ def _serialize_batch(row: Any, include_payload: bool = False) -> dict[str, Any]:
     return result
 
 
-def list_trial_import_batches(session: Session) -> list[dict[str, Any]]:
-    rows = session.execute(text("SELECT * FROM trial_import_batch ORDER BY created_at DESC")).mappings().all()
+def list_trial_import_batches(session: Session, project_id: str) -> list[dict[str, Any]]:
+    rows = session.execute(
+        text("SELECT * FROM trial_import_batch WHERE project_id = :project_id ORDER BY created_at DESC"),
+        {"project_id": project_id},
+    ).mappings().all()
     return [_serialize_batch(row) for row in rows]
 
 
-def get_trial_import_batch(session: Session, batch_id: str) -> dict[str, Any]:
-    row = session.execute(text("SELECT * FROM trial_import_batch WHERE id = :id"), {"id": batch_id}).mappings().first()
+def get_trial_import_batch(session: Session, batch_id: str, project_id: str) -> dict[str, Any]:
+    row = session.execute(
+        text("SELECT * FROM trial_import_batch WHERE id = :id AND project_id = :project_id"),
+        {"id": batch_id, "project_id": project_id},
+    ).mappings().first()
     if not row:
         raise ValueError("未找到该区域试验资料包")
     return _serialize_batch(row, include_payload=True)
 
 
-def upload_trial_package(session: Session, file_name: str, content: bytes, actor: str, raw_storage_dir: Path) -> dict[str, Any]:
+def upload_trial_package(
+    session: Session,
+    file_name: str,
+    content: bytes,
+    actor: str,
+    raw_storage_dir: Path,
+    object_store: ObjectStore | None = None,
+    project_id: str | None = None,
+) -> dict[str, Any]:
+    if not project_id:
+        raise ValueError("上传区域试验资料包前必须选择课题")
     if not file_name.lower().endswith(".zip"):
         raise ValueError("区域试验资料包第一版仅支持 ZIP。请将材料布局、环境土壤、管理和表型 Excel 打包后上传")
     if len(content) > MAX_ARCHIVE_BYTES:
@@ -643,19 +662,34 @@ def upload_trial_package(session: Session, file_name: str, content: bytes, actor
 
     batch_id = _new_id()
     safe_name = _safe_file_name(file_name)
-    target_dir = raw_storage_dir / "trial-packages" / batch_id
-    target_dir.mkdir(parents=True, exist_ok=True)
-    archive_path = target_dir / safe_name
-    archive_path.write_bytes(content)
+    if object_store is not None:
+        stored = object_store.put_bytes(
+            project_object_key(
+                project_id=project_id,
+                category="trial-packages",
+                resource_id=batch_id,
+                file_name=safe_name,
+            ),
+            content,
+            "application/zip",
+        )
+        archive_locator = stored.locator
+    else:
+        target_dir = raw_storage_dir / "trial-packages" / batch_id
+        target_dir.mkdir(parents=True, exist_ok=True)
+        archive_path = target_dir / safe_name
+        archive_path.write_bytes(content)
+        archive_locator = str(archive_path)
     digest = hashlib.sha256(content).hexdigest()
     session.execute(text("""
-        INSERT INTO trial_import_batch (id, display_name, archive_name, archive_path, archive_sha256, uploaded_by, parse_status)
-        VALUES (:id, :display_name, :archive_name, :archive_path, :archive_sha256, :uploaded_by, 'parsing')
+        INSERT INTO trial_import_batch (id, project_id, display_name, archive_name, archive_path, archive_sha256, uploaded_by, parse_status)
+        VALUES (:id, :project_id, :display_name, :archive_name, :archive_path, :archive_sha256, :uploaded_by, 'parsing')
     """), {
         "id": batch_id,
+        "project_id": project_id,
         "display_name": Path(file_name).stem,
         "archive_name": safe_name,
-        "archive_path": str(archive_path),
+        "archive_path": archive_locator,
         "archive_sha256": digest,
         "uploaded_by": actor,
     })
@@ -697,19 +731,22 @@ def upload_trial_package(session: Session, file_name: str, content: bytes, actor
         session.execute(text("UPDATE trial_import_batch SET parse_status = 'failed', error_message = :message, parsed_at = now() WHERE id = :id"), {"id": batch_id, "message": str(exc)})
         session.commit()
         raise
-    return get_trial_import_batch(session, batch_id)
+    return get_trial_import_batch(session, batch_id, project_id)
 
 
 def _trial_id(package_id: str, trial_key: str) -> str:
     return str(uuid.uuid5(uuid.UUID(package_id), f"trial:{trial_key}"))
 
 
-def publish_trial_package(session: Session, batch_id: str, actor: str) -> dict[str, Any]:
-    row = session.execute(text("SELECT * FROM trial_import_batch WHERE id = :id FOR UPDATE"), {"id": batch_id}).mappings().first()
+def publish_trial_package(session: Session, batch_id: str, actor: str, project_id: str) -> dict[str, Any]:
+    row = session.execute(
+        text("SELECT * FROM trial_import_batch WHERE id = :id AND project_id = :project_id FOR UPDATE"),
+        {"id": batch_id, "project_id": project_id},
+    ).mappings().first()
     if not row:
         raise ValueError("未找到该区域试验资料包")
     if row["parse_status"] == "published":
-        return get_trial_import_batch(session, batch_id)
+        return get_trial_import_batch(session, batch_id, project_id)
     if row["parse_status"] != "ready_for_review":
         raise ValueError("资料包尚未完成解析，不能发布入库")
     validation_report = _as_json(row.get("validation_report"), {})
@@ -724,10 +761,11 @@ def publish_trial_package(session: Session, batch_id: str, actor: str) -> dict[s
     package_code = f"RTP-{datetime.now().strftime('%Y%m%d')}-{batch_id[:8].upper()}"
     is_simulated = "模拟" in row["display_name"] or "sample" in row["display_name"].lower()
     session.execute(text("""
-        INSERT INTO trial_data_package (id, package_code, package_name, dataset_type, governance_status, description, is_simulated)
-        VALUES (:id, :code, :name, '多环境区域试验', 'published', :description, :simulated)
+        INSERT INTO trial_data_package (id, project_id, package_code, package_name, dataset_type, governance_status, description, is_simulated)
+        VALUES (:id, :project_id, :code, :name, '多环境区域试验', 'published', :description, :simulated)
     """), {
         "id": package_id,
+        "project_id": project_id,
         "code": package_code,
         "name": row["display_name"],
         "description": f"由数据处理员 {actor} 核验发布；原始资料包 {row['archive_name']} 保留于本地原始数据区。",
@@ -751,6 +789,17 @@ def publish_trial_package(session: Session, batch_id: str, actor: str) -> dict[s
                 INSERT INTO breeding_material (id, material_code, material_name, material_type, is_check, aliases, pedigree_summary)
                 VALUES (:id, :code, :name, '水稻育种材料', :is_check, CAST(:aliases AS jsonb), '资料包导入；系谱待后续补充')
             """), {"id": material_id, "code": material["material_code"], "name": material["material_name"], "is_check": material["is_check"], "aliases": _json(material.get("aliases", []))})
+        session.execute(text("""
+            INSERT INTO data_material_project_scope (
+                project_id, material_id, access_level, source, created_by
+            )
+            VALUES (:project_id, :material_id, 'project', 'trial_package', :created_by)
+            ON CONFLICT (project_id, material_id) DO NOTHING
+        """), {
+            "material_id": material_id,
+            "project_id": project_id,
+            "created_by": actor,
+        })
 
     site_payload = {item["site_code"]: item for item in payload.get("sites", [])}
     for environment in payload.get("environment", []):
@@ -796,14 +845,15 @@ def publish_trial_package(session: Session, batch_id: str, actor: str) -> dict[s
         trial_code = f"{package_code}-{trial_key}"
         session.execute(text("""
             INSERT INTO field_trial (
-                id, trial_code, package_id, site_id, trial_year, trial_name, design_type, replicate_count,
+                id, project_id, trial_code, package_id, site_id, trial_year, trial_name, design_type, replicate_count,
                 design_metadata, design_validation_status, data_status, source_note
             ) VALUES (
-                :id, :code, :package_id, :site_id, :year, :name, :design_type, :replicate_count,
+                :id, :project_id, :code, :package_id, :site_id, :year, :name, :design_type, :replicate_count,
                 CAST(:design_metadata AS jsonb), 'passed', 'published', :note
             )
         """), {
             "id": trial_id,
+            "project_id": project_id,
             "code": trial_code,
             "package_id": package_id,
             "site_id": site_ids[trial["site_code"]],
@@ -878,19 +928,19 @@ def publish_trial_package(session: Session, batch_id: str, actor: str) -> dict[s
         WHERE id = :id
     """), {"id": batch_id, "package_id": package_id})
     session.commit()
-    result = get_trial_import_batch(session, batch_id)
+    result = get_trial_import_batch(session, batch_id, project_id)
     result["published_counts"] = published_counts
     return result
 
 
-def _published_package(session: Session) -> dict[str, Any] | None:
+def _published_package(session: Session, project_id: str) -> dict[str, Any] | None:
     row = session.execute(text("""
         SELECT id, package_code, package_name, created_at
         FROM trial_data_package
-        WHERE governance_status = 'published'
+        WHERE governance_status = 'published' AND project_id = :project_id
         ORDER BY created_at DESC
         LIMIT 1
-    """)).mappings().first()
+    """), {"project_id": project_id}).mappings().first()
     return dict(row) if row else None
 
 
@@ -1142,9 +1192,16 @@ def _decline_analysis(session: Session, package_id: str, rows: list[dict[str, An
     return {"analysis_type": "decline_evidence", "material": material_name, "material_code": requested, "records": details, "method_note": "将该材料同一标准施氮处理下的年点表现、土壤、天气和病害压力并列。只能拆解同时出现的证据变化，不能仅凭本资料判定某一因素导致表现下降。"}
 
 
-def build_published_trial_evidence(session: Session, question: str, requested_by: str = "系统") -> tuple[str, list[dict[str, Any]]]:
+def build_published_trial_evidence(
+    session: Session,
+    question: str,
+    requested_by: str = "系统",
+    project_id: str | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
     """Return only actually published trial-package evidence for the assistant."""
-    package = _published_package(session)
+    if not project_id:
+        return "", []
+    package = _published_package(session, project_id)
     if not package:
         return "", []
     rows = _trial_summaries(session, str(package["id"]))

@@ -10,6 +10,8 @@ import jwt
 from fastapi import HTTPException, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from .tenancy import TenantAccessError, tenant_database_manager
+
 
 bearer_scheme = HTTPBearer(auto_error=False)
 _jwks_cache: dict[str, Any] = {"expires_at": 0.0, "keys": {}}
@@ -23,6 +25,7 @@ class CurrentUser:
     username: str
     display_name: str
     roles: frozenset[str]
+    institution_id: str = "longyun-demo"
 
 
 def _settings() -> tuple[str, str, str]:
@@ -77,13 +80,33 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials | None = Se
     if audience not in token_audiences and claims.get("azp") != audience:
         raise HTTPException(401, "登录凭证不属于本科研助手。")
     roles = frozenset((claims.get("realm_access") or {}).get("roles") or [])
+    institution_id = str(claims.get("institution_id") or "").strip()
+    deployment_profile = os.getenv("DEPLOYMENT_ENV", "development").strip().lower()
+    if not institution_id:
+        if deployment_profile in {"production", "staging"}:
+            raise HTTPException(403, "账号尚未绑定机构，禁止访问正式科研数据。")
+        institution_id = os.getenv("DEFAULT_INSTITUTION_ID", "longyun-demo").strip()
     display_name = " ".join(part for part in [claims.get("family_name"), claims.get("given_name")] if part).strip()
-    return CurrentUser(
+    current_user = CurrentUser(
         id=str(claims.get("sub") or ""),
         username=str(claims.get("preferred_username") or ""),
         display_name=display_name or str(claims.get("preferred_username") or "科研人员"),
         roles=roles,
+        institution_id=institution_id,
     )
+    try:
+        tenant_database_manager.verify_user_membership(
+            current_user.id,
+            current_user.institution_id,
+        )
+        if tenant_database_manager.mode == "multi":
+            tenant_database_manager.resolve(current_user.institution_id)
+    except TenantAccessError as exc:
+        # Checking the mutable control plane on every authenticated request
+        # makes a disabled/deleted account ineffective immediately, even when
+        # its previously issued Keycloak access token has not expired yet.
+        raise HTTPException(403, "当前账号已被停用、删除或所属机构不可用。") from exc
+    return current_user
 
 
 async def require_researcher(user: CurrentUser = Security(get_current_user)) -> CurrentUser:
@@ -100,15 +123,23 @@ async def require_published_data_reader(user: CurrentUser = Security(get_current
 
 
 async def require_knowledge_user(user: CurrentUser = Security(get_current_user)) -> CurrentUser:
-    """Researchers browse their own/private knowledge; field admins manage public knowledge."""
-    if not {"researcher", "field_admin"}.intersection(user.roles):
+    """Researchers browse knowledge; data processors curate institution/public sources."""
+    if not {"researcher", "data_processor", "field_admin"}.intersection(user.roles):
         raise HTTPException(403, "当前账号没有知识库访问权限。")
     return user
 
 
 async def require_knowledge_admin(user: CurrentUser = Security(get_current_user)) -> CurrentUser:
-    if "field_admin" not in user.roles:
-        raise HTTPException(403, "公共知识库仅允许字段管理员维护。")
+    """Only institution data processors may ingest or publish knowledge sources."""
+    if "data_processor" not in user.roles:
+        raise HTTPException(403, "公共知识资料仅允许数据处理员维护。")
+    return user
+
+
+async def require_genotype_user(user: CurrentUser = Security(get_current_user)) -> CurrentUser:
+    """Allow legacy researcher assets and institution-level processor intake."""
+    if not {"researcher", "data_processor"}.intersection(user.roles):
+        raise HTTPException(403, "当前账号没有基因型数据访问权限。")
     return user
 
 
@@ -120,7 +151,7 @@ async def require_data_processor(user: CurrentUser = Security(get_current_user))
 
 async def require_field_admin(user: CurrentUser = Security(get_current_user)) -> CurrentUser:
     if "field_admin" not in user.roles:
-        raise HTTPException(403, "当前账号没有字段和标准模板管理权限。")
+        raise HTTPException(403, "当前账号没有机构课题管理权限。")
     return user
 
 

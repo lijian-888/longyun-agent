@@ -1,0 +1,3 @@
+# AgentScope 1.0.21 imports the legacy `streamablehttp_client` symbol.
+# MCP 1.29 keeps that compatibility alias; MCP 2.0 removes it.
+mcp==1.29.0

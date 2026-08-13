@@ -1,0 +1,148 @@
+# Disposable two-institution acceptance environment. It publishes no ports and
+# uses only project-scoped volumes removed by deploy/run-sandbox-acceptance.ps1.
+services:
+  control-db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: longyun_control
+      POSTGRES_USER: control
+      POSTGRES_PASSWORD: AcceptanceControl_2026
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U control -d longyun_control"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  org-a-db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: longyun_org_a
+      POSTGRES_USER: rice
+      POSTGRES_PASSWORD: AcceptanceOrgA_2026
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rice -d longyun_org_a"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  org-b-db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: longyun_org_b
+      POSTGRES_USER: rice
+      POSTGRES_PASSWORD: AcceptanceOrgB_2026
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rice -d longyun_org_b"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  migration-db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: longyun_migration_test
+      POSTGRES_USER: rice
+      POSTGRES_PASSWORD: AcceptanceMigration_2026
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rice -d longyun_migration_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z-cpuv1
+    command: ["server", "/data"]
+    environment:
+      MINIO_ROOT_USER: acceptance-root
+      MINIO_ROOT_PASSWORD: AcceptanceMinioRoot_2026
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+
+  minio-init:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z-cpuv1
+    entrypoint: ["/bin/sh", "/init/init-tenants.sh"]
+    environment:
+      MINIO_ROOT_USER: acceptance-root
+      MINIO_ROOT_PASSWORD: AcceptanceMinioRoot_2026
+      ORG_A_MINIO_ACCESS_KEY: acceptance-org-a
+      ORG_A_MINIO_SECRET_KEY: AcceptanceOrgAStorage_2026
+      ORG_A_MINIO_BACKUP_ACCESS_KEY: acceptance-org-a-backup
+      ORG_A_MINIO_BACKUP_SECRET_KEY: AcceptanceOrgABackup_2026
+      ORG_B_MINIO_ACCESS_KEY: acceptance-org-b
+      ORG_B_MINIO_SECRET_KEY: AcceptanceOrgBStorage_2026
+      ORG_B_MINIO_BACKUP_ACCESS_KEY: acceptance-org-b-backup
+      ORG_B_MINIO_BACKUP_SECRET_KEY: AcceptanceOrgBBackup_2026
+      ORG_A_MINIO_DATA_QUOTA: 128MiB
+      ORG_A_MINIO_BACKUP_QUOTA: 64MiB
+      ORG_B_MINIO_DATA_QUOTA: 128MiB
+      ORG_B_MINIO_BACKUP_QUOTA: 64MiB
+    depends_on:
+      minio: {condition: service_healthy}
+    volumes:
+      - ./deploy/minio:/init:ro
+      - ./deploy/minio:/policies:ro
+
+  runner:
+    image: longyun-agent-acceptance:current
+    build: ./backend
+    entrypoint: ["/bin/sh", "-c", "sleep infinity"]
+    environment:
+      PYTHONPATH: /app
+      TENANCY_MODE: multi
+      CONTROL_ENFORCE_USER_BINDING: "true"
+      CONTROL_DATABASE_URL: postgresql+psycopg://control:AcceptanceControl_2026@control-db:5432/longyun_control
+      TENANT_BOOTSTRAP_JSON: >-
+        [{"institution_id":"org-a","display_name":"Acceptance Org A","status":"trial","database_url_secret":"ORG_A_DATABASE_URL","migration_database_url_secret":"ORG_A_MIGRATION_DATABASE_URL","storage_backend":"minio","object_endpoint":"minio:9000","data_bucket":"longyun-org-a-data","backup_bucket":"longyun-org-a-backup","object_access_key_secret":"ORG_A_MINIO_ACCESS_KEY","object_secret_key_secret":"ORG_A_MINIO_SECRET_KEY","object_secure":false,"queue_prefix":"tenant.org-a","user_ids":["10000000-0000-4000-8000-000000000001"]},{"institution_id":"org-b","display_name":"Acceptance Org B","status":"trial","database_url_secret":"ORG_B_DATABASE_URL","migration_database_url_secret":"ORG_B_MIGRATION_DATABASE_URL","storage_backend":"minio","object_endpoint":"minio:9000","data_bucket":"longyun-org-b-data","backup_bucket":"longyun-org-b-backup","object_access_key_secret":"ORG_B_MINIO_ACCESS_KEY","object_secret_key_secret":"ORG_B_MINIO_SECRET_KEY","object_secure":false,"queue_prefix":"tenant.org-b","user_ids":["20000000-0000-4000-8000-000000000001"]}]
+      ORG_A_DATABASE_URL: postgresql+psycopg://rice_app:AcceptanceAppA_2026@org-a-db:5432/longyun_org_a
+      ORG_A_MIGRATION_DATABASE_URL: postgresql+psycopg://rice:AcceptanceOrgA_2026@org-a-db:5432/longyun_org_a
+      ORG_B_DATABASE_URL: postgresql+psycopg://rice_app:AcceptanceAppB_2026@org-b-db:5432/longyun_org_b
+      ORG_B_MIGRATION_DATABASE_URL: postgresql+psycopg://rice:AcceptanceOrgB_2026@org-b-db:5432/longyun_org_b
+      ORG_A_MINIO_ACCESS_KEY: acceptance-org-a
+      ORG_A_MINIO_SECRET_KEY: AcceptanceOrgAStorage_2026
+      ORG_B_MINIO_ACCESS_KEY: acceptance-org-b
+      ORG_B_MINIO_SECRET_KEY: AcceptanceOrgBStorage_2026
+      DATABASE_URL: postgresql+psycopg://rice_app:AcceptanceAppA_2026@org-a-db:5432/longyun_org_a
+      MIGRATION_DATABASE_URL: postgresql+psycopg://rice:AcceptanceOrgA_2026@org-a-db:5432/longyun_org_a
+      TEST_DATABASE_URL: postgresql+psycopg://rice_app:AcceptanceAppA_2026@org-a-db:5432/longyun_org_a
+      TEST_MIGRATION_DATABASE_URL: postgresql+psycopg://rice:AcceptanceOrgA_2026@org-a-db:5432/longyun_org_a
+      TEST_APP_DATABASE_PASSWORD: AcceptanceAppA_2026
+      APP_DATABASE_ROLE: rice_app
+      APP_DATABASE_PASSWORD: AcceptanceAppA_2026
+      DEFAULT_INSTITUTION_ID: org-a
+      TEST_INSTITUTION_ID: org-a
+      TEST_OWNER_ID: integration-test-user
+      SEED_ALL_TENANTS_WITH_DEMO_DATA: "true"
+      DEPLOYMENT_ENV: testing
+      LONGYUN_LLM_DEPLOYMENT_MODE: external_api
+      LONGYUN_DATA_ENVIRONMENT: sandbox_desensitized
+      LONGYUN_LLM_PROVIDER_NAME: AcceptanceProvider
+      LONGYUN_LLM_BASE_URL: https://invalid.acceptance.example/v1
+      LONGYUN_LLM_MODEL: acceptance-model
+      LONGYUN_LLM_API_KEY: acceptance-not-used
+      AGENT_QUEUE_LIMITS_ENABLED: "false"
+      RUN_ACPS_DB_INTEGRATION: "1"
+      RUN_AGENT_TOOL_INTEGRATION: "1"
+      RUN_AGENT_DB_INTEGRATION: "1"
+      RUN_DB_INTEGRATION: "1"
+      TEST_MINIO_ENDPOINT: minio:9000
+      TEST_ORG_A_BUCKET: longyun-org-a-data
+      TEST_ORG_A_BACKUP_BUCKET: longyun-org-a-backup
+      TEST_ORG_A_ACCESS_KEY: acceptance-org-a
+      TEST_ORG_A_SECRET_KEY: AcceptanceOrgAStorage_2026
+      TEST_ORG_B_BUCKET: longyun-org-b-data
+      TEST_ORG_B_BACKUP_BUCKET: longyun-org-b-backup
+      TEST_ORG_B_ACCESS_KEY: acceptance-org-b
+      TEST_ORG_B_SECRET_KEY: AcceptanceOrgBStorage_2026
+    depends_on:
+      control-db: {condition: service_healthy}
+      org-a-db: {condition: service_healthy}
+      org-b-db: {condition: service_healthy}
+      migration-db: {condition: service_healthy}
+      minio-init: {condition: service_completed_successfully}
+    volumes:
+      - ./backend/app:/app/app:ro
+      - ./backend/alembic.ini:/app/alembic.ini:ro
+      - ./backend/tests:/app/tests:ro

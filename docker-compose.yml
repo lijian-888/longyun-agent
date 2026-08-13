@@ -15,6 +15,18 @@ services:
     ports:
       - "54329:5432"
 
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - redis_data:/data
+
   api:
     build: ./backend
     environment:
@@ -33,9 +45,35 @@ services:
       KEYCLOAK_ISSUER: https://localhost:8443/realms/rice-research
       KEYCLOAK_JWKS_URL: http://keycloak:8080/realms/rice-research/protocol/openid-connect/certs
       KEYCLOAK_AUDIENCE: rice-research-web
-      SHENNONG_API_BASE_URL: ${SHENNONG_API_BASE_URL:-https://api.agent-tech.cc/api/v1}
-      SHENNONG_MODEL: ${SHENNONG_MODEL:-sn}
-      SHENNONG_API_KEY: ${SHENNONG_API_KEY:-}
+      KEYCLOAK_ADMIN_URL: http://keycloak:8080
+      KEYCLOAK_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USERNAME:-platform-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-ChangeThisAdminPassword!}
+      KEYCLOAK_MANAGED_REALM: rice-research
+      DEFAULT_INSTITUTION_ID: ${DEFAULT_INSTITUTION_ID:-longyun-demo}
+      REDIS_URL: redis://redis:6379/0
+      LONGYUN_LLM_PROVIDER_NAME: ${LONGYUN_LLM_PROVIDER_NAME:-CherryIn}
+      LONGYUN_LLM_BASE_URL: ${LONGYUN_LLM_BASE_URL:-${SHENNONG_API_BASE_URL:-https://open.cherryin.net/v1}}
+      LONGYUN_LLM_MODEL: ${LONGYUN_LLM_MODEL:-${SHENNONG_MODEL:-agent/qwen3.5-flash}}
+      LONGYUN_LLM_API_KEY: ${LONGYUN_LLM_API_KEY:-${SHENNONG_API_KEY:-}}
+      LONGYUN_LLM_ALIAS: ${LONGYUN_LLM_ALIAS:-longyun-sandbox}
+      LONGYUN_LLM_DEPLOYMENT_MODE: ${LONGYUN_LLM_DEPLOYMENT_MODE:-external_api}
+      # Plain evidence chat avoids relay-specific ReAct tool-message failures.
+      # Set agentscope_react only after the target model's tool protocol has
+      # passed compatibility tests.
+      LONGYUN_RESEARCH_TEXT_PROTOCOL: ${LONGYUN_RESEARCH_TEXT_PROTOCOL:-plain_evidence}
+      LONGYUN_DATA_ENVIRONMENT: ${LONGYUN_DATA_ENVIRONMENT:-sandbox_desensitized}
+      LONGYUN_ALLOW_EXTERNAL_PRIVATE_EVIDENCE: ${LONGYUN_ALLOW_EXTERNAL_PRIVATE_EVIDENCE:-false}
+      LONGYUN_ALLOW_EXTERNAL_WEB_SEARCH: ${LONGYUN_ALLOW_EXTERNAL_WEB_SEARCH:-false}
+      AGENT_QUEUE_LIMITS_ENABLED: ${AGENT_QUEUE_LIMITS_ENABLED:-false}
+      AGENT_MAX_ACTIVE_PER_USER: ${AGENT_MAX_ACTIVE_PER_USER:-2}
+      AGENT_MAX_ACTIVE_PER_INSTITUTION: ${AGENT_MAX_ACTIVE_PER_INSTITUTION:-16}
+      AGENT_MAX_EVIDENCE_CHARS: ${AGENT_MAX_EVIDENCE_CHARS:-120000}
+      # Native AIP boundary. Keep disabled until an mTLS proxy and explicit
+      # AIC-to-tenant authorization bindings have been configured.
+      ACPS_AIP_ENABLED: ${ACPS_AIP_ENABLED:-false}
+      LONGYUN_AIC: ${LONGYUN_AIC:-}
+      ACPS_IDENTITY_BINDINGS_JSON: ${ACPS_IDENTITY_BINDINGS_JSON:-{}}
+      ACPS_REQUIRE_MTLS_PROXY: ${ACPS_REQUIRE_MTLS_PROXY:-true}
       TAVILY_API_KEY: ${TAVILY_API_KEY:-}
       DOC_PARSE_MODE: ${DOC_PARSE_MODE:-local}
       # The CPU parser pipeline is deliberately serial.  More parallel workers
@@ -56,6 +94,8 @@ services:
       BGE_M3_MODEL_PATH: /data/models/bge-m3
     depends_on:
       db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
       mineru:
         condition: service_healthy
@@ -89,6 +129,34 @@ services:
       - research_data:/data/research
     restart: unless-stopped
 
+  agent-workflow-worker:
+    build: ./backend
+    command: ["celery", "-A", "app.ai.workflow_worker:celery_app", "worker", "-Q", "tenant.${DEFAULT_INSTITUTION_ID:-longyun-demo}.agent", "--loglevel=INFO", "--concurrency=${AGENT_WORKER_CONCURRENCY:-2}"]
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+psycopg://rice_app:${APP_DATABASE_PASSWORD:-rice_app_demo_password}@db:5432/rice_demo
+      WORKER_DATABASE_URL: postgresql+psycopg://rice_app:${APP_DATABASE_PASSWORD:-rice_app_demo_password}@db:5432/rice_demo
+      MIGRATION_DATABASE_URL: postgresql+psycopg://rice:${POSTGRES_PASSWORD:-rice_demo_password}@db:5432/rice_demo
+      LANGGRAPH_DATABASE_URL: postgresql+psycopg://rice:${POSTGRES_PASSWORD:-rice_demo_password}@db:5432/rice_demo
+      LANGGRAPH_CHECKPOINT_SCHEMA: agent_runtime
+      REDIS_URL: redis://redis:6379/0
+      LONGYUN_LLM_PROVIDER_NAME: ${LONGYUN_LLM_PROVIDER_NAME:-CherryIn}
+      LONGYUN_LLM_BASE_URL: ${LONGYUN_LLM_BASE_URL:-${SHENNONG_API_BASE_URL:-https://open.cherryin.net/v1}}
+      LONGYUN_LLM_MODEL: ${LONGYUN_LLM_MODEL:-${SHENNONG_MODEL:-agent/qwen3.5-flash}}
+      LONGYUN_LLM_API_KEY: ${LONGYUN_LLM_API_KEY:-${SHENNONG_API_KEY:-}}
+      LONGYUN_LLM_ALIAS: ${LONGYUN_LLM_ALIAS:-longyun-sandbox}
+      LONGYUN_LLM_DEPLOYMENT_MODE: ${LONGYUN_LLM_DEPLOYMENT_MODE:-external_api}
+      LONGYUN_DATA_ENVIRONMENT: ${LONGYUN_DATA_ENVIRONMENT:-sandbox_desensitized}
+      LONGYUN_ALLOW_EXTERNAL_PRIVATE_EVIDENCE: ${LONGYUN_ALLOW_EXTERNAL_PRIVATE_EVIDENCE:-false}
+      LONGYUN_ALLOW_EXTERNAL_WEB_SEARCH: ${LONGYUN_ALLOW_EXTERNAL_WEB_SEARCH:-false}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_started
+
   mineru:
     build: ./mineru
     environment:
@@ -115,7 +183,7 @@ services:
       - --https-key-store-password=${KEYCLOAK_HTTPS_KEYSTORE_PASSWORD:-LongyunLocalDev2026!}
       - --https-port=8443
     environment:
-      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USERNAME:-platform-admin}
       KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-ChangeThisAdminPassword!}
       KC_HEALTH_ENABLED: "true"
     volumes:
@@ -159,6 +227,7 @@ services:
 
 volumes:
   postgres_data:
+  redis_data:
   raw_data:
   research_data:
   model_data:

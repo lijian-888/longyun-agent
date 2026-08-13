@@ -1,0 +1,182 @@
+# Two-institution production overlay.
+# Usage:
+#   docker compose --env-file deploy/.env.multitenant \
+#     -f docker-compose.lan.yml -f docker-compose.multitenant.yml up -d --build
+
+x-tenant-environment: &tenant-environment
+  TENANCY_MODE: multi
+  CONTROL_DATABASE_URL: postgresql+psycopg://control:${CONTROL_POSTGRES_PASSWORD:?Set CONTROL_POSTGRES_PASSWORD}@control-db:5432/longyun_control
+  CONTROL_ENFORCE_USER_BINDING: "true"
+  TENANT_DB_POOL_SIZE: ${TENANT_DB_POOL_SIZE:-8}
+  TENANT_DB_MAX_OVERFLOW: ${TENANT_DB_MAX_OVERFLOW:-8}
+  TENANT_BOOTSTRAP_JSON: >-
+    [{"institution_id":"org-a","display_name":"机构 A","status":"trial","database_url_secret":"ORG_A_DATABASE_URL","migration_database_url_secret":"ORG_A_MIGRATION_DATABASE_URL","storage_backend":"minio","object_endpoint":"minio:9000","data_bucket":"longyun-org-a-data","backup_bucket":"longyun-org-a-backup","object_access_key_secret":"ORG_A_MINIO_ACCESS_KEY","object_secret_key_secret":"ORG_A_MINIO_SECRET_KEY","object_secure":false,"kms_key_id":"${ORG_A_MINIO_KMS_KEY_ID:-}","queue_prefix":"tenant.org-a","user_ids":["10000000-0000-4000-8000-000000000001","10000000-0000-4000-8000-000000000002","10000000-0000-4000-8000-000000000003","10000000-0000-4000-8000-000000000004"]},{"institution_id":"org-b","display_name":"机构 B","status":"trial","database_url_secret":"ORG_B_DATABASE_URL","migration_database_url_secret":"ORG_B_MIGRATION_DATABASE_URL","storage_backend":"minio","object_endpoint":"minio:9000","data_bucket":"longyun-org-b-data","backup_bucket":"longyun-org-b-backup","object_access_key_secret":"ORG_B_MINIO_ACCESS_KEY","object_secret_key_secret":"ORG_B_MINIO_SECRET_KEY","object_secure":false,"kms_key_id":"${ORG_B_MINIO_KMS_KEY_ID:-}","queue_prefix":"tenant.org-b","user_ids":["20000000-0000-4000-8000-000000000001","20000000-0000-4000-8000-000000000002","20000000-0000-4000-8000-000000000003","20000000-0000-4000-8000-000000000004"]}]
+  ORG_A_DATABASE_URL: postgresql+psycopg://rice_app:${ORG_A_APP_DATABASE_PASSWORD:?Set ORG_A_APP_DATABASE_PASSWORD}@org-a-db:5432/longyun_org_a
+  ORG_A_MIGRATION_DATABASE_URL: postgresql+psycopg://rice:${ORG_A_POSTGRES_PASSWORD:?Set ORG_A_POSTGRES_PASSWORD}@org-a-db:5432/longyun_org_a
+  ORG_B_DATABASE_URL: postgresql+psycopg://rice_app:${ORG_B_APP_DATABASE_PASSWORD:?Set ORG_B_APP_DATABASE_PASSWORD}@org-b-db:5432/longyun_org_b
+  ORG_B_MIGRATION_DATABASE_URL: postgresql+psycopg://rice:${ORG_B_POSTGRES_PASSWORD:?Set ORG_B_POSTGRES_PASSWORD}@org-b-db:5432/longyun_org_b
+  ORG_A_MINIO_ACCESS_KEY: ${ORG_A_MINIO_ACCESS_KEY:?Set ORG_A_MINIO_ACCESS_KEY}
+  ORG_A_MINIO_SECRET_KEY: ${ORG_A_MINIO_SECRET_KEY:?Set ORG_A_MINIO_SECRET_KEY}
+  ORG_B_MINIO_ACCESS_KEY: ${ORG_B_MINIO_ACCESS_KEY:?Set ORG_B_MINIO_ACCESS_KEY}
+  ORG_B_MINIO_SECRET_KEY: ${ORG_B_MINIO_SECRET_KEY:?Set ORG_B_MINIO_SECRET_KEY}
+
+services:
+  control-db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: longyun_control
+      POSTGRES_USER: control
+      POSTGRES_PASSWORD: ${CONTROL_POSTGRES_PASSWORD:?Set CONTROL_POSTGRES_PASSWORD}
+    command: ["postgres", "-c", "password_encryption=scram-sha-256"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U control -d longyun_control"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - control_postgres_data:/var/lib/postgresql/data
+    security_opt: ["no-new-privileges:true"]
+
+  org-a-db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: longyun_org_a
+      POSTGRES_USER: rice
+      POSTGRES_PASSWORD: ${ORG_A_POSTGRES_PASSWORD:?Set ORG_A_POSTGRES_PASSWORD}
+    command: ["postgres", "-c", "password_encryption=scram-sha-256"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rice -d longyun_org_a"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - org_a_postgres_data:/var/lib/postgresql/data
+    security_opt: ["no-new-privileges:true"]
+
+  org-b-db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: longyun_org_b
+      POSTGRES_USER: rice
+      POSTGRES_PASSWORD: ${ORG_B_POSTGRES_PASSWORD:?Set ORG_B_POSTGRES_PASSWORD}
+    command: ["postgres", "-c", "password_encryption=scram-sha-256"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rice -d longyun_org_b"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - org_b_postgres_data:/var/lib/postgresql/data
+    security_opt: ["no-new-privileges:true"]
+
+  minio:
+    # Pin the image so a routine restart cannot silently introduce a new
+    # object-storage release. Upgrade this tag only after backup/restore and
+    # cross-tenant acceptance tests have passed.
+    image: ${MINIO_IMAGE:-minio/minio:RELEASE.2025-09-07T16-13-09Z-cpuv1}
+    command: ["server", "/data", "--console-address", ":9001"]
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD}
+      MINIO_BROWSER: "on"
+    expose:
+      - "9000"
+      - "9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    volumes:
+      - minio_data:/data
+    security_opt: ["no-new-privileges:true"]
+    stop_grace_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  minio-init:
+    image: ${MINIO_MC_IMAGE:-minio/mc:RELEASE.2025-08-13T08-35-41Z-cpuv1}
+    restart: "no"
+    entrypoint: ["/bin/sh", "/init/init-tenants.sh"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD}
+      ORG_A_MINIO_ACCESS_KEY: ${ORG_A_MINIO_ACCESS_KEY:?Set ORG_A_MINIO_ACCESS_KEY}
+      ORG_A_MINIO_SECRET_KEY: ${ORG_A_MINIO_SECRET_KEY:?Set ORG_A_MINIO_SECRET_KEY}
+      ORG_A_MINIO_BACKUP_ACCESS_KEY: ${ORG_A_MINIO_BACKUP_ACCESS_KEY:?Set ORG_A_MINIO_BACKUP_ACCESS_KEY}
+      ORG_A_MINIO_BACKUP_SECRET_KEY: ${ORG_A_MINIO_BACKUP_SECRET_KEY:?Set ORG_A_MINIO_BACKUP_SECRET_KEY}
+      ORG_B_MINIO_ACCESS_KEY: ${ORG_B_MINIO_ACCESS_KEY:?Set ORG_B_MINIO_ACCESS_KEY}
+      ORG_B_MINIO_SECRET_KEY: ${ORG_B_MINIO_SECRET_KEY:?Set ORG_B_MINIO_SECRET_KEY}
+      ORG_B_MINIO_BACKUP_ACCESS_KEY: ${ORG_B_MINIO_BACKUP_ACCESS_KEY:?Set ORG_B_MINIO_BACKUP_ACCESS_KEY}
+      ORG_B_MINIO_BACKUP_SECRET_KEY: ${ORG_B_MINIO_BACKUP_SECRET_KEY:?Set ORG_B_MINIO_BACKUP_SECRET_KEY}
+      ORG_A_MINIO_DATA_QUOTA: ${ORG_A_MINIO_DATA_QUOTA:-200GiB}
+      ORG_A_MINIO_BACKUP_QUOTA: ${ORG_A_MINIO_BACKUP_QUOTA:-200GiB}
+      ORG_B_MINIO_DATA_QUOTA: ${ORG_B_MINIO_DATA_QUOTA:-200GiB}
+      ORG_B_MINIO_BACKUP_QUOTA: ${ORG_B_MINIO_BACKUP_QUOTA:-200GiB}
+    depends_on:
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./deploy/minio:/init:ro
+      - ./deploy/minio:/policies:ro
+    security_opt: ["no-new-privileges:true"]
+
+  api:
+    environment:
+      <<: *tenant-environment
+      # These safe, non-demo values satisfy the legacy startup guard. Tenant
+      # requests never route from these defaults while TENANCY_MODE=multi.
+      DATABASE_URL: postgresql+psycopg://rice_app:${ORG_A_APP_DATABASE_PASSWORD:?Set ORG_A_APP_DATABASE_PASSWORD}@org-a-db:5432/longyun_org_a
+      MIGRATION_DATABASE_URL: postgresql+psycopg://rice:${ORG_A_POSTGRES_PASSWORD:?Set ORG_A_POSTGRES_PASSWORD}@org-a-db:5432/longyun_org_a
+    depends_on:
+      control-db: {condition: service_healthy}
+      org-a-db: {condition: service_healthy}
+      org-b-db: {condition: service_healthy}
+      minio-init: {condition: service_completed_successfully}
+
+  genotype-worker:
+    environment:
+      <<: *tenant-environment
+    depends_on:
+      control-db: {condition: service_healthy}
+      org-a-db: {condition: service_healthy}
+      org-b-db: {condition: service_healthy}
+      minio-init: {condition: service_completed_successfully}
+      api: {condition: service_healthy}
+
+  agent-workflow-worker:
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        exec celery -A app.ai.workflow_worker:celery_app worker
+        -Q tenant.org-a.agent,tenant.org-b.agent
+        --loglevel=INFO --concurrency=${AGENT_WORKER_CONCURRENCY:-2}
+    environment:
+      <<: *tenant-environment
+    depends_on:
+      control-db: {condition: service_healthy}
+      org-a-db: {condition: service_healthy}
+      org-b-db: {condition: service_healthy}
+      minio-init: {condition: service_completed_successfully}
+      api: {condition: service_healthy}
+
+  keycloak:
+    volumes:
+      - ./deploy/keycloak/rice-research-multitenant-realm.json:/opt/keycloak/data/import/rice-research-realm.json:ro
+      - ./keycloak/themes:/opt/keycloak/themes:ro
+
+volumes:
+  control_postgres_data:
+  org_a_postgres_data:
+  org_b_postgres_data:
+  minio_data:
+    name: ${MINIO_DATA_VOLUME_NAME:-longyun-agent-minio-data}

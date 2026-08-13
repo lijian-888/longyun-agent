@@ -85,7 +85,7 @@ function folderLabel(folder, scope) {
   return scope === "public" ? "未分类" : "未分类";
 }
 
-export default function KnowledgeLibrary({ adminMode = false, onNotice = () => {} }) {
+export default function KnowledgeLibrary({ adminMode = false, onNotice = () => {}, projectId = "" }) {
   const [scope, setScope] = useState(adminMode ? "public" : "private");
   const [folders, setFolders] = useState([]);
   const [documents, setDocuments] = useState([]);
@@ -163,10 +163,11 @@ export default function KnowledgeLibrary({ adminMode = false, onNotice = () => {
     if (!silent) setLoading(true);
     try {
       const includeUnpublished = nextScope === "public" && adminMode;
+      const projectQuery = projectId ? `&project_id=${encodeURIComponent(projectId)}` : "";
       const [folderList, documentList, nextSummary] = await Promise.all([
         request(`/api/knowledge/folders?scope=${nextScope}`),
-        request(`/api/knowledge/documents?scope=${nextScope}&q=${encodeURIComponent(query)}${includeUnpublished ? "&include_unpublished=true" : ""}`),
-        request("/api/knowledge/summary"),
+        request(`/api/knowledge/documents?scope=${nextScope}&q=${encodeURIComponent(query)}${includeUnpublished ? "&include_unpublished=true" : ""}${projectQuery}`),
+        request(`/api/knowledge/summary${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ""}`),
       ]);
       setFolders(folderList);
       setDocuments(documentList);
@@ -179,7 +180,15 @@ export default function KnowledgeLibrary({ adminMode = false, onNotice = () => {
     }
   }
 
-  useEffect(() => { load(scope); }, [scope]);
+  useEffect(() => {
+    if (scope === "private" && !projectId) {
+      setDocuments([]);
+      setSummary(null);
+      setLoading(false);
+      return;
+    }
+    load(scope);
+  }, [scope, projectId]);
 
   useEffect(() => {
     if (!hasActiveProcessing) return undefined;
@@ -326,6 +335,7 @@ export default function KnowledgeLibrary({ adminMode = false, onNotice = () => {
     try {
       const params = new URLSearchParams({
         scope,
+        ...(!isPublic && projectId ? { project_id: projectId } : {}),
         ...(uploadFolderId ? { folder_id: uploadFolderId } : {}),
         ...(metadata.sourceOrganization.trim() ? { source_organization: metadata.sourceOrganization.trim() } : {}),
         ...(metadata.author.trim() ? { author: metadata.author.trim() } : {}),
@@ -458,7 +468,7 @@ export default function KnowledgeLibrary({ adminMode = false, onNotice = () => {
             <button type="button" className={scope === "private" ? "active" : ""} onClick={() => switchScope("private")}>我的知识库</button>
             <button type="button" className={scope === "public" ? "active" : ""} onClick={() => switchScope("public")}>公共知识库</button>
           </nav>}
-          {adminMode && <div className="knowledge-admin-note">字段管理员维护公共资料：核验解析和资料元数据后，再发布给科研人员检索。</div>}
+          {adminMode && <div className="knowledge-admin-note">数据处理员维护本机构资料：核验解析结果、来源和元数据后，再发布给本机构科研人员检索。</div>}
         </div>
         <div className="knowledge-folder-search"><Search size={15} /><input value={folderQuery} onChange={(event) => setFolderQuery(event.target.value)} placeholder="搜索文件夹" /><button className="icon-button" type="button" title="新建分类" onClick={() => document.getElementById("knowledge-folder-name")?.focus()}><FolderPlus size={15} /></button></div>
         <div className="knowledge-folder-tree-title">{isPublic ? "资料分类" : "我的文件夹"}</div>
@@ -545,6 +555,6 @@ export default function KnowledgeLibrary({ adminMode = false, onNotice = () => {
 
     {editingFolder && <div className="knowledge-modal-backdrop" onMouseDown={() => setEditingFolder(null)}><form className="knowledge-modal" onSubmit={saveFolder} onMouseDown={(event) => event.stopPropagation()}><header><div><p>不改变资料原文，只维护目录结构。</p><h3>编辑资料分类</h3></div><button className="icon-button" type="button" onClick={() => setEditingFolder(null)}><X size={17} /></button></header><label>分类名称<input value={editingFolder.folder_name} required onChange={(event) => setEditingFolder({ ...editingFolder, folder_name: event.target.value })} /></label><label>上级分类<select value={editingFolder.parent_id || ""} onChange={(event) => setEditingFolder({ ...editingFolder, parent_id: event.target.value || null })}><option value="">顶级分类</option>{folders.filter((folder) => folder.id !== editingFolder.id).map((folder) => <option key={folder.id} value={folder.id}>{folder.folder_name}</option>)}</select></label><label>说明<textarea value={editingFolder.description || ""} onChange={(event) => setEditingFolder({ ...editingFolder, description: event.target.value })} /></label><footer><button type="button" className="secondary-button" onClick={() => setEditingFolder(null)}>取消</button><button type="submit" className="primary-button">保存分类</button></footer></form></div>}
 
-    {preview && <div className="knowledge-modal-backdrop" onMouseDown={() => setPreview(null)}><section className="knowledge-preview-modal" onMouseDown={(event) => event.stopPropagation()}><header><div><p>字段管理员本地解析核验</p><h3>{preview.display_title}</h3></div><button className="icon-button" type="button" onClick={() => setPreview(null)}><X size={17} /></button></header>{preview.parser_warnings?.map((warning) => <div className="knowledge-warning" key={warning}>{warning}</div>)}<pre>{preview.preview || "未解析到足够的可用文字。"}</pre>{preview.preview_truncated && <small>预览仅显示前 60,000 个字符。</small>}</section></div>}
+    {preview && <div className="knowledge-modal-backdrop" onMouseDown={() => setPreview(null)}><section className="knowledge-preview-modal" onMouseDown={(event) => event.stopPropagation()}><header><div><p>数据处理员本地解析核验</p><h3>{preview.display_title}</h3></div><button className="icon-button" type="button" onClick={() => setPreview(null)}><X size={17} /></button></header>{preview.parser_warnings?.map((warning) => <div className="knowledge-warning" key={warning}>{warning}</div>)}<pre>{preview.preview || "未解析到足够的可用文字。"}</pre>{preview.preview_truncated && <small>预览仅显示前 60,000 个字符。</small>}</section></div>}
   </section>;
 }

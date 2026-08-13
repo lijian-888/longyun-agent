@@ -13,7 +13,7 @@ function AppRouter() {
     username: keycloak.tokenParsed?.preferred_username || "",
     display_name: [keycloak.tokenParsed?.family_name, keycloak.tokenParsed?.given_name].filter(Boolean).join(" ") || keycloak.tokenParsed?.preferred_username || "",
   };
-  let page = <main className="auth-error">当前账号未配置平台角色，请联系系统管理员。</main>;
+  let page = <main className="auth-error">当前账号未配置平台角色，请联系字段管理员。</main>;
   if (roles.includes("field_admin")) page = <DataGovernanceApp user={user} accessRole="field_admin" />;
   else if (roles.includes("data_processor")) page = <DataGovernanceApp user={user} accessRole="data_processor" />;
   else if (roles.includes("researcher")) page = <ResearchAssistant />;

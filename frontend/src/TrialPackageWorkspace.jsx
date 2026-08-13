@@ -26,7 +26,7 @@ function StatusBadge({ status }) {
   return <span className={`trial-package-status ${status}`}>{statusLabels[status] || status}</span>;
 }
 
-export default function TrialPackageWorkspace({ onNotice }) {
+export default function TrialPackageWorkspace({ onNotice, projects = [], selectedProjectId, setSelectedProjectId }) {
   const inputRef = useRef(null);
   const [batches, setBatches] = useState([]);
   const [selected, setSelected] = useState(null);
@@ -37,12 +37,18 @@ export default function TrialPackageWorkspace({ onNotice }) {
   async function load(preferredId) {
     setLoading(true);
     try {
-      const rows = await request("/api/trial-packages");
+      if (!selectedProjectId) {
+        setBatches([]);
+        setSelected(null);
+        return;
+      }
+      const query = `project_id=${encodeURIComponent(selectedProjectId)}`;
+      const rows = await request(`/api/trial-packages?${query}`);
       setBatches(rows);
       const currentId = preferredId || selected?.id;
       const next = rows.find((item) => item.id === currentId) || rows[0] || null;
       if (next) {
-        const detail = await request(`/api/trial-packages/${next.id}`);
+        const detail = await request(`/api/trial-packages/${next.id}?${query}`);
         setSelected(detail);
       } else {
         setSelected(null);
@@ -56,7 +62,7 @@ export default function TrialPackageWorkspace({ onNotice }) {
 
   useEffect(() => {
     void load();
-  }, []);
+  }, [selectedProjectId]);
 
   useEffect(() => {
     if (selected?.parse_status !== "parsing") return undefined;
@@ -66,7 +72,7 @@ export default function TrialPackageWorkspace({ onNotice }) {
 
   async function selectBatch(batch) {
     try {
-      setSelected(await request(`/api/trial-packages/${batch.id}`));
+      setSelected(await request(`/api/trial-packages/${batch.id}?project_id=${encodeURIComponent(selectedProjectId)}`));
     } catch (error) {
       onNotice(error.message);
     }
@@ -80,7 +86,7 @@ export default function TrialPackageWorkspace({ onNotice }) {
     try {
       const form = new FormData();
       form.append("file", file);
-      const result = await request("/api/trial-packages/upload", { method: "POST", body: form });
+      const result = await request(`/api/trial-packages/upload?project_id=${encodeURIComponent(selectedProjectId)}`, { method: "POST", body: form });
       setSelected(result);
       await load(result.id);
       onNotice(result.parse_status === "ready_for_review"
@@ -98,7 +104,7 @@ export default function TrialPackageWorkspace({ onNotice }) {
     if (!selected || selected.parse_status !== "ready_for_review") return;
     setPublishing(true);
     try {
-      const result = await request(`/api/trial-packages/${selected.id}/publish`, { method: "POST" });
+      const result = await request(`/api/trial-packages/${selected.id}/publish?project_id=${encodeURIComponent(selectedProjectId)}`, { method: "POST" });
       setSelected(result);
       await load(result.id);
       const counts = result.published_counts || {};
@@ -127,8 +133,12 @@ export default function TrialPackageWorkspace({ onNotice }) {
         <span>上传三年多点的原始 Excel 文件包，平台保留原件、解析关联、统一单位，并在确认后写入试验级标准数据。</span>
       </div>
       <div className="trial-package-header-actions">
+        <select value={selectedProjectId || ""} onChange={(event) => setSelectedProjectId?.(event.target.value)} disabled={!projects.length} aria-label="当前课题">
+          {!projects.length && <option value="">暂无可用课题</option>}
+          {projects.map((project) => <option key={project.id} value={project.id}>{project.project_name}</option>)}
+        </select>
         <button className="icon-button" type="button" title="刷新资料包状态" onClick={() => load(selected?.id)} disabled={loading}><RefreshCw size={17} className={loading ? "spin" : ""} /></button>
-        <button className="primary-button" type="button" onClick={() => inputRef.current?.click()} disabled={uploading}>
+        <button className="primary-button" type="button" onClick={() => inputRef.current?.click()} disabled={uploading || !selectedProjectId}>
           {uploading ? <LoaderCircle size={16} className="spin" /> : <Upload size={16} />}
           上传 ZIP 资料包
         </button>

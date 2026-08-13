@@ -23,7 +23,21 @@
       "directAccessGrantsEnabled": false,
       "redirectUris": ["${PUBLIC_PLATFORM_URL}/*"],
       "webOrigins": ["${PUBLIC_PLATFORM_URL}"],
-      "attributes": { "pkce.code.challenge.method": "S256" }
+      "attributes": { "pkce.code.challenge.method": "S256" },
+      "protocolMappers": [{
+        "name": "institution-id",
+        "protocol": "openid-connect",
+        "protocolMapper": "oidc-usermodel-attribute-mapper",
+        "consentRequired": false,
+        "config": {
+          "user.attribute": "institution_id",
+          "claim.name": "institution_id",
+          "jsonType.label": "String",
+          "id.token.claim": "true",
+          "access.token.claim": "true",
+          "userinfo.token.claim": "true"
+        }
+      }]
     }
   ],
   "users": [
@@ -34,6 +48,7 @@
       "lastName": "Researcher",
       "email": "wang.researcher@example.local",
       "emailVerified": true,
+      "attributes": {"institution_id": ["longyun-demo"]},
       "realmRoles": ["researcher"],
       "credentials": [{ "type": "password", "value": "${INITIAL_RESEARCHER_PASSWORD}", "temporary": true }]
     },
@@ -44,6 +59,7 @@
       "lastName": "Researcher",
       "email": "li.researcher@example.local",
       "emailVerified": true,
+      "attributes": {"institution_id": ["longyun-demo"]},
       "realmRoles": ["researcher"],
       "credentials": [{ "type": "password", "value": "${INITIAL_RESEARCHER_PASSWORD}", "temporary": true }]
     },
@@ -54,6 +70,7 @@
       "lastName": "Processor",
       "email": "zhang.processor@example.local",
       "emailVerified": true,
+      "attributes": {"institution_id": ["longyun-demo"]},
       "realmRoles": ["data_processor"],
       "credentials": [{ "type": "password", "value": "${INITIAL_PROCESSOR_PASSWORD}", "temporary": true }]
     },
@@ -64,6 +81,7 @@
       "lastName": "FieldAdmin",
       "email": "chen.fieldadmin@example.local",
       "emailVerified": true,
+      "attributes": {"institution_id": ["longyun-demo"]},
       "realmRoles": ["field_admin"],
       "credentials": [{ "type": "password", "value": "${INITIAL_FIELD_ADMIN_PASSWORD}", "temporary": true }]
     }

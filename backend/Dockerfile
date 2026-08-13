@@ -18,6 +18,18 @@ COPY requirements.txt .
 # CPU-only deployment does not accidentally download several GB of CUDA libs.
 RUN pip install --no-cache-dir --retries 8 --timeout 300 \
     --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
+# Install the comparatively small orchestration stack in its own cacheable
+# layer. Updating it must not force a reinstall of Docling/PaddleOCR/PyTorch.
+COPY agent-requirements.txt .
+RUN pip install --no-cache-dir --retries 8 --timeout 300 -r agent-requirements.txt
+# Keep small runtime-compatibility overrides in their own layer. This avoids
+# reinstalling the large OCR/document stack when an indirect dependency needs
+# a major-version ceiling or compatibility release.
+COPY runtime-compatibility.txt .
+RUN pip install --no-cache-dir --retries 8 --timeout 300 -r runtime-compatibility.txt
+# AgentScope's declared MCP range currently permits incompatible major
+# releases. Fail the image build here instead of failing the first chat request.
+RUN python -c "from agentscope.agent import ReActAgent; from agentscope.formatter import OpenAIChatFormatter; from agentscope.model import OpenAIChatModel; from agentscope.token import CharTokenCounter"
 # Keep the local GWAS numerical stack in a separate layer so changing it does
 # not invalidate the much larger OCR/document-analysis dependency cache.
 RUN pip install --no-cache-dir numpy==2.1.3 matplotlib==3.9.2
@@ -28,6 +40,7 @@ RUN pip install --no-cache-dir pgvector==0.3.6
 # otherwise minimal Python image. Keep this before source copy so normal
 # application-code changes do not re-download operating-system dependencies.
 RUN apt-get -o Acquire::Retries=3 update && apt-get -o Acquire::Retries=3 install -y --no-install-recommends libgl1 libglib2.0-0 libgomp1 && rm -rf /var/lib/apt/lists/*
+COPY alembic.ini ./alembic.ini
 COPY app ./app
 
 EXPOSE 8000

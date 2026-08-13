@@ -40,6 +40,22 @@ for key in PUBLIC_PLATFORM_URL PUBLIC_PLATFORM_HOST HTTPS_PORT TLS_CERT_FILE TLS
   require_value "$key"
 done
 
+deployment_mode="$(value_from_env LONGYUN_LLM_DEPLOYMENT_MODE)"
+data_environment="$(value_from_env LONGYUN_DATA_ENVIRONMENT)"
+[[ "$deployment_mode" =~ ^(external_api|local|on_prem|private)$ ]] \
+  || fail "LONGYUN_LLM_DEPLOYMENT_MODE must be external_api, local, on_prem, or private"
+[[ "$data_environment" =~ ^(sandbox_desensitized|institution_private)$ ]] \
+  || fail "LONGYUN_DATA_ENVIRONMENT must be sandbox_desensitized or institution_private"
+for key in LONGYUN_LLM_BASE_URL LONGYUN_LLM_MODEL LONGYUN_LLM_ALIAS; do
+  require_value "$key"
+done
+if [[ "$deployment_mode" == "external_api" ]]; then
+  require_value LONGYUN_LLM_PROVIDER_NAME
+  require_value LONGYUN_LLM_API_KEY
+  [[ "$(value_from_env LONGYUN_LLM_BASE_URL)" == https://* ]] \
+    || fail "External LONGYUN_LLM_BASE_URL must start with https://"
+fi
+
 platform_url="$(value_from_env PUBLIC_PLATFORM_URL)"
 platform_host="$(value_from_env PUBLIC_PLATFORM_HOST)"
 https_port="$(value_from_env HTTPS_PORT)"

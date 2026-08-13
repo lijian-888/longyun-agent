@@ -14,6 +14,7 @@ import {
   Search,
   Send,
   ShieldCheck,
+  Sprout,
   Upload,
 } from "lucide-react";
 import { authorizedFetch, request } from "./api";
@@ -75,6 +76,11 @@ async function downloadProtected(path, fallbackName, onNotice) {
   }
 }
 
+function withProject(path, projectId) {
+  const separator = path.includes("?") ? "&" : "?";
+  return `${path}${separator}project_id=${encodeURIComponent(projectId || "")}`;
+}
+
 function QcTemplateCard() {
   return <section className="genotype-template-card">
     <div><p>当前已发布模板</p><h3>水稻常规育种材料 QC v1.0</h3><span>管理员维护的只读版本；本次运行将完整写入参数、原始文件哈希和处理记录。</span></div>
@@ -88,20 +94,22 @@ function QcTemplateCard() {
   </section>;
 }
 
-function MappingRow({ mapping, assetId, versionId, editable, onSaved, onNotice }) {
+function MappingRow({ mapping, assetId, versionId, projectId, editable, onSaved, onNotice }) {
   const [editing, setEditing] = useState(false);
   // A mapping is a manual identity decision. Never seed the picker with the
   // previous material code, otherwise clearing a mapping makes it look as if
   // the researcher can only select that same material again.
   const [keyword, setKeyword] = useState("");
   const [suggestions, setSuggestions] = useState([]);
+  const [plantPickerOpen, setPlantPickerOpen] = useState(false);
+  const [plants, setPlants] = useState([]);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     if (!editing) return undefined;
     const timer = setTimeout(async () => {
       try {
-        const rows = await request(`/api/genotype-assets/materials?keyword=${encodeURIComponent(keyword)}`);
+        const rows = await request(withProject(`/api/genotype-assets/materials?keyword=${encodeURIComponent(keyword)}`, projectId));
         setSuggestions(rows);
       } catch (error) {
         onNotice(error.message);
@@ -121,7 +129,7 @@ function MappingRow({ mapping, assetId, versionId, editable, onSaved, onNotice }
     if (!editable) return;
     setBusy(true);
     try {
-      const result = await request(`/api/genotype-assets/${assetId}/versions/${versionId}/mappings/${encodeURIComponent(mapping.fid)}/${encodeURIComponent(mapping.iid)}`, {
+      const result = await request(withProject(`/api/genotype-assets/${assetId}/versions/${versionId}/mappings/${encodeURIComponent(mapping.fid)}/${encodeURIComponent(mapping.iid)}`, projectId), {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ material_id: material?.id || null, note: "科研人员确认映射" }),
@@ -142,6 +150,41 @@ function MappingRow({ mapping, assetId, versionId, editable, onSaved, onNotice }
     }
   }
 
+  async function openPlantPicker() {
+    if (!mapping.material_id) {
+      onNotice("请先把 FID/IID 映射到平台材料，再关联具体单株。");
+      return;
+    }
+    setBusy(true);
+    try {
+      setPlants(await request(withProject(`/api/materials/${mapping.material_id}/single-plants`, projectId)));
+      setPlantPickerOpen(true);
+    } catch (error) {
+      onNotice(error.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function savePlant(plant) {
+    setBusy(true);
+    try {
+      await request(withProject(`/api/genotype-assets/${assetId}/versions/${versionId}/mappings/${encodeURIComponent(mapping.fid)}/${encodeURIComponent(mapping.iid)}/single-plant`, projectId), {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sample_id: plant?.id || null, note: plant ? `关联单株 ${plant.sample_code}` : "取消单株关联" }),
+      });
+      const refreshed = await request(withProject(`/api/genotype-assets/${assetId}?version_id=${encodeURIComponent(versionId)}`, projectId));
+      setPlantPickerOpen(false);
+      onSaved(refreshed);
+      onNotice(plant ? `已把 ${mapping.fid}/${mapping.iid} 关联到单株 ${plant.sample_code}。` : "已取消该 FID/IID 的单株关联，材料映射保持不变。");
+    } catch (error) {
+      onNotice(error.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return <tr>
     <td><strong>{mapping.fid}</strong><small>{mapping.iid}</small></td>
     <td>{mapping.sample_name || "-"}</td>
@@ -152,17 +195,17 @@ function MappingRow({ mapping, assetId, versionId, editable, onSaved, onNotice }
           {suggestions.map((item) => <button type="button" key={item.id} onClick={() => save(item)} disabled={busy}><strong>{item.material_code}</strong><span>{item.material_name}{item.aliases ? ` · ${item.aliases}` : ""}</span></button>)}
           {!suggestions.length && <span>未找到已建档材料。请提交数据治理申请，不会在此处直接新建材料主档。</span>}
         </div>
-      </div> : mapping.material_code ? <span className="mapping-material"><CheckCircle2 size={14} />{mapping.material_code} · {mapping.material_name}</span> : <span className="mapping-unresolved">尚未确认</span>}
+      </div> : mapping.material_code ? <div className="mapping-identity"><span className="mapping-material"><CheckCircle2 size={14} />{mapping.material_code} · {mapping.material_name}</span>{mapping.sample_code && <span className="mapping-plant"><Sprout size={13} />单株：{mapping.sample_code}</span>}{plantPickerOpen && <div className="mapping-plant-picker">{plants.length ? plants.map((plant) => <button type="button" key={plant.id} onClick={() => savePlant(plant)} disabled={busy}><strong>{plant.sample_code}</strong><span>{plant.generation_label || "世代未填"} · {plant.plot_no || "未关联小区"}</span></button>) : <span>该材料还没有单株记录，请先由数据处理人员导入单株主表。</span>}</div>}</div> : <span className="mapping-unresolved">尚未确认</span>}
     </td>
     <td>{mapping.suggestion_reason || (mapping.material_code ? "人工确认" : "需要映射")}</td>
     <td>{editable
-      ? <button type="button" className="inline-action" onClick={() => editing ? save(null) : startEditing()} disabled={busy}>{busy ? <LoaderCircle size={14} className="spin" /> : editing ? "清除映射" : mapping.material_code ? "更正" : "选择材料"}</button>
+      ? <div className="mapping-row-actions"><button type="button" className="inline-action" onClick={() => editing ? save(null) : startEditing()} disabled={busy}>{busy ? <LoaderCircle size={14} className="spin" /> : editing ? "清除映射" : mapping.material_code ? "更正" : "选择材料"}</button>{mapping.material_id && <button type="button" className="inline-action plant" onClick={() => mapping.sample_id ? savePlant(null) : plantPickerOpen ? setPlantPickerOpen(false) : openPlantPicker()} disabled={busy}>{mapping.sample_id ? "取消单株关联" : plantPickerOpen ? "收起单株" : "关联单株"}</button>}</div>
       : <span className="mapping-locked">已发布锁定</span>}
     </td>
   </tr>;
 }
 
-export default function GenotypeAssetsWorkspace({ onNotice }) {
+export default function GenotypeAssetsWorkspace({ onNotice, operatorMode = false, projects = [], selectedProjectId, setSelectedProjectId }) {
   const [assets, setAssets] = useState([]);
   const [activeKey, setActiveKey] = useState("");
   const [loading, setLoading] = useState(true);
@@ -185,7 +228,11 @@ export default function GenotypeAssetsWorkspace({ onNotice }) {
   async function load(preferred = "", silent = false) {
     if (!silent) setLoading(true);
     try {
-      const rows = await request("/api/genotype-assets");
+      if (!selectedProjectId) {
+        setAssets([]);
+        return;
+      }
+      const rows = await request(withProject("/api/genotype-assets", selectedProjectId));
       setAssets(rows);
       setActiveKey((current) => preferred || current || (rows[0] ? `${rows[0].asset_id}:${rows[0].id}` : ""));
     } catch (error) {
@@ -195,7 +242,7 @@ export default function GenotypeAssetsWorkspace({ onNotice }) {
     }
   }
 
-  useEffect(() => { void load(); }, []);
+  useEffect(() => { void load(); }, [selectedProjectId]);
   useEffect(() => {
     if (!assets.some((item) => ["queued", "processing", "uploading"].includes(item.status))) return undefined;
     const timer = setInterval(() => void load("", true), 3500);
@@ -228,7 +275,7 @@ export default function GenotypeAssetsWorkspace({ onNotice }) {
       const asset = pendingAsset || await request("/api/genotype-assets", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...createForm, source_format: createForm.source_type, source_type: undefined }),
+        body: JSON.stringify({ ...createForm, project_id: selectedProjectId, source_format: createForm.source_type, source_type: undefined }),
       });
       const completed = await uploadFile(asset.asset_id, file);
       setCreating(false);
@@ -253,14 +300,14 @@ export default function GenotypeAssetsWorkspace({ onNotice }) {
       try {
         const candidate = JSON.parse(stored);
         if (candidate.fileName === file.name && candidate.fileSize === file.size && candidate.totalChunks === totalChunks) {
-          upload = await request(`/api/genotype-assets/${assetId}/uploads/${candidate.uploadId}`);
+          upload = await request(withProject(`/api/genotype-assets/${assetId}/uploads/${candidate.uploadId}`, selectedProjectId));
         }
       } catch {
         sessionStorage.removeItem(sessionKey);
       }
     }
     if (!upload) {
-      upload = await request(`/api/genotype-assets/${assetId}/uploads`, {
+      upload = await request(withProject(`/api/genotype-assets/${assetId}/uploads`, selectedProjectId), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ file_name: file.name, total_bytes: file.size, total_chunks: totalChunks }),
@@ -277,14 +324,14 @@ export default function GenotypeAssetsWorkspace({ onNotice }) {
       if (received.has(index)) continue;
       const data = new FormData();
       data.append("file", file.slice(index * CHUNK_BYTES, Math.min(file.size, (index + 1) * CHUNK_BYTES)), file.name);
-      const response = await authorizedFetch(`/api/genotype-assets/${assetId}/uploads/${uploadId}/chunks/${index}`, { method: "PUT", body: data });
+      const response = await authorizedFetch(withProject(`/api/genotype-assets/${assetId}/uploads/${uploadId}/chunks/${index}`, selectedProjectId), { method: "PUT", body: data });
       if (!response.ok) {
         const body = await response.json().catch(() => ({}));
         throw new Error(body.detail || `第 ${index + 1} 个上传分片失败。`);
       }
       setUploadState({ name: file.name, current: index + 1, total: totalChunks });
     }
-    const completed = await request(`/api/genotype-assets/${assetId}/uploads/${uploadId}/complete`, { method: "POST" });
+    const completed = await request(withProject(`/api/genotype-assets/${assetId}/uploads/${uploadId}/complete`, selectedProjectId), { method: "POST" });
     sessionStorage.removeItem(sessionKey);
     return completed;
   }
@@ -306,7 +353,7 @@ export default function GenotypeAssetsWorkspace({ onNotice }) {
     try {
       const form = new FormData();
       form.append("file", file);
-      const result = await request(`/api/genotype-assets/${active.asset_id}/versions/${active.id}/mappings/import`, { method: "POST", body: form });
+      const result = await request(withProject(`/api/genotype-assets/${active.asset_id}/versions/${active.id}/mappings/import`, selectedProjectId), { method: "POST", body: form });
       updateActive(result.version);
       onNotice(`已处理样本映射表：成功更新 ${result.applied} 条，未识别条目仍保留在待处理区。`);
     } catch (error) {
@@ -320,7 +367,7 @@ export default function GenotypeAssetsWorkspace({ onNotice }) {
     if (!active) return;
     setBusy("publish");
     try {
-      const result = await request(`/api/genotype-assets/${active.asset_id}/versions/${active.id}/publish`, { method: "POST" });
+      const result = await request(withProject(`/api/genotype-assets/${active.asset_id}/versions/${active.id}/publish`, selectedProjectId), { method: "POST" });
       updateActive(result);
       onNotice("质控版本已发布为分析就绪版本，可直接在连续性状 GWAS 中选择。原始文件仍不会对浏览器开放下载。");
     } catch (error) {
@@ -334,7 +381,7 @@ export default function GenotypeAssetsWorkspace({ onNotice }) {
     if (!active) return;
     setBusy("revision");
     try {
-      const result = await request(`/api/genotype-assets/${active.asset_id}/versions/${active.id}/mapping-revision`, { method: "POST" });
+      const result = await request(withProject(`/api/genotype-assets/${active.asset_id}/versions/${active.id}/mapping-revision`, selectedProjectId), { method: "POST" });
       updateActive(result);
       onNotice("已生成新的材料映射修订版。原发布版本保持不变，新的修订版需再次人工发布。");
     } catch (error) {
@@ -349,7 +396,7 @@ export default function GenotypeAssetsWorkspace({ onNotice }) {
     if (!active || !governanceForm.description.trim()) return;
     setBusy("governance");
     try {
-      await request(`/api/genotype-assets/${active.asset_id}/versions/${active.id}/governance-requests`, {
+      await request(withProject(`/api/genotype-assets/${active.asset_id}/versions/${active.id}/governance-requests`, selectedProjectId), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(governanceForm),
@@ -366,16 +413,16 @@ export default function GenotypeAssetsWorkspace({ onNotice }) {
 
   return <div className="genotype-workspace">
     <section className="genotype-hero">
-      <div><p>私有基因型数据治理</p><h2>基因型导入与水稻专用质控</h2><span>把 VCF 或 PLINK 三件套处理为可追溯、可人工确认的分析版本，再交给 GWAS 使用。</span></div>
-      <div className="genotype-privacy"><ShieldCheck size={18} /><span>原始基因型只在内网私有存储与后端计算中使用，不提供浏览器下载。</span></div>
+      <div><p>{operatorMode ? "机构级基因型数据治理" : "私有基因型数据治理"}</p><h2>基因型导入与水稻专用质控</h2><span>把 VCF 或 PLINK 三件套处理为可追溯、可人工确认的分析版本，再交给 GWAS 使用。</span></div>
+      <div><select value={selectedProjectId || ""} onChange={(event) => setSelectedProjectId?.(event.target.value)} disabled={!projects.length} aria-label="当前课题">{!projects.length && <option value="">暂无可用课题</option>}{projects.map((project) => <option key={project.id} value={project.id}>{project.project_name}</option>)}</select><div className="genotype-privacy"><ShieldCheck size={18} /><span>{operatorMode ? "数据处理员在当前课题内统一导入和确认映射；原始文件不向其他机构或课题开放。" : "原始基因型只在当前课题的私有存储与后端计算中使用，不提供浏览器下载。"}</span></div></div>
     </section>
 
     <section className="genotype-steps"><span className="done"><b>1</b>导入文件</span><span><b>2</b>统一格式与质控</span><span><b>3</b>确认样本材料映射</span><span><b>4</b>发布给 GWAS</span></section>
 
     <section className="genotype-layout">
       <aside className="genotype-assets-list">
-        <div className="genotype-list-head"><div><p>我的私有资产</p><h3>基因型版本</h3></div><button type="button" title="刷新列表" onClick={() => void load()}><RefreshCw size={16} /></button></div>
-        <button type="button" className="primary-button genotype-create-trigger" onClick={() => setCreating((value) => !value)}><Upload size={15} />导入基因型</button>
+        <div className="genotype-list-head"><div><p>{operatorMode ? "本机构数据资产" : "我的私有资产"}</p><h3>基因型版本</h3></div><button type="button" title="刷新列表" onClick={() => void load()}><RefreshCw size={16} /></button></div>
+        <button type="button" className="primary-button genotype-create-trigger" disabled={!selectedProjectId} onClick={() => setCreating((value) => !value)}><Upload size={15} />导入基因型</button>
         {creating && <form className="genotype-create-form" onSubmit={createAndUpload}>
           <label>资产名称<input required value={createForm.title} onChange={(event) => setCreateForm({ ...createForm, title: event.target.value })} placeholder="例如：2025 区试材料 SNP 数据" /></label>
           <label>导入格式<select value={createForm.source_type} onChange={(event) => setCreateForm({ ...createForm, source_type: event.target.value })}><option value="vcf">VCF / VCF.GZ</option><option value="plink_zip">PLINK 三件套 ZIP</option></select></label>
@@ -393,8 +440,8 @@ export default function GenotypeAssetsWorkspace({ onNotice }) {
       </aside>
 
       <main className="genotype-detail">
-        {!active ? <div className="genotype-empty-detail"><Dna size={34} /><h3>从一份基因型文件开始</h3><p>科研人员只需选择格式、群体类型和参考版本。转换、质控、审计与结果包会由平台在后端完成。</p></div> : <>
-          <header className="genotype-detail-head"><div><p>私有资产 · {sourceLabel(active.source_format)}</p><h3>{active.title}</h3><span>版本 v{active.version_number} · {active.reference_assembly} · {active.population_type_label || active.population_type}</span></div><span className={`genotype-status ${statusTone(activeStatus)}`}>{["queued", "processing"].includes(activeStatus) && <LoaderCircle size={15} className="spin" />}{STATUS_LABEL[activeStatus] || activeStatus}</span></header>
+        {!active ? <div className="genotype-empty-detail"><Dna size={34} /><h3>从一份基因型文件开始</h3><p>{operatorMode ? "数据处理员选择格式、群体类型和参考版本，并核对样本映射。转换、质控、审计与结果包由平台在后端完成。" : "科研人员只需选择格式、群体类型和参考版本。转换、质控、审计与结果包会由平台在后端完成。"}</p></div> : <>
+          <header className="genotype-detail-head"><div><p>{operatorMode ? "机构资产" : "私有资产"} · {sourceLabel(active.source_format)}</p><h3>{active.title}</h3><span>版本 v{active.version_number} · {active.reference_assembly} · {active.population_type_label || active.population_type}</span></div><span className={`genotype-status ${statusTone(activeStatus)}`}>{["queued", "processing"].includes(activeStatus) && <LoaderCircle size={15} className="spin" />}{STATUS_LABEL[activeStatus] || activeStatus}</span></header>
 
           {active.error_message && <section className="genotype-alert error"><AlertTriangle size={18} /><div><strong>本次处理未完成</strong><span>{active.error_message}</span></div></section>}
           {activeStatus === "reference_review_required" && <section className="genotype-alert warning"><AlertTriangle size={18} /><div><strong>存在未确认参考坐标</strong><span>非标准染色体命名或未确认 contig 不会被静默删除，也不能直接进入 GWAS。请提交数据治理申请后再发布。</span></div><button type="button" onClick={() => setGovernanceOpen(true)}>提交治理申请</button></section>}
@@ -412,13 +459,13 @@ export default function GenotypeAssetsWorkspace({ onNotice }) {
           {active.report_available && <section className="genotype-downloads"><div><p>可追溯研究产物</p><h4>{isFormalAnalysis ? "正式质控报告与分析结果包" : "预质控报告"}</h4><span>{isFormalAnalysis
             ? "材料映射已完整确认并人工发布。结果包包含正式 PDF、样本/SNP 质控汇总、已确认映射表、处理工作簿和审计信息；不包含可直接下载的原始基因型。"
             : `当前仍有 ${unresolvedCount} 个样本待确认材料映射。预质控报告仅用于核验样本/SNP 质量和映射，不可作为 GWAS 或正式分析结论；正式结果包将在全部映射确认并人工发布后生成。`}
-          </span></div><div><button type="button" className="secondary-button" onClick={() => downloadProtected(`/api/genotype-assets/${active.asset_id}/versions/${active.id}/artifacts/report`, `${active.title}-水稻基因型${isFormalAnalysis ? "正式" : "预"}质控报告-v${active.version_number}.pdf`, onNotice)}><FileSpreadsheet size={15} />{isFormalAnalysis ? "下载正式 QC 报告" : "下载预质控报告"}</button>{isFormalAnalysis && active.package_available && <button type="button" className="primary-button" onClick={() => downloadProtected(`/api/genotype-assets/${active.asset_id}/versions/${active.id}/artifacts/package`, `${active.title}-水稻基因型正式质控结果包-v${active.version_number}.zip`, onNotice)}><FileArchive size={15} />下载正式结果包</button>}</div></section>}
+          </span></div><div><button type="button" className="secondary-button" onClick={() => downloadProtected(withProject(`/api/genotype-assets/${active.asset_id}/versions/${active.id}/artifacts/report`, selectedProjectId), `${active.title}-水稻基因型${isFormalAnalysis ? "正式" : "预"}质控报告-v${active.version_number}.pdf`, onNotice)}><FileSpreadsheet size={15} />{isFormalAnalysis ? "下载正式 QC 报告" : "下载预质控报告"}</button>{isFormalAnalysis && active.package_available && <button type="button" className="primary-button" onClick={() => downloadProtected(withProject(`/api/genotype-assets/${active.asset_id}/versions/${active.id}/artifacts/package`, selectedProjectId), `${active.title}-水稻基因型正式质控结果包-v${active.version_number}.zip`, onNotice)}><FileArchive size={15} />下载正式结果包</button>}</div></section>}
 
           {activeMappings.length > 0 && <section className="genotype-mapping-section">
-            <header><div><p>关键人工确认环节</p><h3>样本与材料映射</h3><span>系统按材料编码、名称和别名给出建议。科研人员确认后，样本如 `SEQ2025_081` 才能对应平台材料档案如 `A-08`。</span></div><div className="mapping-counts"><span className={unresolvedCount ? "warning" : "ready"}>{unresolvedCount ? `${unresolvedCount} 个待确认` : "映射已完整"}</span>{duplicateCount > 0 && <span className="warning">{duplicateCount} 个重复材料</span>}</div></header>
-            {activeStatus === "analysis_ready" && <div className="mapping-publish ready mapping-revision-guidance"><span><strong>当前版本已发布并锁定，不能直接更正材料映射。</strong> 请先生成材料映射修订版；新版本可重新选择材料，原版本及已关联的 GWAS 仍保留完整审计记录。</span><div><button type="button" className="secondary-button" onClick={() => downloadProtected(`/api/genotype-assets/${active.asset_id}/versions/${active.id}/phenotype-template`, `${active.title}-连续性状表型模板.xlsx`, onNotice)}><FileSpreadsheet size={15} />下载专用表型模板</button><button type="button" className="inline-action" disabled={busy === "revision"} onClick={createRevision}>{busy === "revision" ? <LoaderCircle size={14} className="spin" /> : <Link2 size={14} />}生成映射修订版</button></div></div>}
-              <div className="mapping-actions"><button type="button" className="secondary-button" onClick={() => downloadProtected(`/api/genotype-assets/${active.asset_id}/versions/${active.id}/mapping-template`, `${active.title}-样本映射模板.csv`, onNotice)}><Download size={15} />下载映射模板</button><button type="button" className="secondary-button" onClick={() => mappingInput.current?.click()} disabled={activeStatus === "analysis_ready" || busy === "mapping"} title={activeStatus === "analysis_ready" ? "已发布版本不可修改，请先生成映射修订版" : undefined}>{busy === "mapping" ? <LoaderCircle size={15} className="spin" /> : <Upload size={15} />}批量导入映射</button><input ref={mappingInput} hidden type="file" accept=".csv" onChange={uploadMapping} /><button type="button" className="inline-action" onClick={() => setGovernanceOpen(true)}><Send size={14} />未建档/冲突，提交治理</button></div>
-            <div className="mapping-table-wrap"><table><thead><tr><th>VCF/PLINK 样本</th><th>原始样本名</th><th>平台材料档案</th><th>辅助依据</th><th>操作</th></tr></thead><tbody>{activeMappings.slice(0, 150).map((mapping) => <MappingRow key={`${mapping.fid}-${mapping.iid}`} mapping={mapping} assetId={active.asset_id} versionId={active.id} editable={activeStatus !== "analysis_ready"} onSaved={updateActive} onNotice={onNotice} />)}</tbody></table>{activeMappings.length > 150 && <p className="mapping-limit">为避免长表影响操作，当前展示前 150 个样本；请下载映射模板批量处理其余样本。</p>}</div>
+            <header><div><p>关键人工确认环节</p><h3>样本与材料映射</h3><span>系统按材料编码、名称和别名给出建议。{operatorMode ? "数据处理员" : "科研人员"}确认后，样本如 `SEQ2025_081` 才能对应平台材料档案如 `A-08`。</span></div><div className="mapping-counts"><span className={unresolvedCount ? "warning" : "ready"}>{unresolvedCount ? `${unresolvedCount} 个待确认` : "映射已完整"}</span>{duplicateCount > 0 && <span className="warning">{duplicateCount} 个重复材料</span>}</div></header>
+            {activeStatus === "analysis_ready" && <div className="mapping-publish ready mapping-revision-guidance"><span><strong>当前版本已发布并锁定，不能直接更正材料映射。</strong> 请先生成材料映射修订版；新版本可重新选择材料，原版本及已关联的 GWAS 仍保留完整审计记录。</span><div><button type="button" className="secondary-button" onClick={() => downloadProtected(withProject(`/api/genotype-assets/${active.asset_id}/versions/${active.id}/phenotype-template`, selectedProjectId), `${active.title}-连续性状表型模板.xlsx`, onNotice)}><FileSpreadsheet size={15} />下载专用表型模板</button><button type="button" className="inline-action" disabled={busy === "revision"} onClick={createRevision}>{busy === "revision" ? <LoaderCircle size={14} className="spin" /> : <Link2 size={14} />}生成映射修订版</button></div></div>}
+              <div className="mapping-actions"><button type="button" className="secondary-button" onClick={() => downloadProtected(withProject(`/api/genotype-assets/${active.asset_id}/versions/${active.id}/mapping-template`, selectedProjectId), `${active.title}-样本映射模板.csv`, onNotice)}><Download size={15} />下载映射模板</button><button type="button" className="secondary-button" onClick={() => mappingInput.current?.click()} disabled={activeStatus === "analysis_ready" || busy === "mapping"} title={activeStatus === "analysis_ready" ? "已发布版本不可修改，请先生成映射修订版" : undefined}>{busy === "mapping" ? <LoaderCircle size={15} className="spin" /> : <Upload size={15} />}批量导入映射</button><input ref={mappingInput} hidden type="file" accept=".csv" onChange={uploadMapping} /><button type="button" className="inline-action" onClick={() => setGovernanceOpen(true)}><Send size={14} />未建档/冲突，提交治理</button></div>
+            <div className="mapping-table-wrap"><table><thead><tr><th>VCF/PLINK 样本</th><th>原始样本名</th><th>平台材料档案</th><th>辅助依据</th><th>操作</th></tr></thead><tbody>{activeMappings.slice(0, 150).map((mapping) => <MappingRow key={`${mapping.fid}-${mapping.iid}`} mapping={mapping} assetId={active.asset_id} versionId={active.id} projectId={selectedProjectId} editable={activeStatus !== "analysis_ready"} onSaved={updateActive} onNotice={onNotice} />)}</tbody></table>{activeMappings.length > 150 && <p className="mapping-limit">为避免长表影响操作，当前展示前 150 个样本；请下载映射模板批量处理其余样本。</p>}</div>
             {activeStatus === "awaiting_mapping" && <div className="mapping-publish"><span>发布前校验：必须全部映射，且不能有两个样本映射到同一材料。发布后形成不可覆盖的分析版本。</span><button type="button" className="primary-button" disabled={busy === "publish" || unresolvedCount > 0 || duplicateCount > 0} onClick={publish}>{busy === "publish" ? <LoaderCircle size={15} className="spin" /> : <CheckCircle2 size={15} />}人工确认并发布给 GWAS</button></div>}
           </section>}
 

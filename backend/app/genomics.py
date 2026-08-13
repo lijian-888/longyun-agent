@@ -28,6 +28,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from .local_gwas import LocalGwasError, run_local_gwas
+from .object_storage import ObjectStore, project_object_key
 
 
 MAX_GENOTYPE_ARCHIVE_BYTES = 512 * 1024 * 1024
@@ -51,6 +52,7 @@ class GenomicsError(ValueError):
 
 
 class CreateGwasPlanRequest(BaseModel):
+    project_id: str = Field(min_length=36, max_length=36)
     trait_name: str = Field(min_length=1, max_length=120)
     reference_assembly: str = Field(default="IRGSP-1.0", min_length=1, max_length=120)
     candidate_window_kb: int = Field(default=100, ge=1, le=2000)
@@ -70,12 +72,21 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while block := handle.read(1024 * 1024):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def ensure_genomics_schema(session: Session) -> None:
     """Create the private plan table and enforce the same owner isolation as chat."""
     session.execute(text("""
         CREATE TABLE IF NOT EXISTS gwas_analysis_plan (
           id VARCHAR(36) PRIMARY KEY,
           owner_id VARCHAR(120) NOT NULL,
+          project_id VARCHAR(36),
           status VARCHAR(40) NOT NULL DEFAULT 'collecting',
           trait_name VARCHAR(120) NOT NULL,
           reference_assembly VARCHAR(120) NOT NULL,
@@ -91,15 +102,19 @@ def ensure_genomics_schema(session: Session) -> None:
         )
     """))
     session.execute(text("ALTER TABLE gwas_analysis_plan ADD COLUMN IF NOT EXISTS result_manifest JSONB NOT NULL DEFAULT '{}'::jsonb"))
+    session.execute(text("ALTER TABLE gwas_analysis_plan ADD COLUMN IF NOT EXISTS project_id VARCHAR(36)"))
     session.execute(text("CREATE INDEX IF NOT EXISTS ix_gwas_analysis_plan_owner_updated ON gwas_analysis_plan(owner_id, updated_at DESC)"))
+    session.execute(text("CREATE INDEX IF NOT EXISTS ix_gwas_analysis_plan_project_updated ON gwas_analysis_plan(project_id, updated_at DESC)"))
     session.execute(text("ALTER TABLE gwas_analysis_plan ENABLE ROW LEVEL SECURITY"))
     session.execute(text("ALTER TABLE gwas_analysis_plan FORCE ROW LEVEL SECURITY"))
     session.execute(text("DROP POLICY IF EXISTS gwas_analysis_plan_owner_only ON gwas_analysis_plan"))
     session.execute(text("""
         CREATE POLICY gwas_analysis_plan_owner_only ON gwas_analysis_plan
         FOR ALL
-        USING (owner_id = current_setting('app.research_user_id', true))
-        WITH CHECK (owner_id = current_setting('app.research_user_id', true))
+        USING (owner_id = current_setting('app.research_user_id', true)
+               AND project_id = current_setting('app.project_id', true))
+        WITH CHECK (owner_id = current_setting('app.research_user_id', true)
+                    AND project_id = current_setting('app.project_id', true))
     """))
 
 
@@ -115,30 +130,68 @@ def _private_dir(storage_dir: Path, owner_id: str, plan_id: str) -> Path:
     return path
 
 
-def _write_private_file(directory: Path, filename: str, content: bytes) -> dict[str, Any]:
+def _write_private_file(
+    directory: Path,
+    filename: str,
+    content: bytes,
+    *,
+    object_store: ObjectStore | None = None,
+    plan_id: str = "",
+    owner_id: str = "",
+    category: str = "gwas-inputs",
+    project_id: str = "",
+) -> dict[str, Any]:
     final_path = directory / _safe_name(filename, "upload.bin")
     temporary_path = final_path.with_suffix(f"{final_path.suffix}.tmp")
     temporary_path.write_bytes(content)
     temporary_path.replace(final_path)
-    return {
+    metadata = {
         "file_name": final_path.name,
         "storage_path": str(final_path),
         "size_bytes": len(content),
         "sha256": hashlib.sha256(content).hexdigest(),
     }
+    if object_store is not None:
+        stored = object_store.put_file(
+            project_object_key(
+                project_id=project_id or None,
+                category=category,
+                resource_id=plan_id,
+                owner_user_id=owner_id,
+                file_name=final_path.name,
+            ),
+            final_path,
+            "application/octet-stream",
+        )
+        metadata["object_locator"] = stored.locator
+    return metadata
+
+
+def _public_manifest(value: dict[str, Any]) -> dict[str, Any]:
+    """Remove internal storage locators and raw sample identifiers from API responses."""
+    public = json.loads(json.dumps(value or {}, ensure_ascii=False, default=str))
+    for key in ("genotype", "phenotype", "covariates"):
+        item = public.get(key)
+        if not isinstance(item, dict):
+            continue
+        item.pop("storage_path", None)
+        item.pop("object_locator", None)
+        item.pop("sample_pairs", None)
+    return public
 
 
 def _row_to_dict(row: Any) -> dict[str, Any]:
     row = dict(row)
     return {
         "id": row["id"],
+        "project_id": row.get("project_id"),
         "status": row["status"],
         "trait_name": row["trait_name"],
         "reference_assembly": row["reference_assembly"],
         "purpose": row["purpose"],
         "workflow_code": row["workflow_code"],
         "parameters": row["parameters"] or {},
-        "input_manifest": row["input_manifest"] or {},
+        "input_manifest": _public_manifest(row["input_manifest"] or {}),
         "preflight": row["preflight"] or {},
         "confirmation": row["confirmation"] or {},
         "result_manifest": row["result_manifest"] or {},
@@ -220,12 +273,13 @@ def create_plan(session: Session, owner_id: str, payload: CreateGwasPlanRequest)
     parameters = {**DEFAULT_PARAMETERS, "candidate_window_kb": payload.candidate_window_kb}
     session.execute(text("""
         INSERT INTO gwas_analysis_plan
-        (id, owner_id, status, trait_name, reference_assembly, purpose, workflow_code, parameters, input_manifest, preflight, confirmation, created_at, updated_at)
-        VALUES (:id, :owner_id, 'collecting', :trait_name, :reference_assembly, :purpose, :workflow_code,
+        (id, owner_id, project_id, status, trait_name, reference_assembly, purpose, workflow_code, parameters, input_manifest, preflight, confirmation, created_at, updated_at)
+        VALUES (:id, :owner_id, :project_id, 'collecting', :trait_name, :reference_assembly, :purpose, :workflow_code,
                 CAST(:parameters AS jsonb), '{}'::jsonb, CAST(:preflight AS jsonb), '{}'::jsonb, :now, :now)
     """), {
         "id": plan_id,
         "owner_id": owner_id,
+        "project_id": payload.project_id,
         "trait_name": payload.trait_name.strip(),
         "reference_assembly": payload.reference_assembly.strip(),
         "purpose": payload.purpose.strip(),
@@ -238,8 +292,11 @@ def create_plan(session: Session, owner_id: str, payload: CreateGwasPlanRequest)
     return _row_to_dict(_plan_row(session, plan_id))
 
 
-def list_plans(session: Session) -> list[dict[str, Any]]:
-    rows = session.execute(text("SELECT * FROM gwas_analysis_plan ORDER BY updated_at DESC")).mappings().all()
+def list_plans(session: Session, project_id: str) -> list[dict[str, Any]]:
+    rows = session.execute(
+        text("SELECT * FROM gwas_analysis_plan WHERE project_id = :project_id ORDER BY updated_at DESC"),
+        {"project_id": project_id},
+    ).mappings().all()
     return [_row_to_dict(row) for row in rows]
 
 
@@ -283,7 +340,15 @@ def _count_bim(content: bytes) -> int:
     return count
 
 
-def upload_genotype(session: Session, owner_id: str, plan_id: str, filename: str, content: bytes, storage_dir: Path) -> dict[str, Any]:
+def upload_genotype(
+    session: Session,
+    owner_id: str,
+    plan_id: str,
+    filename: str,
+    content: bytes,
+    storage_dir: Path,
+    object_store: ObjectStore | None = None,
+) -> dict[str, Any]:
     row = _plan_row(session, plan_id)
     _require_collecting_plan(row)
     if len(content) > MAX_GENOTYPE_ARCHIVE_BYTES:
@@ -315,7 +380,16 @@ def upload_genotype(session: Session, owner_id: str, plan_id: str, filename: str
     sample_count, sample_pairs = _count_fam(fam)
     variant_count = _count_bim(bim)
     directory = _private_dir(storage_dir, owner_id, plan_id)
-    saved = _write_private_file(directory, "genotype.zip", content)
+    saved = _write_private_file(
+        directory,
+        "genotype.zip",
+        content,
+        object_store=object_store,
+        plan_id=plan_id,
+        owner_id=owner_id,
+        category="gwas-genotype-inputs",
+        project_id=str(row["project_id"]),
+    )
     metadata = {
         **saved,
         "source_archive_name": _safe_name(filename, "genotype.zip"),
@@ -338,6 +412,7 @@ def attach_analysis_ready_genotype(
     asset_id: str,
     version_id: str,
     storage_dir: Path,
+    object_store: ObjectStore | None = None,
 ) -> dict[str, Any]:
     """Attach a published private QC version to a GWAS plan without exposing raw PLINK files.
 
@@ -347,11 +422,12 @@ def attach_analysis_ready_genotype(
     plan = _plan_row(session, plan_id)
     _require_collecting_plan(plan)
     version = session.execute(text("""
-        SELECT version.*, asset.title AS asset_title, asset.reference_assembly AS asset_reference_assembly
+        SELECT version.*, asset.title AS asset_title, asset.reference_assembly AS asset_reference_assembly,
+               asset.project_id AS asset_project_id
         FROM genotype_asset_version version
         JOIN genotype_asset asset ON asset.id = version.asset_id
-        WHERE version.id = :version_id AND asset.id = :asset_id
-    """), {"version_id": version_id, "asset_id": asset_id}).mappings().first()
+        WHERE version.id = :version_id AND asset.id = :asset_id AND asset.project_id = :project_id
+    """), {"version_id": version_id, "asset_id": asset_id, "project_id": plan["project_id"]}).mappings().first()
     if not version:
         raise GenomicsError("未找到可由当前科研账号使用的基因型版本。")
     if version["status"] != "analysis_ready":
@@ -391,8 +467,21 @@ def attach_analysis_ready_genotype(
         "file_name": archive_path.name,
         "storage_path": str(archive_path),
         "size_bytes": archive_path.stat().st_size,
-        "sha256": hashlib.sha256(archive_path.read_bytes()).hexdigest(),
+        "sha256": _file_sha256(archive_path),
     }
+    if object_store is not None:
+        stored = object_store.put_file(
+            project_object_key(
+                project_id=str(plan["project_id"]),
+                category="gwas-genotype-inputs",
+                resource_id=plan_id,
+                owner_user_id=owner_id,
+                file_name=archive_path.name,
+            ),
+            archive_path,
+            "application/zip",
+        )
+        saved["object_locator"] = stored.locator
     manifest = dict(plan["input_manifest"] or {})
     manifest["genotype"] = {
         **saved,
@@ -456,7 +545,16 @@ def _rows_as_tsv(rows: list[dict[str, str]], headers: list[str]) -> bytes:
     return buffer.getvalue().encode("utf-8")
 
 
-def upload_phenotype(session: Session, owner_id: str, plan_id: str, filename: str, trait_column: str, content: bytes, storage_dir: Path) -> dict[str, Any]:
+def upload_phenotype(
+    session: Session,
+    owner_id: str,
+    plan_id: str,
+    filename: str,
+    trait_column: str,
+    content: bytes,
+    storage_dir: Path,
+    object_store: ObjectStore | None = None,
+) -> dict[str, Any]:
     plan = _plan_row(session, plan_id)
     _require_collecting_plan(plan)
     if len(content) > MAX_TABULAR_BYTES:
@@ -500,7 +598,16 @@ def upload_phenotype(session: Session, owner_id: str, plan_id: str, filename: st
         raise GenomicsError("首版 GWAS 每个表型文件只能包含一个 analysis_environment。多年多点或多重复数据请先通过区域试验资料包治理或计算 BLUP 后再上传。")
     directory = _private_dir(storage_dir, owner_id, plan_id)
     # Preserve the original filename in the manifest, but execute only against a normalized TSV.
-    saved = _write_private_file(directory, "phenotype.tsv", _rows_as_tsv(rows, headers))
+    saved = _write_private_file(
+        directory,
+        "phenotype.tsv",
+        _rows_as_tsv(rows, headers),
+        object_store=object_store,
+        plan_id=plan_id,
+        owner_id=owner_id,
+        category="gwas-phenotype-inputs",
+        project_id=str(plan["project_id"]),
+    )
     manifest = dict(plan["input_manifest"] or {})
     manifest["phenotype"] = {
         **saved,
@@ -517,7 +624,15 @@ def upload_phenotype(session: Session, owner_id: str, plan_id: str, filename: st
     return _row_to_dict(_update_plan(session, plan_id, manifest=manifest, preflight=_preflight(manifest, parameters), status="collecting"))
 
 
-def upload_covariates(session: Session, owner_id: str, plan_id: str, filename: str, content: bytes, storage_dir: Path) -> dict[str, Any]:
+def upload_covariates(
+    session: Session,
+    owner_id: str,
+    plan_id: str,
+    filename: str,
+    content: bytes,
+    storage_dir: Path,
+    object_store: ObjectStore | None = None,
+) -> dict[str, Any]:
     plan = _plan_row(session, plan_id)
     _require_collecting_plan(plan)
     if len(content) > MAX_TABULAR_BYTES:
@@ -527,7 +642,16 @@ def upload_covariates(session: Session, owner_id: str, plan_id: str, filename: s
     if not {"fid", "iid"}.issubset(lower) or len(headers) < 3:
         raise GenomicsError("协变量文件必须包含 FID、IID 及至少一个协变量列。")
     directory = _private_dir(storage_dir, owner_id, plan_id)
-    saved = _write_private_file(directory, "covariates.tsv", _rows_as_tsv(rows, headers))
+    saved = _write_private_file(
+        directory,
+        "covariates.tsv",
+        _rows_as_tsv(rows, headers),
+        object_store=object_store,
+        plan_id=plan_id,
+        owner_id=owner_id,
+        category="gwas-covariate-inputs",
+        project_id=str(plan["project_id"]),
+    )
     manifest = dict(plan["input_manifest"] or {})
     manifest["covariates"] = {**saved, "source_file_name": _safe_name(filename, "covariates.csv"), "row_count": len(rows), "headers": headers}
     parameters = dict(plan["parameters"] or DEFAULT_PARAMETERS)
@@ -566,7 +690,32 @@ def request_execution(session: Session, plan_id: str) -> dict[str, Any]:
     return _row_to_dict(result)
 
 
-def run_requested_local_execution(session: Session, plan_id: str, storage_dir: Path) -> dict[str, Any]:
+def _ensure_local_manifest_file(
+    private_dir: Path,
+    metadata: dict[str, Any],
+    object_store: ObjectStore | None,
+    fallback: str,
+) -> Path:
+    path = private_dir / str(metadata.get("file_name") or fallback)
+    if path.is_file():
+        return path
+    locator = str(metadata.get("object_locator") or "")
+    if not locator or object_store is None:
+        return path
+    object_store.copy_to(locator, path)
+    expected = str(metadata.get("sha256") or "")
+    if expected and _file_sha256(path) != expected:
+        path.unlink(missing_ok=True)
+        raise GenomicsError("The restored GWAS input checksum does not match its manifest.")
+    return path
+
+
+def run_requested_local_execution(
+    session: Session,
+    plan_id: str,
+    storage_dir: Path,
+    object_store: ObjectStore | None = None,
+) -> dict[str, Any]:
     """Run the locked plan locally and persist only deterministic result files."""
     plan = _plan_row(session, plan_id)
     if plan["status"] != "running":
@@ -577,9 +726,17 @@ def run_requested_local_execution(session: Session, plan_id: str, storage_dir: P
     covariates = manifest.get("covariates") or {}
     owner_id = str(plan["owner_id"])
     private_dir = _private_dir(storage_dir, owner_id, plan_id)
-    genotype_path = private_dir / str(genotype.get("file_name", "genotype.zip"))
-    phenotype_path = private_dir / str(phenotype.get("file_name", "phenotype.csv"))
-    covariate_path = private_dir / str(covariates.get("file_name")) if covariates else None
+    genotype_path = _ensure_local_manifest_file(
+        private_dir, genotype, object_store, "genotype.zip"
+    )
+    phenotype_path = _ensure_local_manifest_file(
+        private_dir, phenotype, object_store, "phenotype.tsv"
+    )
+    covariate_path = (
+        _ensure_local_manifest_file(private_dir, covariates, object_store, "covariates.tsv")
+        if covariates
+        else None
+    )
     if not genotype_path.is_file() or not phenotype_path.is_file() or (covariate_path and not covariate_path.is_file()):
         raise GenomicsError("已锁定的输入文件不完整，无法启动本地 GWAS。")
     parameters = dict(plan["parameters"] or DEFAULT_PARAMETERS)

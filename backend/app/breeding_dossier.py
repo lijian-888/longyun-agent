@@ -231,6 +231,7 @@ def ensure_breeding_dossier_schema(session: Session) -> None:
         """
         CREATE TABLE IF NOT EXISTS breeding_pedigree_relationship (
             id VARCHAR(36) PRIMARY KEY,
+            project_id VARCHAR(36) REFERENCES research_project(id) ON DELETE CASCADE,
             child_material_id VARCHAR(36) NOT NULL REFERENCES breeding_material(id),
             parent_material_id VARCHAR(36) NOT NULL REFERENCES breeding_material(id),
             parent_role VARCHAR(40) NOT NULL,
@@ -241,7 +242,7 @@ def ensure_breeding_dossier_schema(session: Session) -> None:
             source_record_no VARCHAR(120),
             source_note TEXT,
             is_simulated BOOLEAN NOT NULL DEFAULT FALSE,
-            UNIQUE(child_material_id, parent_material_id, parent_role)
+            UNIQUE(project_id, child_material_id, parent_material_id, parent_role)
         )
         """,
         """
@@ -283,6 +284,7 @@ def ensure_breeding_dossier_schema(session: Session) -> None:
         )
         """,
         "ALTER TABLE breeding_pedigree_relationship ADD COLUMN IF NOT EXISTS parent_origin TEXT",
+        "ALTER TABLE breeding_pedigree_relationship ADD COLUMN IF NOT EXISTS project_id VARCHAR(36)",
         "ALTER TABLE breeding_pedigree_relationship ADD COLUMN IF NOT EXISTS parent_trait_summary TEXT",
         "ALTER TABLE breeding_pedigree_relationship ADD COLUMN IF NOT EXISTS combination_basis TEXT",
         "ALTER TABLE breeding_pedigree_relationship ADD COLUMN IF NOT EXISTS source_record_no VARCHAR(120)",
@@ -293,6 +295,7 @@ def ensure_breeding_dossier_schema(session: Session) -> None:
         "ALTER TABLE breeding_selection_record ADD COLUMN IF NOT EXISTS source_record_no VARCHAR(120)",
         "CREATE INDEX IF NOT EXISTS ix_program_material_material ON breeding_program_material(material_id)",
         "CREATE INDEX IF NOT EXISTS ix_pedigree_child ON breeding_pedigree_relationship(child_material_id)",
+        "CREATE INDEX IF NOT EXISTS ix_pedigree_project_child ON breeding_pedigree_relationship(project_id, child_material_id)",
         "CREATE INDEX IF NOT EXISTS ix_generation_material ON breeding_generation_record(material_id, event_sequence)",
         "CREATE INDEX IF NOT EXISTS ix_selection_material ON breeding_selection_record(material_id, selection_year)",
     )
@@ -405,7 +408,7 @@ def seed_mock_breeding_dossiers(session: Session) -> int:
                     :id, :child_id, :parent_id, :role, 'hybrid_parent',
                     :origin, :traits, :basis, :record_no, :note, TRUE
                 )
-                ON CONFLICT (child_material_id, parent_material_id, parent_role) DO UPDATE SET
+                ON CONFLICT (id) DO UPDATE SET
                     parent_origin = EXCLUDED.parent_origin,
                     parent_trait_summary = EXCLUDED.parent_trait_summary,
                     combination_basis = EXCLUDED.combination_basis,

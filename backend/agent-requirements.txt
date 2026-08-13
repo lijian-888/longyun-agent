@@ -1,0 +1,9 @@
+# Multi-agent orchestration and reliable background execution.
+# Kept separate from the heavy OCR/document stack so agent-only changes do
+# not invalidate several gigabytes of stable image layers.
+celery==5.5.3
+langgraph==1.2.10
+langgraph-checkpoint-postgres==3.1.1
+redis==6.4.0
+# Official ACPs v2.1 protocol models, ADP discovery models and AIP transport.
+acps-sdk==2.1.0

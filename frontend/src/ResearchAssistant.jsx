@@ -3,9 +3,10 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   ArrowDown,
+  BarChart3,
   Bot,
+  Building2,
   ChevronDown,
-  Dna,
   FileText,
   FileDown,
   LoaderCircle,
@@ -18,6 +19,7 @@ import {
   SendHorizontal,
   ShieldCheck,
   Sparkles,
+  Sprout,
   Trash2,
   Upload,
   UserRound,
@@ -28,8 +30,10 @@ import { authorizedFetch, request } from "./api";
 import KnowledgeLibrary from "./KnowledgeLibrary";
 import ResultsLibrary from "./ResultsLibrary";
 import GwasWorkspace from "./GwasWorkspace";
-import GenotypeAssetsWorkspace from "./GenotypeAssetsWorkspace";
 import SkillLibrary from "./SkillLibrary";
+import { SinglePlantResearchWorkspace } from "./SinglePlantWorkspace";
+import { BaseShowcaseWorkspace, VarietyEvaluationWorkspace } from "./BreedingDecisionWorkspaces";
+import MultiAgentWorkspace from "./MultiAgentWorkspace";
 
 const AGENT_NAME = "隆耘 Agent 育种智能体";
 
@@ -131,11 +135,13 @@ function ReportDownloadCard({ message, onDownload }) {
 
 
 const QUERY_OPERATORS = [
-  { value: "gte", label: "不小于" },
-  { value: "gt", label: "大于" },
-  { value: "lte", label: "不超过" },
-  { value: "lt", label: "小于" },
-  { value: "eq", label: "等于" },
+  { value: "contains", label: "包含", kinds: ["text", "json"] },
+  { value: "eq", label: "等于", kinds: ["text", "number", "integer", "boolean", "date", "datetime"] },
+  { value: "ne", label: "不等于", kinds: ["text", "number", "integer", "boolean", "date", "datetime"] },
+  { value: "gte", label: "不小于", kinds: ["number", "integer", "date", "datetime"] },
+  { value: "gt", label: "大于", kinds: ["number", "integer", "date", "datetime"] },
+  { value: "lte", label: "不超过", kinds: ["number", "integer", "date", "datetime"] },
+  { value: "lt", label: "小于", kinds: ["number", "integer", "date", "datetime"] },
 ];
 
 const TRIAL_ANALYSIS_PROMPTS = [
@@ -151,116 +157,86 @@ function fieldLabel(field) {
   return field?.unit ? `${field.name} (${field.unit})` : field?.name || "";
 }
 
-function StructuredQueryPanel({ onNotice }) {
-  const [datasets, setDatasets] = useState([]);
-  const [scope, setScope] = useState("rice_phenotype");
-  const [selectedVarieties, setSelectedVarieties] = useState([]);
-  const [varietyKeyword, setVarietyKeyword] = useState("");
-  const [varietyOptions, setVarietyOptions] = useState([]);
-  const [varietyOptionsOpen, setVarietyOptionsOpen] = useState(false);
-  const [varietySearching, setVarietySearching] = useState(false);
-  const [selectedTraitCodes, setSelectedTraitCodes] = useState([]);
+function StructuredQueryPanel({ onNotice, projectId }) {
+  const [catalog, setCatalog] = useState({ datasets: [], project: null });
+  const [datasetCode, setDatasetCode] = useState("");
+  const [selectedFieldCodes, setSelectedFieldCodes] = useState([]);
+  const [search, setSearch] = useState("");
   const [filters, setFilters] = useState([]);
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState("");
-  const varietySearchRequestRef = useRef(0);
-  const varietyComboboxRef = useRef(null);
 
-  const dataset = datasets.find((item) => item.scope === scope);
-  const identityField = dataset?.fields?.find((item) => item.kind === "basic");
-  const traitFields = (dataset?.fields || []).filter((item) => item.kind === "trait");
-  const selectedFields = traitFields.filter((item) => selectedTraitCodes.includes(item.code));
-  const allSelected = traitFields.length > 0 && selectedTraitCodes.length === traitFields.length;
+  const datasets = catalog.datasets || [];
+  const dataset = datasets.find((item) => item.code === datasetCode);
+  const fields = dataset?.fields || [];
+  const selectedFields = fields.filter((item) => selectedFieldCodes.includes(item.code));
+  const allSelected = fields.length > 0 && selectedFieldCodes.length === fields.length;
 
   useEffect(() => {
+    if (!projectId) {
+      setCatalog({ datasets: [], project: null });
+      setDatasetCode("");
+      setLoading(false);
+      return;
+    }
+    let cancelled = false;
     (async () => {
+      setLoading(true);
+      setError("");
       try {
-        const catalog = await request("/api/research/standard-fields");
-        setDatasets(catalog.datasets || []);
+        const response = await request(`/api/research/project-data/catalog?project_id=${encodeURIComponent(projectId)}`);
+        if (cancelled) return;
+        setCatalog(response);
+        setDatasetCode(response.datasets?.[0]?.code || "");
       } catch (requestError) {
-        setError(requestError.message || "无法读取标准字段目录。");
+        if (!cancelled) setError(requestError.message || "无法读取当前课题的数据目录。");
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
     })();
-  }, []);
+    return () => { cancelled = true; };
+  }, [projectId]);
 
   useEffect(() => {
-    if (!traitFields.length) return;
-    setSelectedTraitCodes(traitFields.map((item) => item.code));
+    setSelectedFieldCodes(fields.filter((item) => item.default).map((item) => item.code));
+    setSearch("");
     setFilters([]);
     setResult(null);
-  }, [scope, dataset?.scope]);
+  }, [datasetCode]);
 
-  useEffect(() => {
-    if (!varietyOptionsOpen) return undefined;
-    const requestId = varietySearchRequestRef.current + 1;
-    varietySearchRequestRef.current = requestId;
-    const timer = window.setTimeout(async () => {
-      setVarietySearching(true);
-      try {
-        const options = await request(`/api/research/published-data/varieties?scope=${scope}&q=${encodeURIComponent(varietyKeyword.trim())}`);
-        if (varietySearchRequestRef.current === requestId) setVarietyOptions(options);
-      } catch (requestError) {
-        if (varietySearchRequestRef.current === requestId) setError(requestError.message || "无法搜索品种名称。");
-      } finally {
-        if (varietySearchRequestRef.current === requestId) setVarietySearching(false);
-      }
-    }, 180);
-    return () => window.clearTimeout(timer);
-  }, [scope, varietyKeyword, varietyOptionsOpen]);
-
-  useEffect(() => {
-    function closeVarietyOptions(event) {
-      if (!varietyComboboxRef.current?.contains(event.target)) setVarietyOptionsOpen(false);
-    }
-    window.addEventListener("pointerdown", closeVarietyOptions);
-    return () => window.removeEventListener("pointerdown", closeVarietyOptions);
-  }, []);
-
-  function switchScope(nextScope) {
-    if (nextScope === scope) return;
-    setScope(nextScope);
-    setSelectedVarieties([]);
-    setVarietyKeyword("");
-    setVarietyOptionsOpen(false);
+  function switchDataset(nextCode) {
+    if (nextCode === datasetCode) return;
+    setDatasetCode(nextCode);
     setError("");
   }
 
-  function selectVariety(option) {
-    setSelectedVarieties((current) => current.some((item) => item.id === option.id) ? current : [...current, option]);
-    setVarietyKeyword("");
-    setVarietyOptionsOpen(false);
-  }
-
-  function removeSelectedVariety(id) {
-    setSelectedVarieties((current) => current.filter((item) => item.id !== id));
-  }
-
-  function toggleTrait(code) {
-    setSelectedTraitCodes((current) => current.includes(code)
+  function toggleField(code) {
+    setSelectedFieldCodes((current) => current.includes(code)
       ? current.filter((item) => item !== code)
       : [...current, code]);
   }
 
-  function toggleAllTraits() {
-    setSelectedTraitCodes(allSelected ? [] : traitFields.map((item) => item.code));
+  function toggleAllFields() {
+    setSelectedFieldCodes(allSelected ? [] : fields.map((item) => item.code));
   }
 
   function addFilter() {
-    const firstField = traitFields[0];
-    if (!firstField || filters.length >= 6) return;
-    setFilters((current) => [...current, { trait_code: firstField.code, operator: "gte", value: "" }]);
-    setSelectedTraitCodes((current) => current.includes(firstField.code) ? current : [...current, firstField.code]);
+    const firstField = fields.find((item) => item.filterable);
+    if (!firstField || filters.length >= 8) return;
+    const operator = ["number", "integer", "date", "datetime"].includes(firstField.kind) ? "gte" : "contains";
+    setFilters((current) => [...current, { field: firstField.code, operator, value: "" }]);
   }
 
   function updateFilter(index, patch) {
-    setFilters((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, ...patch } : item));
-    if (patch.trait_code) {
-      setSelectedTraitCodes((current) => current.includes(patch.trait_code) ? current : [...current, patch.trait_code]);
-    }
+    setFilters((current) => current.map((item, itemIndex) => {
+      if (itemIndex !== index) return item;
+      if (!patch.field) return { ...item, ...patch };
+      const nextField = fields.find((field) => field.code === patch.field);
+      const operator = ["number", "integer", "date", "datetime"].includes(nextField?.kind) ? "gte" : "contains";
+      return { ...item, ...patch, operator, value: "" };
+    }));
   }
 
   function removeFilter(index) {
@@ -269,19 +245,19 @@ function StructuredQueryPanel({ onNotice }) {
 
   function exportCsv() {
     if (!result?.records?.length) return;
-    const columns = [identityField?.name || "品种/材料名称", "别名", ...selectedFields.map(fieldLabel)];
+    const resultFields = result.fields || [];
+    const columns = resultFields.map(fieldLabel);
     const escapeCell = (value) => `"${String(value ?? "").replaceAll('"', '""')}"`;
-    const rows = result.records.map((record) => [
-      record.variety_name,
-      record.aliases?.join("、") || "",
-      ...selectedFields.map((field) => record.traits?.[field.code]?.value ?? ""),
-    ]);
+    const rows = result.records.map((record) => resultFields.map((field) => {
+      const value = record[field.code];
+      return value && typeof value === "object" ? JSON.stringify(value) : value;
+    }));
     const csv = `\uFEFF${[columns, ...rows].map((row) => row.map(escapeCell).join(",")).join("\r\n")}`;
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = url;
-    anchor.download = `已发布标准数据查询-${new Date().toISOString().slice(0, 10)}.csv`;
+    anchor.download = `${dataset?.title || "课题数据"}-${new Date().toISOString().slice(0, 10)}.csv`;
     document.body.appendChild(anchor);
     anchor.click();
     anchor.remove();
@@ -291,31 +267,35 @@ function StructuredQueryPanel({ onNotice }) {
   async function runQuery(event) {
     event.preventDefault();
     setError("");
-    if (!selectedTraitCodes.length) {
-      setError("请至少选择一个需要展示的标准字段。");
+    if (!projectId || !datasetCode) {
+      setError("请先选择一个可访问的课题和数据类型。");
       return;
     }
-    if (filters.some((item) => item.value === "" || Number.isNaN(Number(item.value)))) {
-      setError("每个数值筛选条件都需要填写有效数值。");
+    if (!selectedFieldCodes.length) {
+      setError("请至少选择一个需要展示的字段。");
+      return;
+    }
+    if (filters.some((item) => item.value === "")) {
+      setError("每个筛选条件都需要填写值。");
       return;
     }
     setRunning(true);
     try {
-      const response = await request("/api/research/published-data/query", {
+      const response = await request("/api/research/project-data/query", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          scope,
-          variety_names: selectedVarieties.map((item) => item.variety_name),
-          trait_codes: selectedTraitCodes,
-          filters: filters.map((item) => ({ ...item, value: Number(item.value) })),
+          project_id: projectId,
+          dataset: datasetCode,
+          fields: selectedFieldCodes,
+          search: search.trim(),
+          filters,
           limit: 100,
+          offset: 0,
         }),
       });
       setResult(response);
-      if (response.unresolved_variety_names?.length) {
-        onNotice(`未找到以下已发布品种或别名：${response.unresolved_variety_names.join("、")}`);
-      }
+      onNotice(`已从“${catalog.project?.project_name || "当前课题"}”查询到 ${response.record_count} 条${response.dataset_title}记录。`);
     } catch (requestError) {
       setError(requestError.message || "查询未完成，请稍后重试。");
     } finally {
@@ -323,53 +303,55 @@ function StructuredQueryPanel({ onNotice }) {
     }
   }
 
-  if (loading) return <section className="structured-query-loading"><LoaderCircle size={18} className="spin" />正在读取可查询的标准字段</section>;
+  if (loading) return <section className="structured-query-loading"><LoaderCircle size={18} className="spin" />正在读取当前课题的数据目录</section>;
 
   return <section className="structured-query-panel">
     <div className="structured-query-heading">
-      <div><p>只读查询已发布标准数据</p><h2>结构化查询</h2><span>按标准模板选择字段和范围条件，系统自动使用受控查询，不需要填写 SQL。</span></div>
-      <span className="structured-query-limit">单次最多返回 100 个品种/材料</span>
+      <div><p>当前课题 · {catalog.project?.project_name || "尚未选择"}</p><h2>课题数据查询</h2><span>查询当前账号有权访问的课题业务数据；系统使用受控字段，不需要填写 SQL。</span></div>
+      <span className="structured-query-limit">单次最多返回 100 条记录</span>
     </div>
 
-    <div className="dataset-switch" role="tablist" aria-label="选择标准数据模板">
-      {datasets.map((item) => <button key={item.scope} type="button" role="tab" aria-selected={scope === item.scope} className={scope === item.scope ? "active" : ""} onClick={() => switchScope(item.scope)}>{item.title}</button>)}
+    <div className="dataset-switch" role="tablist" aria-label="选择课题数据类型">
+      {datasets.map((item) => <button key={item.code} type="button" role="tab" aria-selected={datasetCode === item.code} className={datasetCode === item.code ? "active" : ""} onClick={() => switchDataset(item.code)}>{item.title}</button>)}
     </div>
 
     {dataset && <form className="structured-query-form" onSubmit={runQuery}>
       <div className="structured-query-description">{dataset.description}</div>
-      <div className="structured-name-input"><span>{identityField?.name || "品种/材料名称"}（可选）</span><div className="variety-combobox" ref={varietyComboboxRef}><div className="variety-selected-list">{selectedVarieties.map((item) => <span className="variety-selected-chip" key={item.id}>{item.variety_name}<button type="button" title={`移除 ${item.variety_name}`} onClick={() => removeSelectedVariety(item.id)}><X size={13} /></button></span>)}</div><input value={varietyKeyword} onFocus={() => setVarietyOptionsOpen(true)} onMouseDown={(event) => { if (document.activeElement === event.currentTarget) { event.preventDefault(); setVarietyOptionsOpen((current) => !current); } }} onKeyDown={(event) => { if (event.key === "Escape") setVarietyOptionsOpen(false); if (event.key === "ArrowDown") setVarietyOptionsOpen(true); }} onChange={(event) => { setVarietyKeyword(event.target.value); setVarietyOptionsOpen(true); }} placeholder="输入品种名称或别名进行模糊搜索" autoComplete="off" /><button className="variety-combobox-toggle" type="button" title={varietyOptionsOpen ? "收起候选品种" : "展开候选品种"} aria-label={varietyOptionsOpen ? "收起候选品种" : "展开候选品种"} aria-expanded={varietyOptionsOpen} onMouseDown={(event) => event.preventDefault()} onClick={() => setVarietyOptionsOpen((current) => !current)}><ChevronDown size={16} /></button>{varietyOptionsOpen && <div className="variety-option-list" role="listbox">{varietySearching ? <span className="variety-option-note"><LoaderCircle size={14} className="spin" />正在搜索已发布品种</span> : varietyOptions.length ? varietyOptions.map((item) => <button type="button" role="option" key={item.id} aria-selected={selectedVarieties.some((selected) => selected.id === item.id)} onMouseDown={(event) => event.preventDefault()} onClick={() => selectVariety(item)}><strong>{item.variety_name}</strong><span>{item.aliases?.length ? `别名：${item.aliases.join("、")}` : "暂无别名"}{item.approval_number ? ` · ${item.approval_number}` : ""}</span></button>) : <span className="variety-option-note">没有匹配的已发布品种或别名。</span>}</div>}</div><small>点击输入框或右侧箭头展开/收起候选品种；不选择名称时，可按下方数值条件查询全部已发布品种/材料。</small></div>
+      <label className="structured-name-input"><span>关键词（可选）</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="输入材料、试验、地点、性状、处理或数据集名称" /><small>关键词只在当前数据类型标记为可搜索的字段中进行模糊匹配。</small></label>
 
       <section className="structured-field-section">
-        <div className="structured-section-title"><div><strong>展示字段</strong><span>勾选查询结果中需要展示的标准字段</span></div><button className="text-button" type="button" onClick={toggleAllTraits}>{allSelected ? "取消全选" : "全选全部字段"}</button></div>
+        <div className="structured-section-title"><div><strong>展示字段</strong><span>勾选结果中需要展示的课题业务字段</span></div><button className="text-button" type="button" onClick={toggleAllFields}>{allSelected ? "取消全选" : "全选全部字段"}</button></div>
         <div className="structured-field-grid">
-          {traitFields.map((field) => <label className="structured-field-option" key={field.code}><input type="checkbox" checked={selectedTraitCodes.includes(field.code)} onChange={() => toggleTrait(field.code)} /><span>{fieldLabel(field)}</span></label>)}
+          {fields.map((field) => <label className="structured-field-option" key={field.code}><input type="checkbox" checked={selectedFieldCodes.includes(field.code)} onChange={() => toggleField(field.code)} /><span>{fieldLabel(field)}</span></label>)}
         </div>
       </section>
 
       <section className="structured-filter-section">
-        <div className="structured-section-title"><div><strong>数值筛选条件</strong><span>可选，最多 6 条；同一字段可添加上下限，形成区间。</span></div><button className="secondary-button" type="button" onClick={addFilter} disabled={filters.length >= 6}><Plus size={15} />新增条件</button></div>
-        {!filters.length && <div className="structured-filter-empty">未添加条件时，将按名称或已发布数据范围查询。</div>}
-        {filters.map((filter, index) => <div className="structured-filter-row" key={`${filter.trait_code}-${index}`}>
-          <select value={filter.trait_code} onChange={(event) => updateFilter(index, { trait_code: event.target.value })}>{traitFields.map((field) => <option value={field.code} key={field.code}>{fieldLabel(field)}</option>)}</select>
-          <select value={filter.operator} onChange={(event) => updateFilter(index, { operator: event.target.value })}>{QUERY_OPERATORS.map((operator) => <option value={operator.value} key={operator.value}>{operator.label}</option>)}</select>
-          <input type="number" step="any" value={filter.value} onChange={(event) => updateFilter(index, { value: event.target.value })} placeholder="数值" />
+        <div className="structured-section-title"><div><strong>筛选条件</strong><span>可选，最多 8 条；支持文本、数值和状态字段的受控筛选。</span></div><button className="secondary-button" type="button" onClick={addFilter} disabled={filters.length >= 8 || !fields.some((item) => item.filterable)}><Plus size={15} />新增条件</button></div>
+        {!filters.length && <div className="structured-filter-empty">未添加条件时，将按关键词或当前课题的全部数据范围查询。</div>}
+        {filters.map((filter, index) => { const filterField = fields.find((field) => field.code === filter.field); const operators = QUERY_OPERATORS.filter((operator) => !operator.kinds || operator.kinds.includes(filterField?.kind)); return <div className="structured-filter-row" key={`${filter.field}-${index}`}>
+          <select value={filter.field} onChange={(event) => updateFilter(index, { field: event.target.value })}>{fields.filter((field) => field.filterable).map((field) => <option value={field.code} key={field.code}>{fieldLabel(field)}</option>)}</select>
+          <select value={filter.operator} onChange={(event) => updateFilter(index, { operator: event.target.value })}>{operators.map((operator) => <option value={operator.value} key={operator.value}>{operator.label}</option>)}</select>
+          {filterField?.kind === "boolean" ? <select value={filter.value} onChange={(event) => updateFilter(index, { value: event.target.value })}><option value="">请选择</option><option value="true">是</option><option value="false">否</option></select> : <input type={["number", "integer"].includes(filterField?.kind) ? "number" : "text"} step={filterField?.kind === "integer" ? "1" : "any"} value={filter.value} onChange={(event) => updateFilter(index, { value: event.target.value })} placeholder="筛选值" />}
           <button className="icon-button" type="button" title="移除此筛选条件" onClick={() => removeFilter(index)}><X size={16} /></button>
-        </div>)}
+        </div>; })}
       </section>
 
       {error && <div className="structured-query-error">{error}</div>}
-      <div className="structured-query-actions"><button className="primary-button" type="submit" disabled={running}><Search size={17} />{running ? "正在查询" : "查询已发布标准数据"}</button></div>
+      <div className="structured-query-actions"><button className="primary-button" type="submit" disabled={running}><Search size={17} />{running ? "正在查询" : "查询当前课题数据"}</button></div>
     </form>}
 
     {result && <section className="structured-query-result">
-      <div className="structured-result-heading"><div><h3>查询结果</h3><span>命中 {result.record_count} 个品种/材料，共 {result.observation_count} 条已发布字段记录。</span></div><div className="structured-result-actions"><span>查询模板：{result.template_code || "—"}</span><button className="secondary-button" type="button" onClick={exportCsv} disabled={!result.records?.length}><FileText size={15} />导出 CSV</button></div></div>
-      <div className="table-scroll structured-result-table"><table><thead><tr><th>{identityField?.name || "品种/材料名称"}</th><th>别名</th>{selectedFields.map((field) => <th key={field.code}>{fieldLabel(field)}</th>)}</tr></thead><tbody>{result.records?.length ? result.records.map((record) => <tr key={record.id}><td>{record.variety_name}</td><td>{record.aliases?.join("、") || "—"}</td>{selectedFields.map((field) => <td key={field.code}>{record.traits?.[field.code]?.value ?? "—"}</td>)}</tr>) : <tr><td className="empty-cell" colSpan={selectedFields.length + 2}>没有命中符合条件的已发布标准数据。</td></tr>}</tbody></table></div>
+      <div className="structured-result-heading"><div><h3>{result.dataset_title}查询结果</h3><span>本次返回 {result.record_count} 条记录{result.has_more ? "，仍有更多数据，可继续细化条件" : ""}。</span></div><div className="structured-result-actions"><span>数据边界：当前课题</span><button className="secondary-button" type="button" onClick={exportCsv} disabled={!result.records?.length}><FileText size={15} />导出 CSV</button></div></div>
+      <div className="table-scroll structured-result-table"><table><thead><tr>{(result.fields || []).map((field) => <th key={field.code}>{fieldLabel(field)}</th>)}</tr></thead><tbody>{result.records?.length ? result.records.map((record) => <tr key={record.id}>{(result.fields || []).map((field) => { const value = record[field.code]; return <td key={field.code}>{value == null || value === "" ? "—" : typeof value === "object" ? JSON.stringify(value) : String(value)}</td>; })}</tr>) : <tr><td className="empty-cell" colSpan={Math.max(result.fields?.length || 0, 1)}>当前课题没有符合条件的数据。</td></tr>}</tbody></table></div>
     </section>}
   </section>;
 }
 
 export default function ResearchAssistant() {
   const [user, setUser] = useState(null);
+  const [projects, setProjects] = useState([]);
+  const [selectedProjectId, setSelectedProjectId] = useState("");
   const [sessions, setSessions] = useState([]);
   const [activeSessionId, setActiveSessionId] = useState("");
   const [messages, setMessages] = useState([]);
@@ -386,7 +368,6 @@ export default function ResearchAssistant() {
   const [pendingImages, setPendingImages] = useState([]);
   const [isDragActive, setIsDragActive] = useState(false);
   const [workspace, setWorkspace] = useState("assistant");
-  const [knowledgeScope, setKnowledgeScope] = useState("both");
   const [accountOpen, setAccountOpen] = useState(false);
   const [showLatestButton, setShowLatestButton] = useState(false);
   const fileInputRef = useRef(null);
@@ -439,7 +420,7 @@ export default function ResearchAssistant() {
     async function loadImagePreviews() {
       const loaded = await Promise.all(missing.map(async (item) => {
         try {
-          const response = await authorizedFetch(`/api/research/attachments/${item.id}/image`);
+          const response = await authorizedFetch(`/api/research/attachments/${item.id}/image?project_id=${encodeURIComponent(selectedProjectId)}`);
           if (!response.ok) throw new Error("图片读取失败");
           return [item.id, URL.createObjectURL(await response.blob())];
         } catch {
@@ -466,17 +447,17 @@ export default function ResearchAssistant() {
 
     void loadImagePreviews();
     return () => { cancelled = true; };
-  }, [attachments]);
+  }, [attachments, selectedProjectId]);
 
   useEffect(() => () => {
     Object.values(imagePreviewUrlsRef.current).forEach((url) => URL.revokeObjectURL(url));
   }, []);
 
-  async function loadConversation(sessionId) {
-    if (!sessionId) return;
+  async function loadConversation(sessionId, projectId = selectedProjectId) {
+    if (!sessionId || !projectId) return;
     const [messageList, attachmentList] = await Promise.all([
-      request(`/api/research/sessions/${sessionId}/messages`),
-      request(`/api/research/sessions/${sessionId}/attachments`),
+      request(`/api/research/sessions/${sessionId}/messages?project_id=${encodeURIComponent(projectId)}`),
+      request(`/api/research/sessions/${sessionId}/attachments?project_id=${encodeURIComponent(projectId)}`),
     ]);
     followLatestRef.current = true;
     setShowLatestButton(false);
@@ -493,31 +474,45 @@ export default function ResearchAssistant() {
     setActiveSessionId(sessionId);
   }
 
-  async function loadSessions(preferredId = "", { reloadConversation = true } = {}) {
-    const sessionList = await request("/api/research/sessions");
+  async function loadSessions(preferredId = "", { reloadConversation = true } = {}, projectId = selectedProjectId) {
+    if (!projectId) {
+      setSessions([]);
+      return [];
+    }
+    const sessionList = await request(`/api/research/sessions?project_id=${encodeURIComponent(projectId)}`);
     setSessions(sessionList);
     const targetId = preferredId || (sessionList.some((item) => item.id === activeSessionId) ? activeSessionId : sessionList[0]?.id);
-    if (targetId && reloadConversation) await loadConversation(targetId);
+    if (targetId && reloadConversation) await loadConversation(targetId, projectId);
     return sessionList;
   }
 
-  async function createSession(title = "新会话") {
+  async function createSession(title = "新会话", projectId = selectedProjectId) {
+    if (!projectId) throw new Error("请先选择课题，再新建会话。");
     const session = await request("/api/research/sessions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ title }),
+      body: JSON.stringify({ title, project_id: projectId }),
     });
-    await loadSessions(session.id);
+    await loadSessions(session.id, {}, projectId);
     return session;
   }
 
   useEffect(() => {
     (async () => {
       try {
-        const currentUser = await request("/api/research/me");
+        const [currentUser, projectList] = await Promise.all([
+          request("/api/research/me"),
+          request("/api/data-spine/projects"),
+        ]);
         setUser(currentUser);
-        const currentSessions = await loadSessions();
-        if (!currentSessions.length) await createSession();
+        setProjects(projectList);
+        const remembered = window.localStorage.getItem("longyun-research-project");
+        const projectId = projectList.some((item) => item.id === remembered) ? remembered : projectList[0]?.id || "";
+        setSelectedProjectId(projectId);
+        if (projectId) {
+          const currentSessions = await loadSessions("", {}, projectId);
+          if (!currentSessions.length) await createSession("新会话", projectId);
+        }
       } catch (error) {
         setNotice(error.message);
       } finally {
@@ -526,12 +521,27 @@ export default function ResearchAssistant() {
     })();
   }, []);
 
+  async function changeProject(projectId) {
+    setSelectedProjectId(projectId);
+    window.localStorage.setItem("longyun-research-project", projectId);
+    setActiveSessionId("");
+    setMessages([]);
+    setAttachments([]);
+    setComposerAttachmentIds([]);
+    try {
+      const projectSessions = await loadSessions("", {}, projectId);
+      if (!projectSessions.length) await createSession("新会话", projectId);
+    } catch (error) {
+      setNotice(error.message);
+    }
+  }
+
   async function renameSession(targetSession) {
     if (!targetSession) return;
     const title = window.prompt("会话名称", targetSession.title);
     if (!title?.trim()) return;
     try {
-      await request(`/api/research/sessions/${targetSession.id}`, {
+      await request(`/api/research/sessions/${targetSession.id}?project_id=${encodeURIComponent(selectedProjectId)}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: title.trim() }),
@@ -545,12 +555,12 @@ export default function ResearchAssistant() {
   async function deleteSession(targetSession) {
     if (!targetSession || !window.confirm(`删除“${targetSession.title}”及其私有附件、解析文本和上下文？此操作不可恢复。`)) return;
     try {
-      await request(`/api/research/sessions/${targetSession.id}`, { method: "DELETE" });
-      const remaining = await request("/api/research/sessions");
+      await request(`/api/research/sessions/${targetSession.id}?project_id=${encodeURIComponent(selectedProjectId)}`, { method: "DELETE" });
+      const remaining = await request(`/api/research/sessions?project_id=${encodeURIComponent(selectedProjectId)}`);
       setSessions(remaining);
       if (targetSession.id === activeSessionId) {
         if (remaining[0]) await loadConversation(remaining[0].id);
-        else await createSession();
+        else await createSession("新会话", selectedProjectId);
       }
     } catch (error) {
       setNotice(error.message);
@@ -572,10 +582,10 @@ export default function ResearchAssistant() {
       for (const file of files) {
         const form = new FormData();
         form.append("file", file);
-        const created = await request(`/api/research/sessions/${activeSessionId}/attachments`, { method: "POST", body: form });
+        const created = await request(`/api/research/sessions/${activeSessionId}/attachments?project_id=${encodeURIComponent(selectedProjectId)}`, { method: "POST", body: form });
         uploadedIds.push(created.id);
       }
-      const attachmentList = await request(`/api/research/sessions/${activeSessionId}/attachments`);
+      const attachmentList = await request(`/api/research/sessions/${activeSessionId}/attachments?project_id=${encodeURIComponent(selectedProjectId)}`);
       setAttachments(attachmentList);
       setComposerAttachmentIds((current) => [...new Set([...current, ...uploadedIds])]);
     } catch (error) {
@@ -614,7 +624,7 @@ export default function ResearchAssistant() {
 
   async function removeAttachment(attachmentId) {
     try {
-      await request(`/api/research/attachments/${attachmentId}`, { method: "DELETE" });
+      await request(`/api/research/attachments/${attachmentId}?project_id=${encodeURIComponent(selectedProjectId)}`, { method: "DELETE" });
       setComposerAttachmentIds((items) => items.filter((item) => item !== attachmentId));
       await loadConversation(activeSessionId);
     } catch (error) {
@@ -638,7 +648,7 @@ export default function ResearchAssistant() {
       return;
     }
     try {
-      setPreview(await request(`/api/research/attachments/${attachment.id}/preview`));
+      setPreview(await request(`/api/research/attachments/${attachment.id}/preview?project_id=${encodeURIComponent(selectedProjectId)}`));
     } catch (error) {
       setNotice(error.message);
     }
@@ -667,7 +677,7 @@ export default function ResearchAssistant() {
 
   async function downloadResearchReport(messageId, automatic = false) {
     try {
-      const response = await authorizedFetch(`/api/research/messages/${messageId}/report.pdf`);
+      const response = await authorizedFetch(`/api/research/messages/${messageId}/report.pdf?project_id=${encodeURIComponent(selectedProjectId)}`);
       if (!response.ok) {
         const payload = await response.json().catch(() => ({}));
         throw new Error(payload.detail || "无法生成 PDF 报告。");
@@ -715,15 +725,25 @@ export default function ResearchAssistant() {
     setMessages((items) => [...items, userEntry, assistantEntry]);
 
     try {
-      const response = await authorizedFetch(`/api/research/sessions/${activeSessionId}/chat/stream`, {
+      const response = await authorizedFetch(`/api/research/sessions/${activeSessionId}/chat/stream?project_id=${encodeURIComponent(selectedProjectId)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content, knowledge_scope: knowledgeScope, attachment_ids: currentTurnAttachmentIds }),
+        body: JSON.stringify({
+          content,
+          knowledge_scope: "both",
+          attachment_ids: currentTurnAttachmentIds,
+          external_data_acknowledged: false,
+        }),
       });
       if (!response.ok || !response.body) {
         const body = await response.json().catch(() => ({}));
         throw new Error(body.detail || "无法开始模型分析。");
       }
+      // The backend has accepted and stored the first question at this point,
+      // including its automatically summarized session title. Refresh only
+      // sidebar metadata now, so the name changes even if model generation
+      // later fails or takes a long time.
+      await loadSessions(activeSessionId, { reloadConversation: false });
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
@@ -751,9 +771,6 @@ export default function ResearchAssistant() {
               // visible button remains available if a browser blocks it.
               void downloadResearchReport(parsed.data.message.id, true);
             }
-            // The streamed answer is already in local state. Refresh only the sidebar
-            // metadata so completing a response never pulls the reader back to the bottom.
-            await loadSessions(activeSessionId, { reloadConversation: false });
           } else if (parsed.event === "error") {
             throw new Error(parsed.data.detail || "模型分析未完成。");
           }
@@ -787,22 +804,32 @@ export default function ResearchAssistant() {
 
   return <div className="research-shell">
     <aside className="research-sidebar">
-      <div className="research-brand"><div className="research-brand-mark brand-logo-mark" aria-hidden="true"><img src="/brand/longyun-agent-logo.png" alt="" /></div><div><strong>{AGENT_NAME}</strong><span>已发布标准数据 + 大模型</span></div></div>
+      <div className="research-brand"><div className="research-brand-mark brand-logo-mark" aria-hidden="true"><img src="/brand/longyun-agent-logo.png" alt="" /></div><div><strong>{AGENT_NAME}</strong><span>课题数据 + 育种智能分析</span></div></div>
       <nav className="research-workspaces" aria-label="科研工作台">
         <section className="research-workspace-group" aria-label="对话">
           <small>对话</small>
           <button type="button" className={workspace === "assistant" ? "active" : ""} onClick={() => setWorkspace("assistant")}><Bot size={16} />{AGENT_NAME}</button>
+          <button type="button" className={workspace === "agent-matrix" ? "active" : ""} onClick={() => setWorkspace("agent-matrix")}><Sparkles size={16} />智能体矩阵</button>
         </section>
         <section className="research-workspace-group" aria-label="管理">
           <small>管理</small>
           <button type="button" className={workspace === "structured" ? "active" : ""} onClick={() => setWorkspace("structured")}><Search size={16} />结构化查询</button>
-          <button type="button" className={workspace === "genotype" ? "active" : ""} onClick={() => setWorkspace("genotype")}><Dna size={16} />基因型导入与质控</button>
+          <button type="button" className={workspace === "variety-evaluation" ? "active" : ""} onClick={() => setWorkspace("variety-evaluation")}><BarChart3 size={16} />品种评价</button>
+          <button type="button" className={workspace === "base-showcase" ? "active" : ""} onClick={() => setWorkspace("base-showcase")}><Building2 size={16} />基地展示大屏</button>
+          <button type="button" className={workspace === "single-plants" ? "active" : ""} onClick={() => setWorkspace("single-plants")}><Sprout size={16} />单株管理</button>
           <button type="button" className={workspace === "skills" ? "active" : ""} onClick={() => setWorkspace("skills")}><Sparkles size={16} />技能库</button>
           <button type="button" className={workspace === "knowledge" ? "active" : ""} onClick={() => setWorkspace("knowledge")}><FileText size={16} />知识库</button>
           <button type="button" className={workspace === "results" ? "active" : ""} onClick={() => setWorkspace("results")}><FileDown size={16} />结果库</button>
         </section>
       </nav>
-      <button className="new-session-button" onClick={() => createSession()}><MessageSquarePlus size={17} />新建会话</button>
+      <label className="research-project-select">
+        <span>当前课题</span>
+        <select value={selectedProjectId} onChange={(event) => changeProject(event.target.value)}>
+          {!projects.length && <option value="">暂无可用课题</option>}
+          {projects.map((project) => <option key={project.id} value={project.id}>{project.project_name}</option>)}
+        </select>
+      </label>
+      <button className="new-session-button" onClick={() => createSession()} disabled={!selectedProjectId}><MessageSquarePlus size={17} />新建会话</button>
       <div className="conversation-list" aria-label="历史会话">
         <small>历史会话</small>
         {sessions.map((item) => <div key={item.id} className={`conversation-item-row ${item.id === activeSessionId ? "active" : ""}`}><button className="conversation-item" onClick={() => loadConversation(item.id)}>{item.title}</button><div className="conversation-item-actions"><button title="重命名会话" onClick={() => renameSession(item)}><Pencil size={14} /></button><button className="delete" title="删除会话" onClick={() => deleteSession(item)}><Trash2 size={14} /></button></div></div>)}
@@ -810,12 +837,12 @@ export default function ResearchAssistant() {
       <div className="research-sidebar-bottom">
         {accountOpen && <div className="research-account-menu"><div><strong>{user?.display_name || user?.username}</strong><span>科研人员 · 已验证登录</span></div><button type="button" onClick={() => keycloak.logout({ redirectUri: window.location.origin })}><LogOut size={15} />退出登录</button></div>}
         <button className={`research-account ${accountOpen ? "expanded" : ""}`} type="button" aria-expanded={accountOpen} onClick={() => setAccountOpen((current) => !current)}><UserRound size={17} /><div><strong>{user?.display_name || user?.username}</strong><span>科研人员</span></div><ChevronDown size={15} /></button>
-        <div className="research-sidebar-foot"><ShieldCheck size={16} /><span>私有附件与会话按登录账号隔离</span></div>
+        <div className="research-sidebar-foot"><ShieldCheck size={16} /><span>会话、附件、任务与结果按当前课题和登录账号双重隔离</span></div>
       </div>
     </aside>
 
-    <main className={`research-main ${workspace === "knowledge" ? "knowledge-main" : workspace === "structured" ? "structured-main" : workspace === "gwas" ? "gwas-main" : workspace === "genotype" ? "genotype-main" : workspace === "skills" ? "skills-main" : workspace === "results" ? "results-main" : ""}`}>
-      {workspace !== "knowledge" && workspace !== "results" && workspace !== "skills" && <header className="research-topbar"><div><p>{workspace === "gwas" ? "固定生信工作流 · 确认后执行" : workspace === "genotype" ? "私有基因型数据 · 后端受控质控" : "仅查询已发布标准数据"}</p><h1>{workspace === "assistant" ? activeSession?.title || AGENT_NAME : workspace === "gwas" ? "水稻连续性状 GWAS" : workspace === "genotype" ? "基因型导入与水稻专用质控" : "结构化查询"}</h1></div></header>}
+    <main className={`research-main ${workspace === "knowledge" ? "knowledge-main" : workspace === "agent-matrix" ? "agent-matrix-main" : workspace === "structured" ? "structured-main" : workspace === "gwas" ? "gwas-main" : workspace === "single-plants" ? "single-plants-main" : workspace === "variety-evaluation" ? "decision-main" : workspace === "base-showcase" ? "base-showcase-main" : workspace === "skills" ? "skills-main" : workspace === "results" ? "results-main" : ""}`}>
+      {workspace !== "knowledge" && workspace !== "results" && workspace !== "skills" && workspace !== "single-plants" && workspace !== "variety-evaluation" && workspace !== "base-showcase" && <header className="research-topbar"><div><p>{workspace === "gwas" ? "固定生信工作流 · 确认后执行" : workspace === "structured" ? "当前账号授权课题数据" : "课题数据与智能分析"}</p><h1>{workspace === "assistant" ? activeSession?.title || AGENT_NAME : workspace === "gwas" ? "水稻连续性状 GWAS" : "结构化查询"}</h1></div></header>}
 
       {notice && <div className="assistant-notice"><span>{notice}</span><button title="关闭提示" onClick={() => setNotice("")}><X size={16} /></button></div>}
 
@@ -870,13 +897,12 @@ export default function ResearchAssistant() {
           <div className="composer-actions">
             <input ref={fileInputRef} hidden type="file" multiple accept=".pdf,.docx,.xlsx,.xls,.pptx,.txt,.md,.markdown,.html,.htm,.csv,.json,.xml,.png,.jpg,.jpeg,.webp" onChange={uploadFileInput} />
             <button className="icon-button" type="button" title="上传、粘贴或拖入当前会话附件（单个不超过 10 MB）" onClick={() => fileInputRef.current?.click()} disabled={uploading}><Paperclip size={18} /></button>
-            <label className="knowledge-scope-select">知识库<select value={knowledgeScope} onChange={(event) => setKnowledgeScope(event.target.value)}><option value="both">我的 + 公共</option><option value="private">仅我的</option><option value="public">仅公共</option></select></label>
             <span>{uploading ? "正在保存附件" : sending ? "模型正在生成，可继续编辑下一条问题或添加图片；当前问题完成后再发送" : "图片原图直接送入多模态视觉分析；PDF、Office、表格和文本在本地解析；按 Enter 发送，Shift + Enter 换行"}</span>
             <button className="primary-button send-button" type="submit" disabled={!draft.trim() || sending || uploading}><SendHorizontal size={17} />发送</button>
           </div>
         </form>
       </section>
-      </> : workspace === "structured" ? <StructuredQueryPanel onNotice={setNotice} /> : workspace === "gwas" ? <GwasWorkspace onNotice={setNotice} /> : workspace === "genotype" ? <GenotypeAssetsWorkspace onNotice={setNotice} /> : workspace === "skills" ? <SkillLibrary onNotice={setNotice} onOpenWorkspace={openResearchSkill} /> : workspace === "knowledge" ? <KnowledgeLibrary onNotice={setNotice} /> : <ResultsLibrary onNotice={setNotice} />}
+      </> : workspace === "agent-matrix" ? <MultiAgentWorkspace sessionId={activeSessionId} attachmentIds={composerAttachmentIds} onNotice={setNotice} projectId={selectedProjectId} /> : workspace === "structured" ? <StructuredQueryPanel onNotice={setNotice} projectId={selectedProjectId} /> : workspace === "gwas" ? <GwasWorkspace onNotice={setNotice} projectId={selectedProjectId} /> : workspace === "variety-evaluation" ? <VarietyEvaluationWorkspace onNotice={setNotice} projectId={selectedProjectId} /> : workspace === "base-showcase" ? <BaseShowcaseWorkspace onNotice={setNotice} projectId={selectedProjectId} /> : workspace === "single-plants" ? <SinglePlantResearchWorkspace onNotice={setNotice} projectId={selectedProjectId} /> : workspace === "skills" ? <SkillLibrary onNotice={setNotice} onOpenWorkspace={openResearchSkill} /> : workspace === "knowledge" ? <KnowledgeLibrary onNotice={setNotice} projectId={selectedProjectId} /> : <ResultsLibrary onNotice={setNotice} projectId={selectedProjectId} />}
     </main>
 
     {preview && <div className="attachment-preview-backdrop" onMouseDown={() => setPreview(null)}><section className={`attachment-preview ${preview.image_url ? "image-preview" : ""}`} onMouseDown={(event) => event.stopPropagation()}><header><div><p>{preview.image_url ? "当前会话私有原图" : "本地解析文字预览"}</p><h2>{preview.file_name}</h2></div><button className="icon-button" title="关闭预览" onClick={() => setPreview(null)}><X size={17} /></button></header>{preview.parser_warnings?.map((warning) => <div className="preview-warning" key={warning}>{warning}</div>)}{preview.image_url ? <div className="attachment-image-full"><img src={preview.image_url} alt={preview.file_name} /></div> : <pre>{preview.preview || "该附件未解析出可预览文本。"}</pre>}{preview.preview_truncated && <small>预览仅显示前 60,000 个字符；完整文本仍仅保存在当前会话的私有附件中。</small>}</section></div>}
