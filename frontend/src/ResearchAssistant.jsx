@@ -33,7 +33,6 @@ import GwasWorkspace from "./GwasWorkspace";
 import SkillLibrary from "./SkillLibrary";
 import { SinglePlantResearchWorkspace } from "./SinglePlantWorkspace";
 import { BaseShowcaseWorkspace, VarietyEvaluationWorkspace } from "./BreedingDecisionWorkspaces";
-import MultiAgentWorkspace from "./MultiAgentWorkspace";
 
 const AGENT_NAME = "隆耘 Agent 育种智能体";
 
@@ -809,7 +808,6 @@ export default function ResearchAssistant() {
         <section className="research-workspace-group" aria-label="对话">
           <small>对话</small>
           <button type="button" className={workspace === "assistant" ? "active" : ""} onClick={() => setWorkspace("assistant")}><Bot size={16} />{AGENT_NAME}</button>
-          <button type="button" className={workspace === "agent-matrix" ? "active" : ""} onClick={() => setWorkspace("agent-matrix")}><Sparkles size={16} />智能体矩阵</button>
         </section>
         <section className="research-workspace-group" aria-label="管理">
           <small>管理</small>
@@ -841,7 +839,7 @@ export default function ResearchAssistant() {
       </div>
     </aside>
 
-    <main className={`research-main ${workspace === "knowledge" ? "knowledge-main" : workspace === "agent-matrix" ? "agent-matrix-main" : workspace === "structured" ? "structured-main" : workspace === "gwas" ? "gwas-main" : workspace === "single-plants" ? "single-plants-main" : workspace === "variety-evaluation" ? "decision-main" : workspace === "base-showcase" ? "base-showcase-main" : workspace === "skills" ? "skills-main" : workspace === "results" ? "results-main" : ""}`}>
+    <main className={`research-main ${workspace === "knowledge" ? "knowledge-main" : workspace === "structured" ? "structured-main" : workspace === "gwas" ? "gwas-main" : workspace === "single-plants" ? "single-plants-main" : workspace === "variety-evaluation" ? "decision-main" : workspace === "base-showcase" ? "base-showcase-main" : workspace === "skills" ? "skills-main" : workspace === "results" ? "results-main" : ""}`}>
       {workspace !== "knowledge" && workspace !== "results" && workspace !== "skills" && workspace !== "single-plants" && workspace !== "variety-evaluation" && workspace !== "base-showcase" && <header className="research-topbar"><div><p>{workspace === "gwas" ? "固定生信工作流 · 确认后执行" : workspace === "structured" ? "当前账号授权课题数据" : "课题数据与智能分析"}</p><h1>{workspace === "assistant" ? activeSession?.title || AGENT_NAME : workspace === "gwas" ? "水稻连续性状 GWAS" : "结构化查询"}</h1></div></header>}
 
       {notice && <div className="assistant-notice"><span>{notice}</span><button title="关闭提示" onClick={() => setNotice("")}><X size={16} /></button></div>}
@@ -902,7 +900,7 @@ export default function ResearchAssistant() {
           </div>
         </form>
       </section>
-      </> : workspace === "agent-matrix" ? <MultiAgentWorkspace sessionId={activeSessionId} attachmentIds={composerAttachmentIds} onNotice={setNotice} projectId={selectedProjectId} /> : workspace === "structured" ? <StructuredQueryPanel onNotice={setNotice} projectId={selectedProjectId} /> : workspace === "gwas" ? <GwasWorkspace onNotice={setNotice} projectId={selectedProjectId} /> : workspace === "variety-evaluation" ? <VarietyEvaluationWorkspace onNotice={setNotice} projectId={selectedProjectId} /> : workspace === "base-showcase" ? <BaseShowcaseWorkspace onNotice={setNotice} projectId={selectedProjectId} /> : workspace === "single-plants" ? <SinglePlantResearchWorkspace onNotice={setNotice} projectId={selectedProjectId} /> : workspace === "skills" ? <SkillLibrary onNotice={setNotice} onOpenWorkspace={openResearchSkill} /> : workspace === "knowledge" ? <KnowledgeLibrary onNotice={setNotice} projectId={selectedProjectId} /> : <ResultsLibrary onNotice={setNotice} projectId={selectedProjectId} />}
+      </> : workspace === "structured" ? <StructuredQueryPanel onNotice={setNotice} projectId={selectedProjectId} /> : workspace === "gwas" ? <GwasWorkspace onNotice={setNotice} projectId={selectedProjectId} /> : workspace === "variety-evaluation" ? <VarietyEvaluationWorkspace onNotice={setNotice} projectId={selectedProjectId} /> : workspace === "base-showcase" ? <BaseShowcaseWorkspace onNotice={setNotice} projectId={selectedProjectId} /> : workspace === "single-plants" ? <SinglePlantResearchWorkspace onNotice={setNotice} projectId={selectedProjectId} /> : workspace === "skills" ? <SkillLibrary onNotice={setNotice} onOpenWorkspace={openResearchSkill} /> : workspace === "knowledge" ? <KnowledgeLibrary onNotice={setNotice} projectId={selectedProjectId} /> : <ResultsLibrary onNotice={setNotice} projectId={selectedProjectId} />}
     </main>
 
     {preview && <div className="attachment-preview-backdrop" onMouseDown={() => setPreview(null)}><section className={`attachment-preview ${preview.image_url ? "image-preview" : ""}`} onMouseDown={(event) => event.stopPropagation()}><header><div><p>{preview.image_url ? "当前会话私有原图" : "本地解析文字预览"}</p><h2>{preview.file_name}</h2></div><button className="icon-button" title="关闭预览" onClick={() => setPreview(null)}><X size={17} /></button></header>{preview.parser_warnings?.map((warning) => <div className="preview-warning" key={warning}>{warning}</div>)}{preview.image_url ? <div className="attachment-image-full"><img src={preview.image_url} alt={preview.file_name} /></div> : <pre>{preview.preview || "该附件未解析出可预览文本。"}</pre>}{preview.preview_truncated && <small>预览仅显示前 60,000 个字符；完整文本仍仅保存在当前会话的私有附件中。</small>}</section></div>}
