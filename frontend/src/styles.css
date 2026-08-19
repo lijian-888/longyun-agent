@@ -346,3 +346,16 @@ body:has(.research-shell), body:has(.assistant-loading), body:has(.auth-error) {
 .governance-resolved p { margin: 4px 0; color: #496f60; font-weight: 400; }
 .governance-resolved small { color: #799287; }
 @media (max-width: 760px) { .governance-resolution { grid-template-columns: 1fr; }.governance-resolution button { justify-self: start; }.genotype-governance-card header { align-items: flex-start; flex-direction: column; } }
+
+.template-admin-intro { border-left: 4px solid #2f8a6c; }
+.template-group-stats { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 13px; }
+.template-group-stats span { border: 1px solid #d6e6de; border-radius: 999px; padding: 6px 10px; color: #4a7465; background: #f8fcfa; font-size: 12px; }
+.template-group { display: grid; gap: 10px; }
+.template-group > header { display: flex; align-items: baseline; gap: 10px; color: #315d50; }
+.template-group > header strong { font-size: 15px; }
+.template-group > header span { color: #718b81; font-size: 12px; }
+.template-compatibility { border: 1px solid #d9e6df; border-radius: 6px; background: #f8fbf9; padding: 12px; }
+.template-compatibility summary { cursor: pointer; color: #486e61; font-size: 13px; font-weight: 600; }
+.template-compatibility[open] summary { margin-bottom: 12px; }
+.field-chip-list span small { display: inline-block; margin-right: 5px; border-right: 1px solid #c9ddd3; padding-right: 5px; color: #6f8e82; font-size: 10px; }
+@media (max-width: 760px) { .template-grid { grid-template-columns: 1fr; }.template-group > header { display: grid; gap: 3px; } }

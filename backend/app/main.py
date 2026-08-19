@@ -1302,7 +1302,19 @@ def seed_data(session: Session) -> None:
     session.commit()
 
 
+LEGACY_INTAKE_TEMPLATE_CODES = frozenset({"rice_data_center", "rice_root_phenotype"})
+STRUCTURED_GOVERNANCE_TEMPLATE_CODES = frozenset({
+    "germplasm_master",
+    "pedigree_relationship",
+    "field_trial_package",
+    "single_plant_master",
+    "genotype_dataset",
+    "knowledge_document",
+})
+
+
 def serialize_template(template: DataTemplate, version: TemplateVersion | None) -> dict[str, Any]:
+    is_structured_governance = template.template_code in STRUCTURED_GOVERNANCE_TEMPLATE_CODES
     return {
         "id": template.id,
         "template_code": template.template_code,
@@ -1315,13 +1327,59 @@ def serialize_template(template: DataTemplate, version: TemplateVersion | None) 
         "current_version_id": version.id if version else None,
         "change_summary": version.change_summary if version else "",
         "fields": version.field_definitions if version else [],
+        "template_group": "structured_governance" if is_structured_governance else "legacy_intake",
+        "intake_supported": template.template_code in LEGACY_INTAKE_TEMPLATE_CODES,
     }
 
 
 def seed_templates(session: Session) -> None:
+    germplasm_fields = [
+        {"code": "material_code", "name": "材料编码", "kind": "identifier", "required": False, "aliases": ["种质编号", "材料编号", "品系编号"]},
+        {"code": "variety_name", "name": "材料名称", "kind": "identifier", "required": True, "aliases": ["种质名称", "品种名称", "品系名称"]},
+        {"code": "variety_type", "name": "材料类型", "kind": "attribute", "required": False, "aliases": ["种质类型", "品种类型"]},
+        {"code": "aliases", "name": "别名", "kind": "attribute", "required": False, "aliases": ["曾用名", "其他名称"]},
+        {"code": "breeding_unit", "name": "选育单位", "kind": "attribute", "required": False, "aliases": ["育种单位", "来源单位"]},
+        {"code": "approval_number", "name": "审定编号", "kind": "attribute", "required": False, "aliases": ["审定号"]},
+    ]
+    pedigree_fields = [
+        {"code": "material_code", "name": "子代材料编码", "kind": "identifier", "required": False, "aliases": ["后代编号", "子代编号"]},
+        {"code": "variety_name", "name": "子代材料名称", "kind": "basic", "required": True, "aliases": ["子代", "子代材料"]},
+        {"code": "female_parent", "name": "母本名称或编码", "kind": "basic", "required": False, "aliases": ["母本", "母本编号"]},
+        {"code": "male_parent", "name": "父本名称或编码", "kind": "basic", "required": False, "aliases": ["父本", "父本编号"]},
+    ]
+    trial_fields = [
+        {"code": "trial_code", "name": "试验编号", "kind": "identifier", "required": True, "aliases": ["试验编码"]},
+        {"code": "site_code", "name": "试点编号", "kind": "identifier", "required": True, "aliases": ["地点编号"]},
+        {"code": "material_code", "name": "材料编码", "kind": "identifier", "required": True, "aliases": ["种质编号"]},
+        {"code": "plot_no", "name": "小区号", "kind": "identifier", "required": True, "aliases": ["小区编号"]},
+        {"code": "trial_year", "name": "试验年份", "kind": "attribute", "required": True, "aliases": ["年份"]},
+    ]
+    single_plant_fields = [
+        {"code": "sample_code", "name": "单株编号", "kind": "identifier", "required": True, "aliases": ["样本编号"]},
+        {"code": "material_code", "name": "材料编码", "kind": "identifier", "required": True, "aliases": ["种质编号"]},
+        {"code": "trial_code", "name": "试验编号", "kind": "identifier", "required": False, "aliases": ["试验编码"]},
+        {"code": "plot_no", "name": "小区号", "kind": "identifier", "required": False, "aliases": ["小区编号"]},
+    ]
+    genotype_fields = [
+        {"code": "sample_id", "name": "基因型样本编号", "kind": "identifier", "required": True, "aliases": ["IID", "样本号"]},
+        {"code": "material_code", "name": "材料编码", "kind": "identifier", "required": True, "aliases": ["种质编号"]},
+        {"code": "reference_assembly", "name": "参考基因组版本", "kind": "attribute", "required": True, "aliases": ["参考版本", "GenomeBuild"]},
+    ]
+    knowledge_fields = [
+        {"code": "display_title", "name": "资料标题", "kind": "attribute", "required": True, "aliases": ["标题", "文献标题"]},
+        {"code": "source_organization", "name": "来源单位", "kind": "attribute", "required": True, "aliases": ["发布单位", "机构"]},
+        {"code": "publication_year", "name": "发布年份", "kind": "attribute", "required": False, "aliases": ["年份"]},
+        {"code": "source_url", "name": "来源链接", "kind": "attribute", "required": False, "aliases": ["URL", "DOI"]},
+    ]
     seeds = [
         ("rice_data_center", "国家水稻数据中心信息标准", "水稻品种与地上部表型", "phenotype_observation", "用于国家水稻数据中心网页、审定资料及同类品种表型数据的归集。", national_template_fields()),
         ("rice_root_phenotype", "水稻根系表型数据标准", "水稻根系表型", "root_phenotype_observation", "用于根系扫描、根系成像和人工测量等根系表型数据。", root_template_fields()),
+        ("germplasm_master", "种质主数据模板", "种质资源主档", "breeding_material", "用于建立平台内稳定的材料编码、名称和别名，是跨文件关联的首要基础。", germplasm_fields),
+        ("pedigree_relationship", "材料系谱关系模板", "亲本与后代关系", "variety_basic", "使用子代、母本和父本语义字段表达系谱关系，并兼容不同来源的原始列名。", pedigree_fields),
+        ("field_trial_package", "多年多点试验资料包模板", "试验、环境、管理与表型", "trial_data_package", "用于治理试验设计、小区布局、环境管理和表型观测组成的关联资料包。", trial_fields),
+        ("single_plant_master", "单株主数据模板", "材料下的单株与样本", "biological_sample", "用于把单株、试验小区、表型照片和后续基因型样本关联起来。", single_plant_fields),
+        ("genotype_dataset", "基因型数据与样本映射模板", "VCF/PLINK 与材料映射", "genotype_asset", "用于登记参考版本，并将基因型样本编号映射到种质材料或单株。", genotype_fields),
+        ("knowledge_document", "育种文献与情报元数据模板", "公共文献与行业情报", "knowledge_document", "用于维护资料来源、版本和可追溯元数据；正文由本地解析与索引流程处理。", knowledge_fields),
     ]
     for code, name, scope, target, description, fields in seeds:
         template = session.scalar(select(DataTemplate).where(DataTemplate.template_code == code))
@@ -1342,7 +1400,7 @@ def get_template_version(session: Session, version_id: str | None) -> tuple[Data
     if not version:
         raise HTTPException(422, "请选择一套已发布的处理标准模板。")
     template = session.get(DataTemplate, version.template_id)
-    if not template or template.status != "published" or version.status != "published":
+    if not template or template.template_code not in LEGACY_INTAKE_TEMPLATE_CODES or template.status != "published" or version.status != "published":
         raise HTTPException(422, "所选标准模板不可用，请选择已发布版本。")
     return template, version
 
@@ -1393,7 +1451,7 @@ def infer_template_from_spreadsheet(session: Session, filename: str, content: by
     if not headers:
         return selected_template, selected_version, False
     candidates: list[tuple[DataTemplate, TemplateVersion]] = []
-    for template in session.scalars(select(DataTemplate).where(DataTemplate.status == "published")).all():
+    for template in session.scalars(select(DataTemplate).where(DataTemplate.status == "published", DataTemplate.template_code.in_(LEGACY_INTAKE_TEMPLATE_CODES))).all():
         version = session.get(TemplateVersion, template.current_version_id)
         if version and version.status == "published":
             candidates.append((template, version))
@@ -1656,6 +1714,7 @@ class TemplateVersionCreate(BaseModel):
     action: str = "add_field"
     field_code: str = ""
     field_name: str
+    field_kind: Literal["identifier", "basic", "attribute", "trait"] = "attribute"
     category: str = "扩展性状"
     unit: str = ""
     aliases: list[str] = Field(default_factory=list)
@@ -5017,10 +5076,10 @@ def create_template_version(template_id: str, payload: TemplateVersionCreate, us
     if payload.action == "add_field" and existing:
         raise HTTPException(409, "该标准字段已存在，请选择更新字段或补充别名。")
     if existing:
-        existing.update({"name": payload.field_name, "category": payload.category, "unit": payload.unit, "required": payload.required, "min": payload.min_value, "max": payload.max_value, "severity": payload.severity})
+        existing.update({"name": payload.field_name, "kind": payload.field_kind, "category": payload.category, "unit": payload.unit, "required": payload.required, "min": payload.min_value, "max": payload.max_value, "severity": payload.severity})
         existing["aliases"] = list(dict.fromkeys([*(existing.get("aliases") or []), *payload.aliases]))
     else:
-        fields.append({"code": field_code, "name": payload.field_name, "category": payload.category, "unit": payload.unit, "aliases": payload.aliases, "required": payload.required, "kind": "trait", "min": payload.min_value, "max": payload.max_value, "severity": payload.severity})
+        fields.append({"code": field_code, "name": payload.field_name, "category": payload.category, "unit": payload.unit, "aliases": payload.aliases, "required": payload.required, "kind": payload.field_kind, "min": payload.min_value, "max": payload.max_value, "severity": payload.severity})
     match = re.match(r"v(\d+)\.(\d+)", current.version)
     next_version = f"v{match.group(1)}.{int(match.group(2)) + 1}" if match else "v1.1"
     version = TemplateVersion(template_id=template.id, version=next_version, change_summary=payload.change_summary, field_definitions=fields, created_by=payload.actor)

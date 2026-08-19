@@ -97,9 +97,10 @@ function App({ user, accessRole = "data_processor" }) {
         setWorkbench(board);
         setCatalog(traitCatalog.traits);
         setManageVarieties(editableVarieties);
-        setTemplates(templateList);
+        const intakeTemplates = templateList.filter((template) => template.intake_supported);
+        setTemplates(intakeTemplates);
         setGenotypeGovernanceRequests(governanceRows);
-        setTemplateVersionId((current) => current || templateList[0]?.current_version_id || "");
+        setTemplateVersionId((current) => intakeTemplates.some((template) => template.current_version_id === current) ? current : intakeTemplates[0]?.current_version_id || "");
       } else {
         const [summary, ruleList, traitCatalog, templateList, requests] = await Promise.all([
           request("/api/dashboard"),
@@ -307,7 +308,7 @@ function App({ user, accessRole = "data_processor" }) {
     const optionalNumber = (name) => form.get(name) === "" ? null : Number(form.get(name));
     try {
       await request(`/api/templates/${form.get("template_id")}/versions`, jsonRequest("POST", {
-        change_summary: form.get("change_summary"), action: form.get("action"), field_code: form.get("field_code"), field_name: form.get("field_name"), category: form.get("category"), unit: form.get("unit"), aliases: String(form.get("aliases") || "").split(/[、,，]/).map((item) => item.trim()).filter(Boolean), required: form.get("required") === "on", min_value: optionalNumber("min_value"), max_value: optionalNumber("max_value"), severity: form.get("severity"), request_id: form.get("request_id") || null, actor: role.user,
+        change_summary: form.get("change_summary"), action: form.get("action"), field_code: form.get("field_code"), field_name: form.get("field_name"), field_kind: form.get("field_kind"), category: form.get("category"), unit: form.get("unit"), aliases: String(form.get("aliases") || "").split(/[、,，]/).map((item) => item.trim()).filter(Boolean), required: form.get("required") === "on", min_value: optionalNumber("min_value"), max_value: optionalNumber("max_value"), severity: form.get("severity"), request_id: form.get("request_id") || null, actor: role.user,
       }));
       setMessage("已发布模板新版本；变更说明和字段快照已保留。数据员可选择新版本重新处理待处理来源。 ");
       await loadBase();
@@ -544,15 +545,26 @@ function ImportPreview({ preview, updatePreviewCandidate, commitPreview, commitA
 }
 
 function TemplateCenter({ templates, requests, createTemplateVersion }) {
-  const [selectedTemplateId, setSelectedTemplateId] = useState(templates[0]?.id || "");
-  const selectedTemplate = templates.find((item) => item.id === selectedTemplateId) || templates[0];
-  useEffect(() => { if (!selectedTemplateId && templates[0]) setSelectedTemplateId(templates[0].id); }, [templates, selectedTemplateId]);
+  const structuredOrder = ["germplasm_master", "pedigree_relationship", "field_trial_package", "single_plant_master", "genotype_dataset", "knowledge_document"];
+  const structuredTemplates = templates.filter((item) => item.template_group === "structured_governance").sort((left, right) => structuredOrder.indexOf(left.template_code) - structuredOrder.indexOf(right.template_code));
+  const compatibilityTemplates = templates.filter((item) => item.template_group !== "structured_governance");
+  const defaultTemplate = structuredTemplates[0] || templates[0];
+  const [selectedTemplateId, setSelectedTemplateId] = useState(defaultTemplate?.id || "");
+  const selectedTemplate = templates.find((item) => item.id === selectedTemplateId) || defaultTemplate;
+  useEffect(() => {
+    if (defaultTemplate && !templates.some((item) => item.id === selectedTemplateId)) setSelectedTemplateId(defaultTemplate.id);
+  }, [templates, selectedTemplateId, defaultTemplate]);
   const pendingRequests = requests.filter((item) => item.status === "pending");
-  return <div className="page-stack"><section className="template-grid">{templates.map((item) => <button key={item.id} className={selectedTemplate?.id === item.id ? "template-card selected" : "template-card"} onClick={() => setSelectedTemplateId(item.id)}><span>{item.data_scope}</span><strong>{item.template_name}</strong><small>{item.current_version} · 正式表：{item.target_table}</small><p>{item.description}</p></button>)}</section>
+  const kindLabel = { identifier: "业务标识", basic: "基础字段", attribute: "属性字段", trait: "性状字段" };
+  const templateCards = (items) => items.map((item) => <button key={item.id} className={selectedTemplate?.id === item.id ? "template-card selected" : "template-card"} onClick={() => setSelectedTemplateId(item.id)}><span>{item.data_scope}</span><strong>{item.template_name}</strong><small>{item.current_version} · 目标表：{item.target_table}</small><p>{item.description}</p></button>);
+  return <div className="page-stack template-admin-page">
+    <section className="panel template-admin-intro"><PanelTitle icon={ShieldCheck} title="六套结构化模板已恢复" note="当前仍是单机构系统。这里管理统一语义字段、别名、必填规则和版本；模板定义不会引入机构、租户或跨机构数据路由。" /><div className="template-group-stats"><span>结构化治理模板 <strong>{structuredTemplates.length}</strong></span><span>兼容导入模板 <strong>{compatibilityTemplates.length}</strong></span></div></section>
+    <section className="template-group"><header><strong>结构化治理模板</strong><span>种质、系谱、试验、单株、基因型与知识文献</span></header><div className="template-grid">{templateCards(structuredTemplates)}</div></section>
+    {compatibilityTemplates.length > 0 && <details className="template-compatibility"><summary>兼容导入模板 · {compatibilityTemplates.length} 套（现有网页、Excel 与 CSV 导入继续使用）</summary><div className="template-grid">{templateCards(compatibilityTemplates)}</div></details>}
     {selectedTemplate && <section className="panel"><PanelTitle icon={SlidersHorizontal} title={`${selectedTemplate.template_name} · ${selectedTemplate.current_version}`} note={selectedTemplate.change_summary || "已发布模板"} />
       <div className="template-meta"><span>目标数据表：<strong>{selectedTemplate.target_table}</strong></span><span>标准字段：<strong>{selectedTemplate.fields.length}</strong> 个</span></div>
-      <div className="field-chip-list">{selectedTemplate.fields.map((field) => <span key={field.code}>{field.name}{field.unit ? ` (${field.unit})` : ""}{field.required ? " *" : ""}</span>)}</div>
-      <form className="template-version-form" onSubmit={createTemplateVersion}><input type="hidden" name="template_id" value={selectedTemplate.id} /><select name="request_id" defaultValue=""><option value="">不关联字段申请</option>{pendingRequests.filter((item) => item.template_id === selectedTemplate.id).map((item) => <option key={item.id} value={item.id}>{item.source_field} · 示例：{item.sample_value}</option>)}</select><select name="action" defaultValue="add_field"><option value="add_field">新增标准字段</option><option value="update_field">更新已有字段</option></select><input name="field_code" placeholder="内部字段编号（可不填，系统自动生成）" /><input name="field_name" required placeholder="标准字段名，例如 根系呼吸速率" /><input name="category" defaultValue="扩展性状" placeholder="字段分类" /><input name="unit" placeholder="标准单位，例如 mg/g/h" /><input name="aliases" placeholder="原字段别名，用逗号分隔" /><label><input name="required" type="checkbox" />必填</label><input name="min_value" type="number" step="any" placeholder="最小值（可不填）" /><input name="max_value" type="number" step="any" placeholder="最大值（可不填）" /><select name="severity" defaultValue="warning"><option value="warning">超范围预警</option><option value="block">超范围阻断</option></select><input name="change_summary" required placeholder="本次修改说明，例如 新增根系呼吸速率及其单位规范" /><button className="primary-button" type="submit"><Plus size={16} />发布新版本</button></form>
+      <div className="field-chip-list">{selectedTemplate.fields.map((field) => <span key={field.code} title={`内部编号：${field.code}；别名：${field.aliases?.join("、") || "无"}`}><small>{kindLabel[field.kind] || "字段"}</small>{field.name}{field.unit ? ` (${field.unit})` : ""}{field.required ? " *" : ""}</span>)}</div>
+      <form key={selectedTemplate.id} className="template-version-form" onSubmit={createTemplateVersion}><input type="hidden" name="template_id" value={selectedTemplate.id} /><select name="request_id" defaultValue=""><option value="">不关联字段申请</option>{pendingRequests.filter((item) => item.template_id === selectedTemplate.id).map((item) => <option key={item.id} value={item.id}>{item.source_field} · 示例：{item.sample_value}</option>)}</select><select name="action" defaultValue="add_field"><option value="add_field">新增标准字段</option><option value="update_field">更新已有字段</option></select><select name="field_kind" defaultValue={selectedTemplate.intake_supported ? "trait" : "attribute"}><option value="identifier">业务标识</option><option value="basic">基础字段</option><option value="attribute">属性字段</option><option value="trait">性状字段</option></select><input name="field_code" placeholder="内部字段编号（更新字段时必填）" /><input name="field_name" required placeholder="标准语义字段名，例如 材料来源" /><input name="category" defaultValue={selectedTemplate.intake_supported ? "扩展性状" : "扩展字段"} placeholder="字段分类" /><input name="unit" placeholder="标准单位（无单位可留空）" /><input name="aliases" placeholder="原始列名别名，用逗号分隔" /><label><input name="required" type="checkbox" />设为必填字段</label><input name="min_value" type="number" step="any" placeholder="最小值（仅数值字段）" /><input name="max_value" type="number" step="any" placeholder="最大值（仅数值字段）" /><select name="severity" defaultValue="warning"><option value="warning">超范围预警</option><option value="block">超范围阻断</option></select><input name="change_summary" required placeholder="本次修改说明及影响范围" /><button className="primary-button" type="submit"><Plus size={16} />发布新版本</button></form>
     </section>}
     <section className="panel"><PanelTitle icon={ListChecks} title="数据员提交的字段处理申请" note="管理员决定是否纳入某个模板；发布新版本时可关联申请并自动标记为已处理。" /><div className="table-scroll"><table><thead><tr><th>模板</th><th>原始字段</th><th>示例值</th><th>提交人</th><th>状态</th></tr></thead><tbody>{requests.map((item) => <tr key={item.id}><td>{item.template_name}</td><td>{item.source_field}</td><td>{item.sample_value || "-"}</td><td>{item.submitted_by}</td><td><Status value={item.status} /></td></tr>)}</tbody></table></div></section>
   </div>;
