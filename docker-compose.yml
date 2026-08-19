@@ -36,6 +36,25 @@ services:
       SHENNONG_API_BASE_URL: ${SHENNONG_API_BASE_URL:-https://api.agent-tech.cc/api/v1}
       SHENNONG_MODEL: ${SHENNONG_MODEL:-sn}
       SHENNONG_API_KEY: ${SHENNONG_API_KEY:-}
+      # ACPs v2.1 adapter. Local development defaults to a dual-role Direct
+      # JSON-RPC endpoint; production registration supplies the real AIC/URLs.
+      ACPS_ENABLED: ${ACPS_ENABLED:-true}
+      ACPS_ROLE: ${ACPS_ROLE:-hybrid}
+      ACPS_AIC: ${ACPS_AIC:-}
+      ACPS_AGENT_NAME: ${ACPS_AGENT_NAME:-隆耘 Agent 育种智能体}
+      ACPS_AGENT_VERSION: ${ACPS_AGENT_VERSION:-1.0.0}
+      ACPS_PUBLIC_BASE_URL: ${ACPS_PUBLIC_BASE_URL:-http://localhost:5183}
+      ACPS_DOCUMENTATION_URL: ${ACPS_DOCUMENTATION_URL:-https://github.com/lijian-888/longyun-agent/blob/codex/main-rework/docs/ACPS-INTEGRATION.md}
+      ACPS_RPC_URL: ${ACPS_RPC_URL:-http://localhost:5183/acps/rpc}
+      ACPS_DISCOVERY_BASE_URL: ${ACPS_DISCOVERY_BASE_URL:-}
+      ACPS_MTLS_ENABLED: ${ACPS_MTLS_ENABLED:-false}
+      ACPS_REQUIRE_VERIFIED_CLIENT: ${ACPS_REQUIRE_VERIFIED_CLIENT:-false}
+      ACPS_CLIENT_CERT_FILE: ${ACPS_CLIENT_CERT_FILE:-}
+      ACPS_CLIENT_KEY_FILE: ${ACPS_CLIENT_KEY_FILE:-}
+      ACPS_TRUST_BUNDLE_FILE: ${ACPS_TRUST_BUNDLE_FILE:-}
+      ACPS_PROVIDER_DOMAIN: ${ACPS_PROVIDER_DOMAIN:-}
+      ACPS_PROVIDER_DOMAIN_REGISTRATION_NUMBER: ${ACPS_PROVIDER_DOMAIN_REGISTRATION_NUMBER:-}
+      ACPS_PROVIDER_DOMAIN_REGISTRATION_TYPE: ${ACPS_PROVIDER_DOMAIN_REGISTRATION_TYPE:-}
       TAVILY_API_KEY: ${TAVILY_API_KEY:-}
       DOC_PARSE_MODE: ${DOC_PARSE_MODE:-local}
       # The CPU parser pipeline is deliberately serial.  More parallel workers
@@ -63,6 +82,7 @@ services:
       - raw_data:/data/raw
       - research_data:/data/research
       - model_data:/data/models
+      - ./deploy/acps/runtime:/data/acps
     ports:
       - "8000:8000"
 

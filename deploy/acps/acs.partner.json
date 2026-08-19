@@ -1,0 +1,122 @@
+{
+  "aic": "",
+  "active": true,
+  "lastModifiedTime": "2026-08-19T00:00:00+08:00",
+  "protocolVersion": "02.01",
+  "name": "隆耘 Agent 育种智能体（Partner）",
+  "description": "面向水稻育种科研的数据分析 Partner。只读查询和分析已发布标准数据，不处理未发布数据、私有知识库或用户会话附件；输出用于科研辅助，不替代专家审查和田间验证。",
+  "version": "1.0.0",
+  "documentationUrl": "https://agent.example.cn/acps/info",
+  "webAppUrl": "https://agent.example.cn",
+  "provider": {
+    "countryCode": "CN",
+    "organization": "请替换为真实机构名称",
+    "department": "请替换为真实部门名称",
+    "url": "https://agent.example.cn",
+    "license": "请替换为真实备案或资质信息",
+    "name": "请替换为联系人",
+    "email": "acps@example.cn",
+    "domainRegistrations": [
+      {
+        "domain": "example.cn",
+        "registrationNumber": "请替换为真实 ICP 或 WHOIS 登记号",
+        "registrationType": "ICP"
+      }
+    ]
+  },
+  "securitySchemes": {
+    "mtls": {
+      "type": "mutualTLS",
+      "description": "使用 ACPs CA 签发的客户端和服务端身份证书进行双向 TLS 认证"
+    }
+  },
+  "endPoints": [
+    {
+      "url": "https://agent.example.cn:9443/acps/rpc",
+      "transport": "JSONRPC",
+      "security": [
+        {
+          "mtls": []
+        }
+      ]
+    }
+  ],
+  "certificate": {
+    "altNames": {
+      "dns": [
+        "agent.example.cn"
+      ]
+    },
+    "requestedValidity": 365
+  },
+  "capabilities": {
+    "streaming": false,
+    "notification": false,
+    "messageQueue": []
+  },
+  "defaultInputModes": [
+    "text/plain"
+  ],
+  "defaultOutputModes": [
+    "text/plain",
+    "application/json"
+  ],
+  "skills": [
+    {
+      "id": "longyun.rice.published-data-analysis",
+      "name": "水稻已发布标准数据分析",
+      "description": "查询并分析已发布的标准化水稻品种、性状和区域试验数据。只读访问，不处理未发布数据、私有知识库或会话附件。",
+      "version": "1.0.0",
+      "tags": [
+        "水稻",
+        "育种",
+        "性状",
+        "区域试验",
+        "已发布数据",
+        "只读"
+      ],
+      "examples": [
+        "比较候选材料 A 与对照品种三年区域试验的产量和稳定性。",
+        "查询某品种的已发布株高、千粒重和生育期性状。"
+      ],
+      "inputModes": [
+        "text/plain"
+      ],
+      "outputModes": [
+        "text/plain",
+        "application/json"
+      ]
+    },
+    {
+      "id": "longyun.rice.breeding-research",
+      "name": "水稻育种科研辅助",
+      "description": "结合已发布标准数据给出材料比较、试验解释与基因型研究建议；结果用于科研辅助，不替代专家审查或田间验证。",
+      "version": "1.0.0",
+      "tags": [
+        "水稻育种",
+        "材料比较",
+        "基因型",
+        "科研分析",
+        "决策辅助"
+      ],
+      "examples": [
+        "根据已发布试验数据分析候选材料的主要优势与风险。",
+        "解释目标性状与候选基因研究时需要关注的验证步骤。"
+      ],
+      "inputModes": [
+        "text/plain"
+      ],
+      "outputModes": [
+        "text/plain",
+        "application/json"
+      ]
+    }
+  ],
+  "entityMeta": {
+    "runtimeRoles": [
+      "partner"
+    ],
+    "dataBoundary": "published-standard-data-only",
+    "aipTransport": "direct-jsonrpc"
+  }
+}

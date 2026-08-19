@@ -9,7 +9,14 @@ export default defineConfig({
         target: "http://api:8000",
         changeOrigin: true,
       },
+      "/acps": {
+        target: "http://api:8000",
+        changeOrigin: true,
+      },
+      "/.well-known/acps-agent.json": {
+        target: "http://api:8000",
+        changeOrigin: true,
+      },
     },
   },
 });
-

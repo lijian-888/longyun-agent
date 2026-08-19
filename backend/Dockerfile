@@ -18,6 +18,10 @@ COPY requirements.txt .
 # CPU-only deployment does not accidentally download several GB of CUDA libs.
 RUN pip install --no-cache-dir --retries 8 --timeout 300 \
     --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
+# Keep the small ACPs protocol dependency separate from the OCR/document
+# stack so protocol upgrades do not trigger multi-gigabyte image rebuilds.
+COPY requirements-acps.txt .
+RUN pip install --no-cache-dir --retries 8 --timeout 300 -r requirements-acps.txt
 # Keep the local GWAS numerical stack in a separate layer so changing it does
 # not invalidate the much larger OCR/document-analysis dependency cache.
 RUN pip install --no-cache-dir numpy==2.1.3 matplotlib==3.9.2

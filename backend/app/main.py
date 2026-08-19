@@ -35,6 +35,13 @@ from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, Stri
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 from pgvector.sqlalchemy import Vector
 
+from .acps_adapter import (
+    AcpsExecutionResult,
+    AcpsLeaderDispatchRequest,
+    AcpsSettings,
+    dispatch_partner_task,
+    mount_acps_routes,
+)
 from .auth import (
     CurrentUser,
     audit_actor,
@@ -2215,6 +2222,7 @@ def serialize_public_query_execution(execution: Any) -> dict[str, Any]:
 
 
 app = FastAPI(title="隆耘 Agent 育种智能体", version="1.5.0")
+ACPS_SETTINGS = AcpsSettings.from_env()
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
 app.add_middleware(
     CORSMiddleware,
@@ -5610,3 +5618,74 @@ def pdf_report(payload: PdfReport) -> Response:
     story.append(Paragraph("说明：本报告仅基于已发布标准数据生成。原始文件不包含在下载内容中；抗病等级未在缺少正式评价体系时自动转换为抗性分类。", chinese))
     document.build(story)
     return Response(content=buffer.getvalue(), media_type="application/pdf", headers={"Content-Disposition": "attachment; filename=rice-phenotype-report.pdf"})
+
+
+async def execute_longyun_acps_partner(question: str, caller_aic: str) -> AcpsExecutionResult:
+    """Run an ACPs Partner task inside the published-data-only boundary.
+
+    External ACPs callers never inherit a browser user's private knowledge
+    scope, attachments, chat history, or public-web search configuration.
+    """
+    with SessionLocal() as session:
+        published_context, evidence_cards = await build_published_evidence_context(
+            session,
+            question.strip(),
+            requested_by=f"ACPs:{caller_aic or 'unknown-leader'}",
+        )
+
+    completed: dict[str, Any] | None = None
+    async for event in stream_research_reply(
+        user_prompt=question.strip(),
+        evidence_context=published_context,
+        memory_state={},
+        public_web_context="",
+        vision_images=[],
+        conversation_history=[],
+        has_current_vision_images=False,
+    ):
+        if event["type"] == "complete":
+            completed = event
+    if not completed or not str(completed.get("content") or "").strip():
+        raise ResearchAgentError("隆耘智能体未生成可展示的 ACPs 任务结果。")
+
+    evidence_summary = [
+        {
+            key: card.get(key)
+            for key in ("type", "title", "detail", "query_template", "query_parameters")
+            if card.get(key) is not None
+        }
+        for card in evidence_cards
+    ]
+    return AcpsExecutionResult(
+        text=str(completed["content"]).strip(),
+        structured_data={
+            "dataBoundary": "published-standard-data-only",
+            "evidenceCount": len(evidence_summary),
+            "evidence": evidence_summary,
+        },
+    )
+
+
+@app.post("/api/acps/leader/dispatch", tags=["ACPs"])
+async def acps_leader_dispatch(
+    payload: AcpsLeaderDispatchRequest,
+    user: CurrentUser = Depends(require_researcher),
+) -> dict[str, Any]:
+    """Let an authenticated researcher use Longyun as an ACPs Leader."""
+    try:
+        result = await dispatch_partner_task(payload, ACPS_SETTINGS)
+    except TimeoutError as exc:
+        raise HTTPException(504, str(exc)) from exc
+    except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+        raise HTTPException(502, str(exc)) from exc
+    except Exception as exc:
+        logger.exception("ACPs Leader dispatch failed")
+        raise HTTPException(502, "ACPs Leader 调度失败，请检查 Partner、Discovery 和证书配置。") from exc
+    return {
+        **result,
+        "requestedBy": audit_actor(user),
+        "leaderAic": ACPS_SETTINGS.aic or None,
+    }
+
+
+mount_acps_routes(app, ACPS_SETTINGS, execute_longyun_acps_partner)

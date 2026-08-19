@@ -1,0 +1,23 @@
+# Copy this file outside source control and replace every service URL with the
+# ACPs platform operator's real Registry, CA and Discovery addresses.
+
+[registry]
+base_url = "https://registry.example.cn"
+mtls_base_url = "https://registry-mtls.example.cn"
+# mtls_server_ca_file = "./private/trust-bundle.pem"
+timeout_seconds = 30
+
+[auth]
+user_token_file = "./private/tokens/registry-user.json"
+admin_token_file = "./private/tokens/registry-admin.json"
+
+[ca]
+base_url = "https://ca.example.cn"
+account_keys_dir = "./private/accounts"
+private_keys_dir = "./private/keys"
+certs_dir = "./private/certs"
+csr_dir = "./private/csr"
+trust_bundle_path = "./private/trust-bundle.pem"
+
+[discovery]
+base_url = "https://discovery.example.cn/acps-adp-v2"

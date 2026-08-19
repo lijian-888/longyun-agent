@@ -1,0 +1,49 @@
+{
+  "aic": "",
+  "active": true,
+  "lastModifiedTime": "2026-08-19T00:00:00+08:00",
+  "protocolVersion": "02.01",
+  "name": "隆耘 Agent 育种智能体（Leader）",
+  "description": "面向水稻育种科研的协作 Leader。接收科研人员问题，通过 ACPs Discovery 选择合适 Partner，按 AIP 下发、轮询、确认或取消任务，并把协作结果返回给科研人员。",
+  "version": "1.0.0",
+  "documentationUrl": "https://agent.example.cn/acps/info",
+  "webAppUrl": "https://agent.example.cn",
+  "provider": {
+    "countryCode": "CN",
+    "organization": "请替换为真实机构名称",
+    "department": "请替换为真实部门名称",
+    "url": "https://agent.example.cn",
+    "license": "请替换为真实备案或资质信息",
+    "name": "请替换为联系人",
+    "email": "acps@example.cn",
+    "domainRegistrations": [
+      {
+        "domain": "example.cn",
+        "registrationNumber": "请替换为真实 ICP 或 WHOIS 登记号",
+        "registrationType": "ICP"
+      }
+    ]
+  },
+  "securitySchemes": {
+    "mtls": {
+      "type": "mutualTLS",
+      "description": "Leader 使用 ACPs CA 签发的 clientAuth 身份证书调用 Discovery 和 Partner"
+    }
+  },
+  "endPoints": [],
+  "capabilities": {
+    "streaming": false,
+    "notification": false,
+    "messageQueue": []
+  },
+  "defaultInputModes": [],
+  "defaultOutputModes": [],
+  "skills": [],
+  "entityMeta": {
+    "runtimeRoles": [
+      "leader"
+    ],
+    "aipTransport": "direct-jsonrpc",
+    "partnerSelection": "acps-discovery"
+  }
+}
