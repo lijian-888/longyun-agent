@@ -2,10 +2,13 @@
   "realm": "rice-research",
   "enabled": true,
   "sslRequired": "EXTERNAL",
-  "displayName": "隆耘 Agent 育种智能体",
+  "displayName": "海南南繁 · 隆耘 Agent 育种智能体",
   "loginTheme": "rice-research",
   "registrationAllowed": false,
   "loginWithEmailAllowed": false,
+  "eventsEnabled": true,
+  "adminEventsEnabled": true,
+  "adminEventsDetailsEnabled": true,
   "roles": {
     "realm": [
       { "name": "researcher", "description": "Researcher access to published data and private research sessions." },

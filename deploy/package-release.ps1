@@ -85,7 +85,11 @@ try {
         "backend\\.env",
         "backend\\.env.production",
         "frontend\\.env",
-        "frontend\\.env.production"
+        "frontend\\.env.production",
+        # This ignored file is generated for local Docker development and can
+        # contain developer-only account passwords. Production uses the
+        # placeholder-based realm under deploy/keycloak instead.
+        "keycloak\\rice-research-realm.json"
     )
     foreach ($relativePath in $explicitSecretFiles) {
         $candidate = Join-Path $stagePath $relativePath

@@ -41,6 +41,10 @@ Copy-Item keycloak/rice-research-realm.json.example keycloak/rice-research-realm
 
 示例内预置两个研究人员账号 `wang.researcher`、`li.researcher`，以及数据处理员 `zhang.processor`、字段管理员 `chen.fieldadmin`。占位密码只能用于初始化，启动前必须替换；所有账号首次登录也应修改密码。研究人员共享“已发布标准数据”的只读查询能力，但会话、上传附件、解析文本和压缩上下文严格隔离。数据处理员不能修改标准模板；字段管理员不能导入、审核或发布业务数据。
 
+## 海南南繁单机构与课题边界
+
+平台固定运行在“海南南繁”单机构上下文，不从 Token、请求参数或页面表单接收机构编号，也不提供机构开通、选择和切换功能。用户登录后直接进入其有权课题：科研人员仅能进入已加入的课题，数据处理员和字段管理员按岗位进入各活跃课题。课题成员、应用账号状态和权限操作记录由字段管理员在“课题与账号”页面维护。实现与验收说明见 [海南南繁单机构与课题权限实现说明](docs/海南南繁单机构与课题权限实现说明.md)。
+
 ## 神农配置
 
 将 `.env.example` 复制为 `.env`，仅在服务器本地填写 `SHENNONG_API_KEY`，不要写进前端代码或提交到版本库。未配置 Key 时，科研助手仍可登录、管理私有会话与附件，但发起模型分析会明确提示缺少服务端配置。
@@ -72,8 +76,9 @@ docker compose --profile warmup run --rm model-warmup
 
 - Keycloak 负责真实登录、角色与 Token 签发；前端只携带短期 Bearer Token。
 - API 使用非超级用户 `rice_app` 连接 PostgreSQL；迁移与建表使用独立的 bootstrap 账号。
-- `research_session`、`research_message`、`research_attachment`、`research_audit` 启用并强制 PostgreSQL RLS。即使有人篡改会话 ID，也无法读取其他研究人员的私有内容。
-- `knowledge_folder`、`knowledge_document`、`knowledge_chunk` 同样启用并强制 PostgreSQL RLS。私有知识库只能由资料所有者访问；研究人员只能检索已发布的公共资料，字段管理员才可核验、发布和撤回公共资料。
+- `research_session`、`research_message`、`research_attachment`、`research_audit`、`research_result` 同时按课题和登录账号启用并强制 PostgreSQL RLS。即使有人篡改会话 ID，也无法读取其他课题或其他研究人员的私有内容。
+- `knowledge_folder`、`knowledge_document`、`knowledge_chunk` 同样按课题启用并强制 PostgreSQL RLS。私有知识库只能由资料所有者访问；研究人员只能检索当前课题已发布的公共资料，字段管理员才可核验、发布和撤回公共资料。
+- 品种、表型、原始来源、区域试验、GWAS、基因型资产、知识、任务和成果均带 `project_id`；历史数据启动时自动归入海南南繁默认课题。
 - 私有附件存入本地 Docker 卷，不提供对浏览器的直接文件路径访问；删除会话会一并删除附件、解析文本和压缩上下文。
 
 ## 说明
@@ -81,7 +86,7 @@ docker compose --profile warmup run --rm model-warmup
 - 数据、规则、审核日志保存在本机 Docker 卷内。
 - 文档解析优先使用 Docling；扫描型 PDF 或图片会由本地 PaddleOCR 兜底识别。OCR 结果可能存在识别误差，需通过“解析文字预览”核验。
 - 网页 URL 只尝试读取单个页面，不进行整站抓取。
-- 数据处理员导入前选择管理员发布的标准模板。当前预置“国家水稻数据中心信息标准”和“水稻根系表型数据标准”；根系模板发布后的数据写入独立 `root_phenotype_observation` 表。
+- 数据处理员导入前选择管理员发布的标准模板。当前保留六套结构化模板，并兼容两套历史导入模板；根系模板发布后的数据写入独立 `root_phenotype_observation` 表。
 - Excel/CSV 会按每一行生成一个品种候选；确认“创建全部 N 个品种待处理草稿”后，每个品种会在待处理区独立展开、审核和发布。
 - 未识别字段可从导入预览提交管理员处理。管理员在“标准模板管理”中发布带变更说明的新版本，数据处理员可从来源标签按最新版本重新处理原始文件。
 - 当前 `docker-compose.yml` 设置 `ENABLE_SOURCE_DEDUPLICATION: "false"`，允许同一文件重复导入以便演示和调试。正式使用时改为 `"true"` 后重启服务，新导入将按文件内容哈希和网页地址阻止重复来源。

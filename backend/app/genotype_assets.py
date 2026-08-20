@@ -42,6 +42,7 @@ MAX_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024
 UPLOAD_CHUNK_BYTES = 10 * 1024 * 1024
 RICE_QC_TEMPLATE_CODE = "rice_standard_breeding_qc"
 RICE_QC_TEMPLATE_VERSION = "v1.0"
+DEFAULT_PROJECT_ID = "00000000-0000-4000-8000-000000000001"
 SUPPORTED_POPULATIONS = {
     "stable_breeding": "稳定育种材料",
     "segregating": "分离群体",
@@ -258,6 +259,42 @@ def ensure_genotype_asset_schema(session: Session) -> None:
     # raw-file metadata and private genotype storage.
     session.execute(text("ALTER TABLE genotype_governance_request ADD COLUMN IF NOT EXISTS asset_title_snapshot VARCHAR(300)"))
     session.execute(text("ALTER TABLE genotype_governance_request ADD COLUMN IF NOT EXISTS version_number_snapshot INTEGER"))
+    for table_name in (
+        "genotype_asset", "genotype_asset_version", "genotype_processing_job",
+        "genotype_upload_session", "genotype_sample_mapping", "genotype_governance_request",
+    ):
+        session.execute(text(
+            f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS project_id VARCHAR(36) "
+            f"NOT NULL DEFAULT '{DEFAULT_PROJECT_ID}'"
+        ))
+        session.execute(text(f"CREATE INDEX IF NOT EXISTS ix_{table_name}_project_id ON {table_name}(project_id)"))
+    session.execute(text("""
+        CREATE OR REPLACE FUNCTION inherit_genotype_project_from_asset() RETURNS trigger AS $$
+        BEGIN
+          NEW.project_id := COALESCE((SELECT project_id FROM genotype_asset WHERE id = NEW.asset_id), NEW.project_id);
+          RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql
+    """))
+    session.execute(text("""
+        CREATE OR REPLACE FUNCTION inherit_genotype_project_from_version() RETURNS trigger AS $$
+        BEGIN
+          NEW.project_id := COALESCE((SELECT project_id FROM genotype_asset_version WHERE id = NEW.version_id), NEW.project_id);
+          RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql
+    """))
+    for table_name in ("genotype_asset_version", "genotype_processing_job", "genotype_upload_session", "genotype_governance_request"):
+        session.execute(text(f"DROP TRIGGER IF EXISTS trg_{table_name}_project ON {table_name}"))
+        session.execute(text(
+            f"CREATE TRIGGER trg_{table_name}_project BEFORE INSERT OR UPDATE OF asset_id ON {table_name} "
+            "FOR EACH ROW EXECUTE FUNCTION inherit_genotype_project_from_asset()"
+        ))
+    session.execute(text("DROP TRIGGER IF EXISTS trg_genotype_sample_mapping_project ON genotype_sample_mapping"))
+    session.execute(text(
+        "CREATE TRIGGER trg_genotype_sample_mapping_project BEFORE INSERT OR UPDATE OF version_id ON genotype_sample_mapping "
+        "FOR EACH ROW EXECUTE FUNCTION inherit_genotype_project_from_version()"
+    ))
     template_exists = session.execute(text("""
         SELECT 1 FROM genotype_qc_template
         WHERE template_code = :code AND version = :version
@@ -294,8 +331,10 @@ def ensure_genotype_asset_schema(session: Session) -> None:
         session.execute(text(f"DROP POLICY IF EXISTS genotype_owner_only ON {table_name}"))
         session.execute(text(
             f"CREATE POLICY genotype_owner_only ON {table_name} FOR ALL "
-            "USING (owner_id = current_setting('app.research_user_id', true) OR current_user = 'rice') "
-            "WITH CHECK (owner_id = current_setting('app.research_user_id', true) OR current_user = 'rice')"
+            "USING ((owner_id = current_setting('app.research_user_id', true) "
+            "AND project_id = current_setting('app.project_id', true)) OR current_user = 'rice') "
+            "WITH CHECK ((owner_id = current_setting('app.research_user_id', true) "
+            "AND project_id = current_setting('app.project_id', true)) OR current_user = 'rice')"
         ))
     # A data processor can only read and update governance request summaries.
     # It does not receive a policy on genotype assets, uploads or mappings.
@@ -303,12 +342,15 @@ def ensure_genotype_asset_schema(session: Session) -> None:
     session.execute(text("DROP POLICY IF EXISTS genotype_governance_processor_update ON genotype_governance_request"))
     session.execute(text(
         "CREATE POLICY genotype_governance_processor_read ON genotype_governance_request FOR SELECT "
-        "USING (current_setting('app.genotype_governance_processor', true) = 'true' OR current_user = 'rice')"
+        "USING ((current_setting('app.genotype_governance_processor', true) = 'true' "
+        "AND project_id = current_setting('app.project_id', true)) OR current_user = 'rice')"
     ))
     session.execute(text(
         "CREATE POLICY genotype_governance_processor_update ON genotype_governance_request FOR UPDATE "
-        "USING (current_setting('app.genotype_governance_processor', true) = 'true' OR current_user = 'rice') "
-        "WITH CHECK (current_setting('app.genotype_governance_processor', true) = 'true' OR current_user = 'rice')"
+        "USING ((current_setting('app.genotype_governance_processor', true) = 'true' "
+        "AND project_id = current_setting('app.project_id', true)) OR current_user = 'rice') "
+        "WITH CHECK ((current_setting('app.genotype_governance_processor', true) = 'true' "
+        "AND project_id = current_setting('app.project_id', true)) OR current_user = 'rice')"
     ))
     session.execute(text("ALTER TABLE genotype_qc_template ENABLE ROW LEVEL SECURITY"))
     session.execute(text("ALTER TABLE genotype_qc_template FORCE ROW LEVEL SECURITY"))
@@ -344,6 +386,7 @@ def _version_summary(session: Session, version_id: str) -> dict[str, Any]:
     duplicate_material_count = len(material_ids) - len(set(material_ids))
     return {
         "id": version["id"], "asset_id": version["asset_id"], "title": version["asset_title"],
+        "project_id": version["project_id"],
         "version_number": version["version_number"], "status": version["status"],
         "source_format": version["source_format"], "reference_assembly": version["reference_assembly"],
         "population_type": version["population_type"], "population_type_label": SUPPORTED_POPULATIONS.get(version["population_type"], version["population_type"]),
@@ -385,6 +428,7 @@ def list_assets(session: Session) -> list[dict[str, Any]]:
             if asset:
                 items.append({
                     "id": None, "asset_id": asset["id"], "title": asset["title"], "version_number": 0,
+                    "project_id": asset["project_id"],
                     "status": asset["status"], "source_format": asset["source_format"], "reference_assembly": asset["reference_assembly"],
                     "population_type": asset["population_type"], "population_type_label": SUPPORTED_POPULATIONS.get(asset["population_type"], asset["population_type"]),
                     "qc_summary": {}, "mapping_summary": {"total": 0, "mapped": 0, "unmapped": 0}, "job": None,
@@ -403,17 +447,17 @@ def get_asset_version(session: Session, asset_id: str, version_id: str | None = 
     return _version_summary(session, str(row))
 
 
-def create_asset(session: Session, owner_id: str, payload: CreateGenotypeAssetRequest) -> dict[str, Any]:
+def create_asset(session: Session, owner_id: str, payload: CreateGenotypeAssetRequest, project_id: str = DEFAULT_PROJECT_ID) -> dict[str, Any]:
     if payload.population_type not in SUPPORTED_POPULATIONS:
         raise GenotypeAssetError("请选择稳定育种材料、分离群体、自然种质群体或待确认。")
     asset_id = str(uuid.uuid4())
     session.execute(text("""
         INSERT INTO genotype_asset
-        (id, owner_id, title, source_format, reference_assembly, population_type, status, created_at, updated_at)
-        VALUES (:id, :owner_id, :title, :source_format, :assembly, :population_type, 'awaiting_upload', :now, :now)
-    """), {"id": asset_id, "owner_id": owner_id, "title": payload.title.strip(), "source_format": payload.source_format,
+        (id, owner_id, project_id, title, source_format, reference_assembly, population_type, status, created_at, updated_at)
+        VALUES (:id, :owner_id, :project_id, :title, :source_format, :assembly, :population_type, 'awaiting_upload', :now, :now)
+    """), {"id": asset_id, "owner_id": owner_id, "project_id": project_id, "title": payload.title.strip(), "source_format": payload.source_format,
              "assembly": payload.reference_assembly.strip(), "population_type": payload.population_type, "now": _now()})
-    return {"asset_id": asset_id, "status": "awaiting_upload", "upload_chunk_bytes": UPLOAD_CHUNK_BYTES}
+    return {"asset_id": asset_id, "project_id": project_id, "status": "awaiting_upload", "upload_chunk_bytes": UPLOAD_CHUNK_BYTES}
 
 
 def create_upload_session(session: Session, owner_id: str, asset_id: str, payload: UploadInitRequest, storage_dir: Path) -> dict[str, Any]:
@@ -887,26 +931,26 @@ def _build_qc_artifacts(
     return pdf_path, package_path, workbook_path, mapping_csv
 
 
-def _archive_qc_result(session: Session, owner_id: str, version_id: str, title: str, package_path: Path, summary: dict[str, Any]) -> None:
+def _archive_qc_result(session: Session, owner_id: str, project_id: str, version_id: str, title: str, package_path: Path, summary: dict[str, Any]) -> None:
     existing = session.execute(text("""
         SELECT id FROM research_result WHERE owner_id = :owner_id AND analysis_run_id = :version_id AND result_type = 'genotype_qc_package'
     """), {"owner_id": owner_id, "version_id": version_id}).scalar()
     if existing:
         session.execute(text("""
             UPDATE research_result
-            SET title=:title, file_name=:file_name, size_bytes=:size, storage_path=:path,
+            SET project_id=:project_id, title=:title, file_name=:file_name, size_bytes=:size, storage_path=:path,
                 summary=:summary, metadata=CAST(:metadata AS jsonb)
             WHERE id=:id
-        """), {"id": existing, "title": f"{title} · 基因型导入与质控结果包",
+        """), {"id": existing, "project_id": project_id, "title": f"{title} · 基因型导入与质控结果包",
                "file_name": package_path.name, "size": package_path.stat().st_size, "path": str(package_path),
                "summary": "材料映射已完整确认后的正式质控结果包，包含 PDF、样本/SNP 质控表、已确认映射表和处理工作簿；PLINK 三件套仅供后续受控分析调用。",
                "metadata": _json({"generated_from": "local_genotype_qc", "formal_analysis_ready": True, "qc_summary": summary})})
         return
     session.execute(text("""
         INSERT INTO research_result
-        (id, owner_id, session_id, source_message_id, analysis_run_id, result_type, title, content_type, file_name, size_bytes, storage_path, summary, metadata, created_at)
-        VALUES (:id, :owner_id, NULL, NULL, :version_id, 'genotype_qc_package', :title, 'application/zip', :file_name, :size, :path, :summary, CAST(:metadata AS jsonb), :created_at)
-    """), {"id": str(uuid.uuid4()), "owner_id": owner_id, "version_id": version_id, "title": f"{title} · 基因型导入与质控结果包",
+        (id, owner_id, project_id, session_id, source_message_id, analysis_run_id, result_type, title, content_type, file_name, size_bytes, storage_path, summary, metadata, created_at)
+        VALUES (:id, :owner_id, :project_id, NULL, NULL, :version_id, 'genotype_qc_package', :title, 'application/zip', :file_name, :size, :path, :summary, CAST(:metadata AS jsonb), :created_at)
+    """), {"id": str(uuid.uuid4()), "owner_id": owner_id, "project_id": project_id, "version_id": version_id, "title": f"{title} · 基因型导入与质控结果包",
              "file_name": package_path.name, "size": package_path.stat().st_size, "path": str(package_path),
              "summary": "材料映射已完整确认后的正式质控结果包，包含 PDF、样本/SNP 质控表、已确认映射表和处理工作簿；PLINK 三件套仅供后续受控分析调用。",
              "metadata": _json({"generated_from": "local_genotype_qc", "formal_analysis_ready": True, "qc_summary": summary}), "created_at": _now()})
@@ -1191,7 +1235,7 @@ def publish_analysis_ready(session: Session, owner_id: str, version_id: str) -> 
         WHERE id=:id
     """), {"summary": _json(summary), "report_path": str(pdf_path), "package_path": str(package_path), "now": now, "owner_id": owner_id, "id": version_id})
     session.execute(text("UPDATE genotype_asset SET status='analysis_ready', current_version_id=:version_id, updated_at=:now WHERE id=:asset_id"), {"version_id": version_id, "now": now, "asset_id": version["asset_id"]})
-    _archive_qc_result(session, owner_id, version_id, str(asset["title"]), package_path, summary)
+    _archive_qc_result(session, owner_id, str(version["project_id"]), version_id, str(asset["title"]), package_path, summary)
     return _version_summary(session, version_id)
 
 

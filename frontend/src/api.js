@@ -1,9 +1,22 @@
 import { accessToken, keycloak } from "./auth";
 
+const ACTIVE_PROJECT_KEY = "longyun.activeProjectId";
+
+export function activeProjectId() {
+  return window.localStorage.getItem(ACTIVE_PROJECT_KEY) || "";
+}
+
+export function setActiveProjectId(projectId) {
+  if (projectId) window.localStorage.setItem(ACTIVE_PROJECT_KEY, projectId);
+  else window.localStorage.removeItem(ACTIVE_PROJECT_KEY);
+}
+
 export async function authorizedFetch(path, options = {}) {
   const headers = new Headers(options.headers || {});
   const token = await accessToken();
   if (token) headers.set("Authorization", `Bearer ${token}`);
+  const projectId = activeProjectId();
+  if (projectId && path.startsWith("/api/")) headers.set("X-Project-Id", projectId);
   const response = await fetch(path, { ...options, headers });
   if (response.status === 401 && path.startsWith("/api/")) {
     keycloak.login();

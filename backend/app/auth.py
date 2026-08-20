@@ -13,6 +13,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 bearer_scheme = HTTPBearer(auto_error=False)
 _jwks_cache: dict[str, Any] = {"expires_at": 0.0, "keys": {}}
+BUSINESS_ROLES = frozenset({"researcher", "data_processor", "field_admin"})
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,8 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials | None = Se
     if audience not in token_audiences and claims.get("azp") != audience:
         raise HTTPException(401, "登录凭证不属于本科研助手。")
     roles = frozenset((claims.get("realm_access") or {}).get("roles") or [])
+    if len(BUSINESS_ROLES.intersection(roles)) > 1:
+        raise HTTPException(403, "当前账号配置了多个业务角色，请由身份管理员保留且仅保留一种角色。")
     display_name = " ".join(part for part in [claims.get("family_name"), claims.get("given_name")] if part).strip()
     return CurrentUser(
         id=str(claims.get("sub") or ""),
@@ -134,6 +137,13 @@ async def require_trial_demo_user(user: CurrentUser = Security(get_current_user)
     """Read the governed multi-environment demo from any platform-facing role."""
     if not {"researcher", "data_processor", "field_admin"}.intersection(user.roles):
         raise HTTPException(403, "当前账号没有多环境试验数据访问权限。")
+    return user
+
+
+async def require_business_user(user: CurrentUser = Security(get_current_user)) -> CurrentUser:
+    """Allow only the three business roles used by the Hainan NanFan platform."""
+    if not {"researcher", "data_processor", "field_admin"}.intersection(user.roles):
+        raise HTTPException(403, "当前账号未配置海南南繁平台业务角色。")
     return user
 
 

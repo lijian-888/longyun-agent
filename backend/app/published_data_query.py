@@ -43,7 +43,7 @@ VARIETY_LOOKUP_SQL = """
 SELECT id, variety_name, normalized_name, alias_names, variety_type,
        approval_number, approval_year, suitable_region
 FROM variety_basic
-WHERE data_status = 'published'
+WHERE data_status = 'published' AND project_id = :project_id
 ORDER BY variety_name
 """
 
@@ -56,6 +56,7 @@ SELECT v.id AS variety_id, v.variety_name, v.alias_names, v.variety_type,
 FROM variety_basic v
 JOIN phenotype_observation p ON p.variety_id = v.id
 WHERE v.data_status = 'published'
+  AND v.project_id = :project_id AND p.project_id = :project_id
   AND p.publish_status = 'published'
   AND v.id = ANY(CAST(:variety_ids AS text[]))
   AND (:trait_codes_empty OR p.trait_code = ANY(CAST(:trait_codes AS text[])))
@@ -73,6 +74,7 @@ SELECT v.id AS variety_id, v.variety_name, v.alias_names, v.variety_type,
 FROM variety_basic v
 JOIN root_phenotype_observation r ON r.variety_id = v.id
 WHERE v.data_status = 'published'
+  AND v.project_id = :project_id AND r.project_id = :project_id
   AND v.id = ANY(CAST(:variety_ids AS text[]))
   AND (:trait_codes_empty OR r.trait_code = ANY(CAST(:trait_codes AS text[])))
 ORDER BY v.variety_name, r.trait_code
@@ -85,6 +87,7 @@ WITH matched_varieties AS (
     FROM variety_basic v
     JOIN phenotype_observation p ON p.variety_id = v.id
     WHERE v.data_status = 'published'
+      AND v.project_id = :project_id AND p.project_id = :project_id
       AND p.publish_status = 'published'
       AND p.trait_code = ANY(CAST(:trait_codes AS text[]))
     ORDER BY v.variety_name
@@ -99,6 +102,7 @@ FROM variety_basic v
 JOIN matched_varieties matched ON matched.id = v.id
 JOIN phenotype_observation p ON p.variety_id = v.id
 WHERE v.data_status = 'published'
+  AND v.project_id = :project_id AND p.project_id = :project_id
   AND p.publish_status = 'published'
   AND p.trait_code = ANY(CAST(:trait_codes AS text[]))
 ORDER BY v.variety_name, p.trait_code
@@ -111,6 +115,7 @@ WITH matched_varieties AS (
     FROM variety_basic v
     JOIN root_phenotype_observation r ON r.variety_id = v.id
     WHERE v.data_status = 'published'
+      AND v.project_id = :project_id AND r.project_id = :project_id
       AND r.trait_code = ANY(CAST(:trait_codes AS text[]))
     ORDER BY v.variety_name
     LIMIT :limit
@@ -125,6 +130,7 @@ FROM variety_basic v
 JOIN matched_varieties matched ON matched.id = v.id
 JOIN root_phenotype_observation r ON r.variety_id = v.id
 WHERE v.data_status = 'published'
+  AND v.project_id = :project_id AND r.project_id = :project_id
   AND r.trait_code = ANY(CAST(:trait_codes AS text[]))
 ORDER BY v.variety_name, r.trait_code
 LIMIT :row_limit
@@ -254,6 +260,7 @@ def plan_query_from_question(
     question: str,
     rice_traits: dict[str, dict[str, Any]],
     root_traits: dict[str, dict[str, Any]],
+    project_id: str,
 ) -> PublishedDataQuery | None:
     """Deterministic first-pass intent extraction from names, aliases, and field dictionary."""
     normalized_question = _normalize(question)
@@ -262,7 +269,7 @@ def plan_query_from_question(
     trait_codes = _match_trait_codes(normalized_question, catalog)
     filters = _extract_filters(question, catalog)
     trait_codes = list(dict.fromkeys([*trait_codes, *(item.trait_code for item in filters)]))
-    varieties = session.execute(text(VARIETY_LOOKUP_SQL)).mappings().all()
+    varieties = session.execute(text(VARIETY_LOOKUP_SQL), {"project_id": project_id}).mappings().all()
     matched_ids: list[str] = []
     for variety in varieties:
         names = [variety["variety_name"], *(variety["alias_names"] or [])]
@@ -284,6 +291,7 @@ def plan_query_from_structured_request(
     request: StructuredQueryRequest,
     rice_traits: dict[str, dict[str, Any]],
     root_traits: dict[str, dict[str, Any]],
+    project_id: str,
 ) -> tuple[PublishedDataQuery | None, list[str]]:
     """Resolve an LLM-safe request against governed fields and published varieties."""
     if not request.query_needed:
@@ -292,7 +300,7 @@ def plan_query_from_structured_request(
     trait_codes = [code for code in request.trait_codes if code in catalog]
     filters = [item for item in request.filters if item.trait_code in catalog]
     trait_codes = list(dict.fromkeys([*trait_codes, *(item.trait_code for item in filters)]))
-    variety_ids, unresolved_names = _resolve_variety_names(session, request.variety_names)
+    variety_ids, unresolved_names = _resolve_variety_names(session, request.variety_names, project_id)
     # A supplied but wholly unresolved name must never broaden into a whole-
     # dataset query merely because trait fields were also selected.
     if request.variety_names and not variety_ids:
@@ -307,16 +315,17 @@ def plan_query_from_structured_request(
     ), unresolved_names
 
 
-def execute_published_data_query(session: Session, query: PublishedDataQuery) -> QueryExecution:
+def execute_published_data_query(session: Session, query: PublishedDataQuery, project_id: str) -> QueryExecution:
     """Execute a validated plan using only fixed read-only SQL templates."""
     query = _validated_query(query)
     if query.filters:
-        return _execute_filter_query(session, query)
+        return _execute_filter_query(session, query, project_id)
 
     is_root = query.scope == "root_phenotype"
     if query.variety_ids:
         template_code = "root_by_variety" if is_root else "phenotype_by_variety"
         params = {
+            "project_id": project_id,
             "variety_ids": query.variety_ids,
             "trait_codes": query.trait_codes,
             "trait_codes_empty": not bool(query.trait_codes),
@@ -325,6 +334,7 @@ def execute_published_data_query(session: Session, query: PublishedDataQuery) ->
     elif query.trait_codes:
         template_code = "root_by_trait" if is_root else "phenotype_by_trait"
         params = {
+            "project_id": project_id,
             "trait_codes": query.trait_codes,
             "limit": query.limit,
             "row_limit": _observation_row_limit(query),
@@ -337,15 +347,15 @@ def execute_published_data_query(session: Session, query: PublishedDataQuery) ->
         template_code=template_code,
         parameters=_safe_parameters(params),
         records=[dict(row) for row in rows],
-        matched_variety_names=_names_for_ids(session, query.variety_ids),
+        matched_variety_names=_names_for_ids(session, query.variety_ids, project_id),
     )
 
 
-def _execute_filter_query(session: Session, query: PublishedDataQuery) -> QueryExecution:
+def _execute_filter_query(session: Session, query: PublishedDataQuery, project_id: str) -> QueryExecution:
     table_name = "root_phenotype_observation" if query.scope == "root_phenotype" else "phenotype_observation"
     published_clause = "" if query.scope == "root_phenotype" else "AND p.publish_status = 'published'"
-    clauses: list[str] = ["v.data_status = 'published'"]
-    params: dict[str, Any] = {"limit": query.limit}
+    clauses: list[str] = ["v.data_status = 'published'", "v.project_id = :project_id"]
+    params: dict[str, Any] = {"limit": query.limit, "project_id": project_id}
     if query.variety_ids:
         clauses.append("v.id = ANY(CAST(:variety_ids AS text[]))")
         params["variety_ids"] = query.variety_ids
@@ -357,6 +367,7 @@ def _execute_filter_query(session: Session, query: PublishedDataQuery) -> QueryE
             f"""EXISTS (
                 SELECT 1 FROM {table_name} p{index}
                 WHERE p{index}.variety_id = v.id
+                  AND p{index}.project_id = :project_id
                   {published_clause.replace('p.', f'p{index}.')}
                   AND p{index}.trait_code = :trait_code_{index}
                   AND p{index}.value_numeric {operator} :value_{index}
@@ -376,7 +387,7 @@ def _execute_filter_query(session: Session, query: PublishedDataQuery) -> QueryE
         "trait_codes": list(dict.fromkeys([*query.trait_codes, *(item.trait_code for item in query.filters)])),
         "filters": [],
     })
-    detail_execution = execute_published_data_query(session, detail_query)
+    detail_execution = execute_published_data_query(session, detail_query, project_id)
     detail_execution.template_code = "root_filter" if query.scope == "root_phenotype" else "phenotype_filter"
     detail_execution.parameters = _safe_parameters(params)
     return detail_execution
@@ -438,20 +449,20 @@ def _extract_filters(question: str, catalog: dict[str, dict[str, Any]]) -> list[
     return filters
 
 
-def _names_for_ids(session: Session, variety_ids: list[str]) -> list[str]:
+def _names_for_ids(session: Session, variety_ids: list[str], project_id: str) -> list[str]:
     if not variety_ids:
         return []
     rows = session.execute(
-        text("SELECT variety_name FROM variety_basic WHERE id = ANY(CAST(:variety_ids AS text[])) ORDER BY variety_name"),
-        {"variety_ids": variety_ids},
+        text("SELECT variety_name FROM variety_basic WHERE project_id = :project_id AND id = ANY(CAST(:variety_ids AS text[])) ORDER BY variety_name"),
+        {"variety_ids": variety_ids, "project_id": project_id},
     ).mappings().all()
     return [str(row["variety_name"]) for row in rows]
 
 
-def _resolve_variety_names(session: Session, names: list[str]) -> tuple[list[str], list[str]]:
+def _resolve_variety_names(session: Session, names: list[str], project_id: str) -> tuple[list[str], list[str]]:
     if not names:
         return [], []
-    varieties = session.execute(text(VARIETY_LOOKUP_SQL)).mappings().all()
+    varieties = session.execute(text(VARIETY_LOOKUP_SQL), {"project_id": project_id}).mappings().all()
     resolved: list[str] = []
     unresolved: list[str] = []
     for requested in names:

@@ -34,6 +34,7 @@ MAX_GENOTYPE_ARCHIVE_BYTES = 512 * 1024 * 1024
 MAX_TABULAR_BYTES = 32 * 1024 * 1024
 MAX_UNCOMPRESSED_ARCHIVE_BYTES = 1024 * 1024 * 1024
 WORKFLOW_CODE = "rice_gwas_lmm_v1"
+DEFAULT_PROJECT_ID = "00000000-0000-4000-8000-000000000001"
 DEFAULT_PARAMETERS = {
     "maf": 0.05,
     "snp_missing_rate": 0.05,
@@ -76,6 +77,7 @@ def ensure_genomics_schema(session: Session) -> None:
         CREATE TABLE IF NOT EXISTS gwas_analysis_plan (
           id VARCHAR(36) PRIMARY KEY,
           owner_id VARCHAR(120) NOT NULL,
+          project_id VARCHAR(36) NOT NULL DEFAULT '00000000-0000-4000-8000-000000000001',
           status VARCHAR(40) NOT NULL DEFAULT 'collecting',
           trait_name VARCHAR(120) NOT NULL,
           reference_assembly VARCHAR(120) NOT NULL,
@@ -91,6 +93,7 @@ def ensure_genomics_schema(session: Session) -> None:
         )
     """))
     session.execute(text("ALTER TABLE gwas_analysis_plan ADD COLUMN IF NOT EXISTS result_manifest JSONB NOT NULL DEFAULT '{}'::jsonb"))
+    session.execute(text("ALTER TABLE gwas_analysis_plan ADD COLUMN IF NOT EXISTS project_id VARCHAR(36) NOT NULL DEFAULT '00000000-0000-4000-8000-000000000001'"))
     session.execute(text("CREATE INDEX IF NOT EXISTS ix_gwas_analysis_plan_owner_updated ON gwas_analysis_plan(owner_id, updated_at DESC)"))
     session.execute(text("ALTER TABLE gwas_analysis_plan ENABLE ROW LEVEL SECURITY"))
     session.execute(text("ALTER TABLE gwas_analysis_plan FORCE ROW LEVEL SECURITY"))
@@ -98,8 +101,10 @@ def ensure_genomics_schema(session: Session) -> None:
     session.execute(text("""
         CREATE POLICY gwas_analysis_plan_owner_only ON gwas_analysis_plan
         FOR ALL
-        USING (owner_id = current_setting('app.research_user_id', true))
-        WITH CHECK (owner_id = current_setting('app.research_user_id', true))
+        USING (owner_id = current_setting('app.research_user_id', true)
+               AND project_id = current_setting('app.project_id', true))
+        WITH CHECK (owner_id = current_setting('app.research_user_id', true)
+                    AND project_id = current_setting('app.project_id', true))
     """))
 
 
@@ -132,6 +137,7 @@ def _row_to_dict(row: Any) -> dict[str, Any]:
     row = dict(row)
     return {
         "id": row["id"],
+        "project_id": row["project_id"],
         "status": row["status"],
         "trait_name": row["trait_name"],
         "reference_assembly": row["reference_assembly"],
@@ -215,17 +221,18 @@ def _update_plan(session: Session, plan_id: str, *, manifest: dict[str, Any], pr
     return _plan_row(session, plan_id)
 
 
-def create_plan(session: Session, owner_id: str, payload: CreateGwasPlanRequest) -> dict[str, Any]:
+def create_plan(session: Session, owner_id: str, payload: CreateGwasPlanRequest, project_id: str = DEFAULT_PROJECT_ID) -> dict[str, Any]:
     plan_id = str(uuid.uuid4())
     parameters = {**DEFAULT_PARAMETERS, "candidate_window_kb": payload.candidate_window_kb}
     session.execute(text("""
         INSERT INTO gwas_analysis_plan
-        (id, owner_id, status, trait_name, reference_assembly, purpose, workflow_code, parameters, input_manifest, preflight, confirmation, created_at, updated_at)
-        VALUES (:id, :owner_id, 'collecting', :trait_name, :reference_assembly, :purpose, :workflow_code,
+        (id, owner_id, project_id, status, trait_name, reference_assembly, purpose, workflow_code, parameters, input_manifest, preflight, confirmation, created_at, updated_at)
+        VALUES (:id, :owner_id, :project_id, 'collecting', :trait_name, :reference_assembly, :purpose, :workflow_code,
                 CAST(:parameters AS jsonb), '{}'::jsonb, CAST(:preflight AS jsonb), '{}'::jsonb, :now, :now)
     """), {
         "id": plan_id,
         "owner_id": owner_id,
+        "project_id": project_id,
         "trait_name": payload.trait_name.strip(),
         "reference_assembly": payload.reference_assembly.strip(),
         "purpose": payload.purpose.strip(),

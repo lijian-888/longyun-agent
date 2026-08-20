@@ -1,5 +1,8 @@
 beautifulsoup4==4.13.5
 agentscope==1.0.21
+# AgentScope 1.0.21 imports the MCP v1 Streamable HTTP client API. MCP 2.0
+# renamed that API, so keep this transitive dependency reproducible and compatible.
+mcp==1.29.0
 asyncpg==0.30.0
 docling==2.113.0
 fastapi==0.115.6

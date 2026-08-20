@@ -32,6 +32,7 @@ from sqlalchemy.orm import Session
 PDF_FONT = "STSong-Light"
 MOCK_PROGRAM_CODE = "JX-RICE-DEMO-2021"
 MOCK_PROGRAM_NAME = "优质抗病杂交稻区域试验与审定辅助演示项目"
+DEFAULT_PROJECT_ID = "00000000-0000-4000-8000-000000000001"
 NAMESPACE = uuid.UUID("5b4d9df5-1ae9-4f6b-9cee-7f48678893b0")
 MOCK_CANDIDATE_CODES = tuple(f"ME-A{index:02d}" for index in range(1, 9))
 
@@ -202,6 +203,7 @@ def ensure_breeding_dossier_schema(session: Session) -> None:
         """
         CREATE TABLE IF NOT EXISTS breeding_program (
             id VARCHAR(36) PRIMARY KEY,
+            project_id VARCHAR(36) NOT NULL DEFAULT '00000000-0000-4000-8000-000000000001',
             program_code VARCHAR(100) NOT NULL UNIQUE,
             program_name VARCHAR(300) NOT NULL,
             crop_name VARCHAR(80) NOT NULL DEFAULT '水稻',
@@ -283,6 +285,7 @@ def ensure_breeding_dossier_schema(session: Session) -> None:
         )
         """,
         "ALTER TABLE breeding_pedigree_relationship ADD COLUMN IF NOT EXISTS parent_origin TEXT",
+        "ALTER TABLE breeding_program ADD COLUMN IF NOT EXISTS project_id VARCHAR(36) NOT NULL DEFAULT '00000000-0000-4000-8000-000000000001'",
         "ALTER TABLE breeding_pedigree_relationship ADD COLUMN IF NOT EXISTS parent_trait_summary TEXT",
         "ALTER TABLE breeding_pedigree_relationship ADD COLUMN IF NOT EXISTS combination_basis TEXT",
         "ALTER TABLE breeding_pedigree_relationship ADD COLUMN IF NOT EXISTS source_record_no VARCHAR(120)",
@@ -292,6 +295,7 @@ def ensure_breeding_dossier_schema(session: Session) -> None:
         "ALTER TABLE breeding_selection_record ADD COLUMN IF NOT EXISTS retention_reason TEXT",
         "ALTER TABLE breeding_selection_record ADD COLUMN IF NOT EXISTS source_record_no VARCHAR(120)",
         "CREATE INDEX IF NOT EXISTS ix_program_material_material ON breeding_program_material(material_id)",
+        "CREATE INDEX IF NOT EXISTS ix_breeding_program_project ON breeding_program(project_id)",
         "CREATE INDEX IF NOT EXISTS ix_pedigree_child ON breeding_pedigree_relationship(child_material_id)",
         "CREATE INDEX IF NOT EXISTS ix_generation_material ON breeding_generation_record(material_id, event_sequence)",
         "CREATE INDEX IF NOT EXISTS ix_selection_material ON breeding_selection_record(material_id, selection_year)",
@@ -329,20 +333,20 @@ def _demo_parent_profile(index: int, role: str) -> dict[str, str]:
     record_prefix = f"DEMO-PAR-{index:02d}"
     if role == "female":
         return {
-            "origin": "江西水稻育种平台演示亲本库；雌亲本来源为系统模拟档案。",
+            "origin": "海南南繁隆耘平台演示亲本库；雌亲本来源为系统模拟档案。",
             "traits": "演示档案记载：株型较整齐、结实基础较好，作为不育系母本提供细胞质不育条件。",
             "basis": "组合设计以雌亲本的结实基础和不育系属性为母本条件，配合恢复系的恢复性与产量构成表现；该依据为演示设定，正式组合须引用亲本鉴定与原始选配记录。",
             "record_no": f"{record_prefix}-F",
         }
     return {
-        "origin": "江西水稻育种平台演示亲本库；父本来源为系统模拟档案。",
+        "origin": "海南南繁隆耘平台演示亲本库；父本来源为系统模拟档案。",
         "traits": "演示档案记载：恢复性、穗粒数和千粒重基础较好，作为恢复系父本用于恢复育性并补充产量构成。",
         "basis": "组合设计以雌亲本的结实基础和不育系属性为母本条件，配合恢复系的恢复性与产量构成表现；该依据为演示设定，正式组合须引用亲本鉴定与原始选配记录。",
         "record_no": f"{record_prefix}-M",
     }
 
 
-def seed_mock_breeding_dossiers(session: Session) -> int:
+def seed_mock_breeding_dossiers(session: Session, project_id: str = DEFAULT_PROJECT_ID) -> int:
     """Attach mock dossiers to the existing simulated regional-trial materials.
 
     The function is idempotent and intentionally does nothing until the
@@ -357,14 +361,16 @@ def seed_mock_breeding_dossiers(session: Session) -> int:
     if not candidate_rows:
         return 0
 
-    program_id = _id("program", MOCK_PROGRAM_CODE)
+    program_id = _id("program", project_id, MOCK_PROGRAM_CODE)
+    program_code = f"{MOCK_PROGRAM_CODE}-{project_id[:8]}"
     session.execute(text("""
         INSERT INTO breeding_program (
-            id, program_code, program_name, crop_name, breeding_target,
+            id, project_id, program_code, program_name, crop_name, breeding_target,
             target_ecological_zone, leading_unit, start_year, status, description, is_simulated
         ) VALUES (
-            :id, :code, :name, '水稻', :target, :zone, :unit, 2021, 'demo', :description, TRUE
+            :id, :project_id, :code, :name, '水稻', :target, :zone, :unit, 2021, 'demo', :description, TRUE
         ) ON CONFLICT (program_code) DO UPDATE SET
+            project_id = EXCLUDED.project_id,
             program_name = EXCLUDED.program_name,
             breeding_target = EXCLUDED.breeding_target,
             target_ecological_zone = EXCLUDED.target_ecological_zone,
@@ -372,11 +378,12 @@ def seed_mock_breeding_dossiers(session: Session) -> int:
             is_simulated = TRUE
     """), {
         "id": program_id,
-        "code": MOCK_PROGRAM_CODE,
+        "project_id": project_id,
+        "code": program_code,
         "name": MOCK_PROGRAM_NAME,
         "target": "面向江西中籼稻区的高产稳产、较好米质、较低穗瘟与倒伏风险组合筛选。",
         "zone": "赣北平原稻作区、赣东丘陵稻作区、赣南丘陵双季稻区",
-        "unit": "江西水稻育种平台演示课题组",
+        "unit": "海南南繁隆耘平台演示课题组",
         "description": "该项目、系谱、世代和选择记录均为系统演示模拟数据；仅用于展示审定辅助材料的数据组织方式。",
     })
 
@@ -392,7 +399,7 @@ def seed_mock_breeding_dossiers(session: Session) -> int:
             ON CONFLICT (program_id, material_id) DO UPDATE SET
                 selection_stage = EXCLUDED.selection_stage, source_note = EXCLUDED.source_note, is_simulated = TRUE
         """), {
-            "id": _id("program-material", MOCK_PROGRAM_CODE, code), "program_id": program_id, "material_id": material_id,
+            "id": _id("program-material", project_id, MOCK_PROGRAM_CODE, code), "program_id": program_id, "material_id": material_id,
             "note": "由模拟区域试验资料包关联生成；真实项目须由育种团队补录并审核。",
         })
         for parent_id, role, parent_code in ((female_id, "female", female_code), (male_id, "male", male_code)):
@@ -427,7 +434,7 @@ def seed_mock_breeding_dossiers(session: Session) -> int:
         ]
         generation_ids: dict[int, str] = {}
         for sequence, year, site, generation, stage, method, result in stage_rows:
-            record_id = _id("generation", code, sequence)
+            record_id = _id("generation", project_id, code, sequence)
             generation_ids[sequence] = record_id
             session.execute(text("""
                 INSERT INTO breeding_generation_record (
@@ -455,7 +462,7 @@ def seed_mock_breeding_dossiers(session: Session) -> int:
             (5, 2025, "江西多点", "多年多点产量、稳定性、倒伏和穗瘟风险综合审查", "candidate", 3, 1, 66.67, "形成审定辅助草稿候选对象；不代表已通过任何审定。", f"DEMO-SEL-{code}-2025-05", "形成审定辅助草稿候选对象；不代表已通过任何审定。"),
         ]
         for sequence, year, site, criterion, decision, input_count, retained_count, elimination_rate, retention_reason, source_record_no, evidence in selection_rows:
-            selection_id = _id("selection", code, sequence)
+            selection_id = _id("selection", project_id, code, sequence)
             session.execute(text("""
                 INSERT INTO breeding_selection_record (
                     id, program_id, material_id, generation_record_id, selection_year, selection_site,
@@ -495,7 +502,7 @@ def _normalized(value: Any) -> str:
     return re.sub(r"[\s()（）\[\]【】_\-－]", "", str(value or "")).lower()
 
 
-def _resolve_material(session: Session, question: str) -> dict[str, Any]:
+def _resolve_material(session: Session, question: str, project_id: str) -> dict[str, Any]:
     rows = session.execute(text("""
         SELECT material.id, material.material_code, material.material_name, material.aliases,
                program.id AS program_id, program.program_code, program.program_name, program.breeding_target,
@@ -504,9 +511,9 @@ def _resolve_material(session: Session, question: str) -> dict[str, Any]:
         FROM breeding_program_material link
         JOIN breeding_program program ON program.id = link.program_id
         JOIN breeding_material material ON material.id = link.material_id
-        WHERE link.material_role = 'candidate_hybrid'
+        WHERE link.material_role = 'candidate_hybrid' AND program.project_id = :project_id
         ORDER BY material.material_code
-    """)).mappings().all()
+    """), {"project_id": project_id}).mappings().all()
     question_key = _normalized(question)
     matches: list[dict[str, Any]] = []
     for raw in rows:
@@ -528,9 +535,9 @@ def _resolve_material(session: Session, question: str) -> dict[str, Any]:
     raise BreedingDossierError("问题中命中了多个候选材料，请只指定一个材料后再生成品种选育报告。")
 
 
-def build_breeding_report_context(session: Session, question: str) -> dict[str, Any]:
+def build_breeding_report_context(session: Session, question: str, project_id: str = DEFAULT_PROJECT_ID) -> dict[str, Any]:
     """Collect only published trial facts plus the explicitly simulated dossier."""
-    material = _resolve_material(session, question)
+    material = _resolve_material(session, question, project_id)
     material_id = str(material["id"])
     parents = [dict(row) for row in session.execute(text("""
         SELECT relation.parent_role, parent.material_code, parent.material_name, relation.relationship_type,
@@ -570,8 +577,9 @@ def build_breeding_report_context(session: Session, question: str) -> dict[str, 
         WHERE summary.material_id = :material_id
           AND trial.data_status = 'published'
           AND package.governance_status = 'published'
+          AND package.project_id = :project_id
         ORDER BY summary.trial_year, summary.site_name, summary.treatment_code
-    """), {"material_id": material_id}).mappings().all()]
+    """), {"material_id": material_id, "project_id": project_id}).mappings().all()]
     standard_records = [item for item in trial_records if item.get("treatment_code") == "M1"] or trial_records
     numeric_fields = ("yield_per_mu", "plant_height", "thousand_grain_weight", "seed_setting_rate", "head_rice_rate", "chalkiness_degree", "panicle_blast_score", "lodging_score")
     averages: dict[str, float | None] = {}

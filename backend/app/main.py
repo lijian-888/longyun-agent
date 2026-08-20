@@ -18,7 +18,7 @@ from urllib.parse import quote, urljoin
 import fitz
 import httpx
 from bs4 import BeautifulSoup
-from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
@@ -32,7 +32,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, create_engine, event, func, select, text
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker, with_loader_criteria
 from pgvector.sqlalchemy import Vector
 
 from .acps_adapter import (
@@ -45,6 +45,7 @@ from .acps_adapter import (
 from .auth import (
     CurrentUser,
     audit_actor,
+    require_business_user,
     require_data_platform_user,
     require_data_processor,
     require_field_admin,
@@ -54,6 +55,7 @@ from .auth import (
     require_researcher,
 )
 from .document_parser import SUPPORTED_SUFFIXES, VISION_IMAGE_SUFFIXES, parse_local_document
+from .conversation_title import DEFAULT_RESEARCH_SESSION_TITLE, auto_title_for_first_message
 from .genomics import (
     AttachGenotypeAssetRequest,
     CreateGwasPlanRequest,
@@ -167,6 +169,16 @@ TRUSTED_HOSTS = [
 ]
 RAW_STORAGE_DIR = Path(os.getenv("RAW_STORAGE_DIR", "./data/raw"))
 RESEARCH_STORAGE_DIR = Path(os.getenv("RESEARCH_STORAGE_DIR", "./data/research"))
+
+# The application is intentionally single-institution.  This identifier is
+# server-owned and is never accepted from a browser form or access token.
+INSTITUTION_ID = "hainan-nanfan"
+INSTITUTION_CODE = "HNNF"
+INSTITUTION_NAME = "海南南繁"
+DEFAULT_PROJECT_ID = "00000000-0000-4000-8000-000000000001"
+DEFAULT_PROJECT_CODE = "HNNF-DEFAULT"
+DEFAULT_PROJECT_NAME = "海南南繁水稻育种研究"
+BUSINESS_ROLES = ("data_processor", "field_admin", "researcher")
 
 
 def _unsafe_production_value(value: str) -> bool:
@@ -308,10 +320,80 @@ class Base(DeclarativeBase):
     pass
 
 
+class Institution(Base):
+    __tablename__ = "institution"
+
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    institution_code: Mapped[str] = mapped_column(String(40), unique=True)
+    institution_name: Mapped[str] = mapped_column(String(200))
+    status: Mapped[str] = mapped_column(String(30), default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class PlatformAccount(Base):
+    """Application directory entry backed by a Keycloak account."""
+
+    __tablename__ = "platform_account"
+
+    username: Mapped[str] = mapped_column(String(120), primary_key=True)
+    keycloak_subject: Mapped[str | None] = mapped_column(String(120), nullable=True, unique=True)
+    display_name: Mapped[str] = mapped_column(String(200))
+    business_role: Mapped[str] = mapped_column(String(40), index=True)
+    institution_id: Mapped[str] = mapped_column(String(80), default=INSTITUTION_ID, index=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+
+class ResearchProject(Base):
+    """A project boundary inside the one Hainan NanFan institution."""
+
+    __tablename__ = "research_project"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_code: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    project_name: Mapped[str] = mapped_column(String(300))
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    institution_id: Mapped[str] = mapped_column(String(80), default=INSTITUTION_ID, index=True)
+    status: Mapped[str] = mapped_column(String(30), default="active", index=True)
+    created_by: Mapped[str] = mapped_column(String(120))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+
+class ProjectMember(Base):
+    __tablename__ = "project_member"
+    __table_args__ = (UniqueConstraint("project_id", "username", name="uq_project_member_project_user"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_id: Mapped[str] = mapped_column(ForeignKey("research_project.id", ondelete="CASCADE"), index=True)
+    username: Mapped[str] = mapped_column(ForeignKey("platform_account.username", ondelete="CASCADE"), index=True)
+    member_role: Mapped[str] = mapped_column(String(40), default="researcher")
+    created_by: Mapped[str] = mapped_column(String(120))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class PermissionAudit(Base):
+    __tablename__ = "permission_audit"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    actor_id: Mapped[str] = mapped_column(String(120), index=True)
+    actor_name: Mapped[str] = mapped_column(String(200))
+    action: Mapped[str] = mapped_column(String(100), index=True)
+    target_type: Mapped[str] = mapped_column(String(80), index=True)
+    target_id: Mapped[str] = mapped_column(String(160), index=True)
+    project_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    before_state: Mapped[dict] = mapped_column(JSON, default=dict)
+    after_state: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+
+
 class Variety(Base):
     __tablename__ = "variety_basic"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_id: Mapped[str] = mapped_column(ForeignKey("research_project.id"), default=DEFAULT_PROJECT_ID, index=True)
     variety_name: Mapped[str] = mapped_column(String(200), index=True)
     normalized_name: Mapped[str] = mapped_column(String(200), index=True)
     alias_names: Mapped[list] = mapped_column(JSON, default=list)
@@ -335,6 +417,7 @@ class SourceReview(Base):
     __tablename__ = "source_review"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_id: Mapped[str] = mapped_column(ForeignKey("research_project.id"), default=DEFAULT_PROJECT_ID, index=True)
     source_type: Mapped[str] = mapped_column(String(30))
     source_name: Mapped[str] = mapped_column(String(500))
     source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -353,6 +436,7 @@ class PhenotypeObservation(Base):
     __tablename__ = "phenotype_observation"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_id: Mapped[str] = mapped_column(ForeignKey("research_project.id"), default=DEFAULT_PROJECT_ID, index=True)
     variety_id: Mapped[str] = mapped_column(ForeignKey("variety_basic.id"), index=True)
     source_review_id: Mapped[str | None] = mapped_column(ForeignKey("source_review.id"), nullable=True)
     trait_code: Mapped[str] = mapped_column(String(100), index=True)
@@ -419,7 +503,7 @@ class TemplateVersion(Base):
     change_summary: Mapped[str] = mapped_column(Text)
     field_definitions: Mapped[list] = mapped_column(JSON, default=list)
     status: Mapped[str] = mapped_column(String(30), default="published")
-    created_by: Mapped[str] = mapped_column(String(100), default="系统管理员")
+    created_by: Mapped[str] = mapped_column(String(100), default="字段管理员")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
@@ -427,6 +511,7 @@ class FieldChangeRequest(Base):
     __tablename__ = "field_change_request"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_id: Mapped[str] = mapped_column(ForeignKey("research_project.id"), default=DEFAULT_PROJECT_ID, index=True)
     source_review_id: Mapped[str] = mapped_column(ForeignKey("source_review.id"), index=True)
     template_id: Mapped[str] = mapped_column(ForeignKey("data_template.id"), index=True)
     source_field: Mapped[str] = mapped_column(String(200))
@@ -444,6 +529,7 @@ class RootPhenotypeObservation(Base):
     __tablename__ = "root_phenotype_observation"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_id: Mapped[str] = mapped_column(ForeignKey("research_project.id"), default=DEFAULT_PROJECT_ID, index=True)
     variety_id: Mapped[str] = mapped_column(ForeignKey("variety_basic.id"), index=True)
     source_review_id: Mapped[str | None] = mapped_column(ForeignKey("source_review.id"), nullable=True)
     trait_code: Mapped[str] = mapped_column(String(100), index=True)
@@ -465,8 +551,9 @@ class ResearchSession(Base):
     __tablename__ = "research_session"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_id: Mapped[str] = mapped_column(ForeignKey("research_project.id"), default=DEFAULT_PROJECT_ID, index=True)
     owner_id: Mapped[str] = mapped_column(String(120), index=True)
-    title: Mapped[str] = mapped_column(String(200), default="新会话")
+    title: Mapped[str] = mapped_column(String(200), default=DEFAULT_RESEARCH_SESSION_TITLE)
     memory_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     memory_state: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
@@ -480,6 +567,7 @@ class ResearchMessage(Base):
     __tablename__ = "research_message"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_id: Mapped[str] = mapped_column(ForeignKey("research_project.id"), default=DEFAULT_PROJECT_ID, index=True)
     session_id: Mapped[str] = mapped_column(ForeignKey("research_session.id", ondelete="CASCADE"), index=True)
     owner_id: Mapped[str] = mapped_column(String(120), index=True)
     role: Mapped[str] = mapped_column(String(20))
@@ -495,6 +583,7 @@ class ResearchAttachment(Base):
     __tablename__ = "research_attachment"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_id: Mapped[str] = mapped_column(ForeignKey("research_project.id"), default=DEFAULT_PROJECT_ID, index=True)
     session_id: Mapped[str] = mapped_column(ForeignKey("research_session.id", ondelete="CASCADE"), index=True)
     owner_id: Mapped[str] = mapped_column(String(120), index=True)
     file_name: Mapped[str] = mapped_column(String(500))
@@ -515,6 +604,7 @@ class ResearchAudit(Base):
     __tablename__ = "research_audit"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_id: Mapped[str] = mapped_column(ForeignKey("research_project.id"), default=DEFAULT_PROJECT_ID, index=True)
     owner_id: Mapped[str] = mapped_column(String(120), index=True)
     session_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     action: Mapped[str] = mapped_column(String(100))
@@ -536,6 +626,7 @@ class ResearchResult(Base):
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_id: Mapped[str] = mapped_column(ForeignKey("research_project.id"), default=DEFAULT_PROJECT_ID, index=True)
     owner_id: Mapped[str] = mapped_column(String(120), index=True)
     session_id: Mapped[str | None] = mapped_column(ForeignKey("research_session.id", ondelete="SET NULL"), nullable=True, index=True)
     source_message_id: Mapped[str | None] = mapped_column(ForeignKey("research_message.id", ondelete="SET NULL"), nullable=True, index=True)
@@ -557,6 +648,7 @@ class KnowledgeFolder(Base):
     __tablename__ = "knowledge_folder"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_id: Mapped[str] = mapped_column(ForeignKey("research_project.id"), default=DEFAULT_PROJECT_ID, index=True)
     scope: Mapped[str] = mapped_column(String(20), index=True)
     owner_id: Mapped[str] = mapped_column(String(120), index=True)
     parent_id: Mapped[str | None] = mapped_column(ForeignKey("knowledge_folder.id", ondelete="CASCADE"), nullable=True, index=True)
@@ -573,6 +665,7 @@ class KnowledgeDocument(Base):
     __tablename__ = "knowledge_document"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_id: Mapped[str] = mapped_column(ForeignKey("research_project.id"), default=DEFAULT_PROJECT_ID, index=True)
     scope: Mapped[str] = mapped_column(String(20), index=True)
     owner_id: Mapped[str] = mapped_column(String(120), index=True)
     folder_id: Mapped[str | None] = mapped_column(ForeignKey("knowledge_folder.id", ondelete="SET NULL"), nullable=True, index=True)
@@ -608,6 +701,7 @@ class KnowledgeChunk(Base):
     __tablename__ = "knowledge_chunk"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_id: Mapped[str] = mapped_column(ForeignKey("research_project.id"), default=DEFAULT_PROJECT_ID, index=True)
     document_id: Mapped[str] = mapped_column(ForeignKey("knowledge_document.id", ondelete="CASCADE"), index=True)
     scope: Mapped[str] = mapped_column(String(20), index=True)
     owner_id: Mapped[str] = mapped_column(String(120), index=True)
@@ -634,6 +728,106 @@ def get_session() -> Generator[Session, None, None]:
         session.close()
 
 
+def _business_role(user: CurrentUser) -> str:
+    for role in ("field_admin", "data_processor", "researcher"):
+        if role in user.roles:
+            return role
+    raise HTTPException(403, "当前账号未配置海南南繁平台业务角色。")
+
+
+def sync_platform_account(session: Session, user: CurrentUser) -> PlatformAccount:
+    """Keep the application directory aligned with the verified Keycloak identity."""
+    role = _business_role(user)
+    account = session.get(PlatformAccount, user.username)
+    if not account:
+        account = PlatformAccount(
+            username=user.username,
+            keycloak_subject=user.id,
+            display_name=user.display_name or user.username,
+            business_role=role,
+            institution_id=INSTITUTION_ID,
+            active=True,
+        )
+        session.add(account)
+    else:
+        account.keycloak_subject = user.id
+        account.display_name = user.display_name or user.username
+        account.business_role = role
+        account.institution_id = INSTITUTION_ID
+    account.last_login_at = datetime.now(timezone.utc)
+    session.flush()
+    if not account.active:
+        raise HTTPException(403, "当前业务账号已停用，请联系字段管理员。")
+    return account
+
+
+def accessible_projects(session: Session, user: CurrentUser) -> list[ResearchProject]:
+    sync_platform_account(session, user)
+    statement = select(ResearchProject).where(
+        ResearchProject.institution_id == INSTITUTION_ID,
+        ResearchProject.status == "active",
+    )
+    if "researcher" in user.roles and not {"field_admin", "data_processor"}.intersection(user.roles):
+        statement = statement.join(ProjectMember, ProjectMember.project_id == ResearchProject.id).where(
+            ProjectMember.username == user.username
+        )
+    return list(session.scalars(statement.order_by(ResearchProject.created_at, ResearchProject.project_name)).all())
+
+
+def resolve_project_access(session: Session, user: CurrentUser, requested_project_id: str | None = None) -> ResearchProject:
+    projects = accessible_projects(session, user)
+    if not projects:
+        raise HTTPException(403, "当前账号尚未加入任何课题，请联系字段管理员分配课题。")
+    project_id = (requested_project_id or "").strip()
+    if project_id:
+        project = next((item for item in projects if item.id == project_id), None)
+        if not project:
+            raise HTTPException(403, "当前账号无权访问所选课题。")
+        return project
+    return next((item for item in projects if item.id == DEFAULT_PROJECT_ID), projects[0])
+
+
+def record_permission_audit(
+    session: Session,
+    user: CurrentUser,
+    action: str,
+    target_type: str,
+    target_id: str,
+    *,
+    project_id: str | None = None,
+    before: dict[str, Any] | None = None,
+    after: dict[str, Any] | None = None,
+) -> None:
+    session.add(PermissionAudit(
+        actor_id=user.id,
+        actor_name=audit_actor(user),
+        action=action,
+        target_type=target_type,
+        target_id=target_id,
+        project_id=project_id,
+        before_state=before or {},
+        after_state=after or {},
+    ))
+
+
+def serialize_project(project: ResearchProject, member_count: int | None = None) -> dict[str, Any]:
+    result = {
+        "id": project.id,
+        "project_code": project.project_code,
+        "project_name": project.project_name,
+        "description": project.description or "",
+        "institution_id": project.institution_id,
+        "institution_name": INSTITUTION_NAME,
+        "status": project.status,
+        "created_by": project.created_by,
+        "created_at": project.created_at.isoformat(),
+        "updated_at": project.updated_at.isoformat(),
+    }
+    if member_count is not None:
+        result["member_count"] = member_count
+    return result
+
+
 @event.listens_for(Session, "after_begin")
 def apply_request_rls_context(session: Session, _transaction: Any, connection: Any) -> None:
     """Restore request-scoped RLS variables whenever a pooled connection begins work.
@@ -655,6 +849,12 @@ def apply_request_rls_context(session: Session, _transaction: Any, connection: A
             text("SELECT set_config('app.knowledge_is_admin', :is_admin, true)"),
             {"is_admin": session.info["knowledge_is_admin"]},
         )
+    project_id = session.info.get("active_project_id")
+    if project_id:
+        connection.execute(
+            text("SELECT set_config('app.project_id', :project_id, true)"),
+            {"project_id": project_id},
+        )
 
 
 def _set_research_owner(session: Session, owner_id: str) -> None:
@@ -666,12 +866,25 @@ def _set_research_owner(session: Session, owner_id: str) -> None:
     )
 
 
+def _set_active_project(session: Session, project_id: str) -> None:
+    session.info["active_project_id"] = project_id
+    session.execute(
+        text("SELECT set_config('app.project_id', :project_id, true)"),
+        {"project_id": project_id},
+    )
+
+
 def get_research_session(
+    x_project_id: str | None = Header(default=None, alias="X-Project-Id"),
     user: CurrentUser = Depends(require_researcher),
 ) -> Generator[Session, None, None]:
     session = SessionLocal()
     try:
         _set_research_owner(session, user.id)
+        session.info["research_username"] = user.username
+        session.info["research_roles"] = tuple(user.roles)
+        project = resolve_project_access(session, user, x_project_id)
+        _set_active_project(session, project.id)
         yield session
     finally:
         session.close()
@@ -680,6 +893,8 @@ def get_research_session(
 def _set_knowledge_context(session: Session, user: CurrentUser) -> None:
     """Set RLS variables for both the caller identity and the public-KB admin gate."""
     _set_research_owner(session, user.id)
+    session.info["research_username"] = user.username
+    session.info["research_roles"] = tuple(user.roles)
     session.info["knowledge_is_admin"] = "true" if "field_admin" in user.roles else "false"
     session.execute(
         text("SELECT set_config('app.knowledge_is_admin', :is_admin, true)"),
@@ -688,14 +903,78 @@ def _set_knowledge_context(session: Session, user: CurrentUser) -> None:
 
 
 def get_knowledge_session(
+    x_project_id: str | None = Header(default=None, alias="X-Project-Id"),
     user: CurrentUser = Depends(require_knowledge_user),
 ) -> Generator[Session, None, None]:
     session = SessionLocal()
     try:
         _set_knowledge_context(session, user)
+        project = resolve_project_access(session, user, x_project_id)
+        _set_active_project(session, project.id)
         yield session
     finally:
         session.close()
+
+
+def active_project_id(session: Session) -> str:
+    return str(session.info.get("active_project_id") or DEFAULT_PROJECT_ID)
+
+
+def get_business_project_session(
+    x_project_id: str | None = Header(default=None, alias="X-Project-Id"),
+    user: CurrentUser = Depends(require_business_user),
+) -> Generator[Session, None, None]:
+    session = SessionLocal()
+    try:
+        project = resolve_project_access(session, user, x_project_id)
+        _set_active_project(session, project.id)
+        yield session
+    finally:
+        session.close()
+
+
+PROJECT_SCOPED_MODELS = (
+    Variety,
+    SourceReview,
+    PhenotypeObservation,
+    RootPhenotypeObservation,
+    ResearchSession,
+    ResearchMessage,
+    ResearchAttachment,
+    ResearchAudit,
+    ResearchResult,
+    KnowledgeFolder,
+    KnowledgeDocument,
+    KnowledgeChunk,
+    FieldChangeRequest,
+)
+
+
+@event.listens_for(Session, "before_flush")
+def assign_active_project_to_new_rows(session: Session, _flush_context: Any, _instances: Any) -> None:
+    project_id = session.info.get("active_project_id")
+    if not project_id:
+        return
+    for item in session.new:
+        if isinstance(item, PROJECT_SCOPED_MODELS) and not getattr(item, "project_id", None):
+            item.project_id = str(project_id)
+
+
+@event.listens_for(Session, "do_orm_execute")
+def restrict_orm_selects_to_active_project(execute_state: Any) -> None:
+    if not execute_state.is_select:
+        return
+    project_id = execute_state.session.info.get("active_project_id")
+    if not project_id:
+        return
+    statement = execute_state.statement
+    for model in PROJECT_SCOPED_MODELS:
+        statement = statement.options(with_loader_criteria(
+            model,
+            lambda cls: cls.project_id == project_id,
+            include_aliases=True,
+        ))
+    execute_state.statement = statement
 
 
 TRAITS: dict[str, dict[str, Any]] = {
@@ -1264,15 +1543,15 @@ async def parse_uploaded_content(filename: str, content: bytes, template: DataTe
 
 
 def serialize_source(source: SourceReview) -> dict[str, Any]:
-    return {"id": source.id, "source_type": source.source_type, "source_name": source.source_name, "source_url": source.source_url, "raw_text": source.raw_text or "", "page_or_locator": source.page_or_locator, "parsing_status": source.parsing_status, "quality_status": source.quality_status, "template_version_id": source.template_version_id, "review_history": source.review_history or [], "created_at": source.created_at.isoformat()}
+    return {"id": source.id, "project_id": source.project_id, "source_type": source.source_type, "source_name": source.source_name, "source_url": source.source_url, "raw_text": source.raw_text or "", "page_or_locator": source.page_or_locator, "parsing_status": source.parsing_status, "quality_status": source.quality_status, "template_version_id": source.template_version_id, "review_history": source.review_history or [], "created_at": source.created_at.isoformat()}
 
 
 def serialize_observation(observation: PhenotypeObservation) -> dict[str, Any]:
-    return {"id": observation.id, "variety_id": observation.variety_id, "source_review_id": observation.source_review_id, "trait_code": observation.trait_code, "trait_name": observation.trait_name, "trait_category": observation.trait_category, "observation_type": observation.observation_type, "value_numeric": observation.value_numeric, "value_text": observation.value_text, "unit": observation.unit, "original_value": observation.original_value, "original_field": observation.original_field, "source_locator": observation.source_locator, "trial_year": observation.trial_year, "trial_location": observation.trial_location, "evaluation_method": observation.evaluation_method, "rule_version": observation.rule_version, "quality_status": observation.quality_status, "publish_status": observation.publish_status, "review_comment": observation.review_comment, "created_at": observation.created_at.isoformat()}
+    return {"id": observation.id, "project_id": observation.project_id, "variety_id": observation.variety_id, "source_review_id": observation.source_review_id, "trait_code": observation.trait_code, "trait_name": observation.trait_name, "trait_category": observation.trait_category, "observation_type": observation.observation_type, "value_numeric": observation.value_numeric, "value_text": observation.value_text, "unit": observation.unit, "original_value": observation.original_value, "original_field": observation.original_field, "source_locator": observation.source_locator, "trial_year": observation.trial_year, "trial_location": observation.trial_location, "evaluation_method": observation.evaluation_method, "rule_version": observation.rule_version, "quality_status": observation.quality_status, "publish_status": observation.publish_status, "review_comment": observation.review_comment, "created_at": observation.created_at.isoformat()}
 
 
 def serialize_variety(variety: Variety, include_observations: bool = False) -> dict[str, Any]:
-    data = {"id": variety.id, "variety_name": variety.variety_name, "alias_names": variety.alias_names or [], "raw_variety_title": variety.raw_variety_title, "variety_type": variety.variety_type, "female_parent": variety.female_parent, "male_parent": variety.male_parent, "breeding_unit": variety.breeding_unit, "approval_number": variety.approval_number, "approval_year": variety.approval_year, "suitable_region": variety.suitable_region, "data_status": variety.data_status}
+    data = {"id": variety.id, "project_id": variety.project_id, "variety_name": variety.variety_name, "alias_names": variety.alias_names or [], "raw_variety_title": variety.raw_variety_title, "variety_type": variety.variety_type, "female_parent": variety.female_parent, "male_parent": variety.male_parent, "breeding_unit": variety.breeding_unit, "approval_number": variety.approval_number, "approval_year": variety.approval_year, "suitable_region": variety.suitable_region, "data_status": variety.data_status}
     if include_observations:
         data["observations"] = [serialize_observation(item) for item in variety.observations]
     return data
@@ -1395,7 +1674,7 @@ def seed_templates(session: Session) -> None:
         template = DataTemplate(template_code=code, template_name=name, data_scope=scope, target_table=target, description=description)
         session.add(template)
         session.flush()
-        version = TemplateVersion(template_id=template.id, version="v1.0", change_summary="第一版预置标准模板", field_definitions=fields, created_by="系统管理员")
+        version = TemplateVersion(template_id=template.id, version="v1.0", change_summary="第一版预置标准模板", field_definitions=fields, created_by="字段管理员")
         session.add(version)
         session.flush()
         template.current_version_id = version.id
@@ -1730,7 +2009,7 @@ class TemplateVersionCreate(BaseModel):
     max_value: float | None = None
     severity: str = "warning"
     request_id: str | None = None
-    actor: str = "系统管理员"
+    actor: str = "字段管理员"
 
 
 class FieldChangeRequestCreate(BaseModel):
@@ -1741,8 +2020,28 @@ class FieldChangeRequestCreate(BaseModel):
     actor: str = "数据处理员-张三"
 
 
+class ProjectCreate(BaseModel):
+    project_code: str = Field(min_length=2, max_length=80, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    project_name: str = Field(min_length=2, max_length=300)
+    description: str = Field(default="", max_length=2000)
+
+
+class ProjectUpdate(BaseModel):
+    project_name: str | None = Field(default=None, min_length=2, max_length=300)
+    description: str | None = Field(default=None, max_length=2000)
+    status: Literal["active", "archived"] | None = None
+
+
+class ProjectMemberUpdate(BaseModel):
+    member_role: Literal["researcher"] = "researcher"
+
+
+class PlatformAccountUpdate(BaseModel):
+    active: bool
+
+
 class ResearchSessionCreate(BaseModel):
-    title: str = Field(default="新会话", min_length=1, max_length=200)
+    title: str = Field(default=DEFAULT_RESEARCH_SESSION_TITLE, min_length=1, max_length=200)
 
 
 class ResearchSessionRename(BaseModel):
@@ -1861,6 +2160,7 @@ def _serialize_research_skill(skill: dict[str, Any], last_opened_at: datetime | 
 def serialize_research_session(item: ResearchSession) -> dict[str, Any]:
     return {
         "id": item.id,
+        "project_id": item.project_id,
         "title": item.title,
         "created_at": item.created_at.isoformat(),
         "updated_at": item.updated_at.isoformat(),
@@ -1871,6 +2171,7 @@ def serialize_research_message(item: ResearchMessage) -> dict[str, Any]:
     operation_state = item.operation_state or []
     return {
         "id": item.id,
+        "project_id": item.project_id,
         "role": item.role,
         "content": item.content,
         "evidence": item.evidence or [],
@@ -1892,6 +2193,7 @@ RESEARCH_RESULT_LABELS = {
 def serialize_research_result(item: ResearchResult) -> dict[str, Any]:
     return {
         "id": item.id,
+        "project_id": item.project_id,
         "session_id": item.session_id,
         "source_message_id": item.source_message_id,
         "analysis_run_id": item.analysis_run_id,
@@ -1931,6 +2233,7 @@ def _store_research_result(
     session: Session,
     *,
     owner_id: str,
+    project_id: str,
     source_message_id: str,
     session_id: str | None,
     analysis_run_id: str | None,
@@ -1949,6 +2252,7 @@ def _store_research_result(
     ))
     result = existing or ResearchResult(
         owner_id=owner_id,
+        project_id=project_id,
         source_message_id=source_message_id,
         session_id=session_id,
         analysis_run_id=analysis_run_id,
@@ -1962,7 +2266,8 @@ def _store_research_result(
         session.add(result)
         session.flush()
 
-    directory = RESULT_STORAGE_DIR / owner_id / result.id
+    result.project_id = project_id
+    directory = RESULT_STORAGE_DIR / project_id / owner_id / result.id
     directory.mkdir(parents=True, exist_ok=True)
     target_path = directory / _safe_result_filename(file_name, "research_result")
     temporary_path = target_path.with_suffix(f"{target_path.suffix}.tmp")
@@ -1990,6 +2295,7 @@ def _store_gwas_result_bundle(
     session: Session,
     *,
     owner_id: str,
+    project_id: str,
     plan_id: str,
     content: bytes,
     file_name: str,
@@ -2004,6 +2310,7 @@ def _store_gwas_result_bundle(
     if not result:
         result = ResearchResult(
             owner_id=owner_id,
+            project_id=project_id,
             session_id=None,
             source_message_id=None,
             analysis_run_id=plan_id,
@@ -2015,7 +2322,8 @@ def _store_gwas_result_bundle(
         )
         session.add(result)
         session.flush()
-    directory = RESULT_STORAGE_DIR / owner_id / result.id
+    result.project_id = project_id
+    directory = RESULT_STORAGE_DIR / project_id / owner_id / result.id
     directory.mkdir(parents=True, exist_ok=True)
     target = directory / _safe_result_filename(file_name, "rice_gwas_results")
     temporary = target.with_suffix(f"{target.suffix}.tmp")
@@ -2069,6 +2377,7 @@ def _save_structured_result_artifacts(
     saved = [_store_research_result(
         session,
         owner_id=owner_id,
+        project_id=message.project_id,
         source_message_id=message.id,
         session_id=message.session_id,
         analysis_run_id=analysis_run_id,
@@ -2088,6 +2397,7 @@ def _save_structured_result_artifacts(
         saved.append(_store_research_result(
             session,
             owner_id=owner_id,
+            project_id=message.project_id,
             source_message_id=message.id,
             session_id=message.session_id,
             analysis_run_id=analysis_run_id,
@@ -2104,6 +2414,7 @@ def _save_structured_result_artifacts(
 def serialize_research_attachment(item: ResearchAttachment, include_preview: bool = False) -> dict[str, Any]:
     result = {
         "id": item.id,
+        "project_id": item.project_id,
         "file_name": item.file_name,
         "content_type": item.content_type,
         "size_bytes": item.size_bytes,
@@ -2126,6 +2437,7 @@ def serialize_research_attachment(item: ResearchAttachment, include_preview: boo
 def serialize_knowledge_folder(item: KnowledgeFolder) -> dict[str, Any]:
     return {
         "id": item.id,
+        "project_id": item.project_id,
         "scope": item.scope,
         "owner_id": item.owner_id,
         "parent_id": item.parent_id,
@@ -2139,6 +2451,7 @@ def serialize_knowledge_folder(item: KnowledgeFolder) -> dict[str, Any]:
 def serialize_knowledge_document(item: KnowledgeDocument, folder: KnowledgeFolder | None = None) -> dict[str, Any]:
     return {
         "id": item.id,
+        "project_id": item.project_id,
         "scope": item.scope,
         "folder_id": item.folder_id,
         "folder_name": folder.folder_name if folder else "未分类",
@@ -2299,6 +2612,108 @@ def normalize_legacy_range_markers(session: Session) -> None:
         session.commit()
 
 
+def ensure_single_institution_schema(session: Session) -> None:
+    """Install the one-institution/project boundary and backfill legacy rows."""
+    institution = session.get(Institution, INSTITUTION_ID)
+    if not institution:
+        session.add(Institution(
+            id=INSTITUTION_ID,
+            institution_code=INSTITUTION_CODE,
+            institution_name=INSTITUTION_NAME,
+            status="active",
+        ))
+
+    default_accounts = (
+        ("wang.researcher", "王研究员", "researcher"),
+        ("li.researcher", "李研究员", "researcher"),
+        ("zhang.processor", "张数据处理员", "data_processor"),
+        ("chen.fieldadmin", "陈字段管理员", "field_admin"),
+    )
+    for username, display_name, role in default_accounts:
+        account = session.get(PlatformAccount, username)
+        if not account:
+            session.add(PlatformAccount(
+                username=username,
+                display_name=display_name,
+                business_role=role,
+                institution_id=INSTITUTION_ID,
+                active=True,
+            ))
+        else:
+            account.institution_id = INSTITUTION_ID
+
+    project = session.get(ResearchProject, DEFAULT_PROJECT_ID)
+    if not project:
+        project = ResearchProject(
+            id=DEFAULT_PROJECT_ID,
+            project_code=DEFAULT_PROJECT_CODE,
+            project_name=DEFAULT_PROJECT_NAME,
+            description="海南南繁统一默认课题；历史业务数据已自动归入此课题。",
+            institution_id=INSTITUTION_ID,
+            status="active",
+            created_by="system-bootstrap",
+        )
+        session.add(project)
+    else:
+        project.institution_id = INSTITUTION_ID
+    session.flush()
+
+    for username in ("wang.researcher", "li.researcher"):
+        membership = session.scalar(select(ProjectMember).where(
+            ProjectMember.project_id == DEFAULT_PROJECT_ID,
+            ProjectMember.username == username,
+        ))
+        if not membership:
+            session.add(ProjectMember(
+                project_id=DEFAULT_PROJECT_ID,
+                username=username,
+                member_role="researcher",
+                created_by="system-bootstrap",
+            ))
+    session.commit()
+
+    orm_project_tables = (
+        "variety_basic",
+        "source_review",
+        "phenotype_observation",
+        "root_phenotype_observation",
+        "research_session",
+        "research_message",
+        "research_attachment",
+        "research_audit",
+        "research_result",
+        "knowledge_folder",
+        "knowledge_document",
+        "knowledge_chunk",
+        "field_change_request",
+    )
+    raw_project_tables = (
+        "trial_import_batch",
+        "trial_data_package",
+        "field_trial",
+        "gwas_analysis_plan",
+        "genotype_asset",
+        "genotype_asset_version",
+        "genotype_upload_session",
+        "genotype_processing_job",
+        "genotype_sample_mapping",
+        "genotype_governance_request",
+    )
+    for table_name in (*orm_project_tables, *raw_project_tables):
+        exists = session.scalar(text("SELECT to_regclass(:table_name)"), {"table_name": f"public.{table_name}"})
+        if not exists:
+            continue
+        session.execute(text(
+            f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS project_id VARCHAR(36) "
+            f"NOT NULL DEFAULT '{DEFAULT_PROJECT_ID}'"
+        ))
+        session.execute(text(f"UPDATE {table_name} SET project_id = :project_id WHERE project_id IS NULL"), {
+            "project_id": DEFAULT_PROJECT_ID,
+        })
+        session.execute(text(f"CREATE INDEX IF NOT EXISTS ix_{table_name}_project_id ON {table_name}(project_id)"))
+    session.commit()
+
+
 @app.on_event("startup")
 def startup() -> None:
     validate_runtime_configuration()
@@ -2318,6 +2733,7 @@ def startup() -> None:
         ensure_breeding_dossier_schema(session)
         ensure_genomics_schema(session)
         ensure_genotype_asset_schema(session)
+        ensure_single_institution_schema(session)
         retire_legacy_seeded_trial_demo(session)
         session.execute(text("ALTER TABLE source_review ADD COLUMN IF NOT EXISTS template_version_id VARCHAR(36)"))
         session.execute(text("ALTER TABLE research_session ADD COLUMN IF NOT EXISTS memory_state JSONB NOT NULL DEFAULT '{}'::jsonb"))
@@ -2349,23 +2765,316 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/context")
+def platform_context(
+    x_project_id: str | None = Header(default=None, alias="X-Project-Id"),
+    user: CurrentUser = Depends(require_business_user),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    project = resolve_project_access(session, user, x_project_id)
+    projects = accessible_projects(session, user)
+    session.commit()
+    return {
+        "institution": {
+            "id": INSTITUTION_ID,
+            "code": INSTITUTION_CODE,
+            "name": INSTITUTION_NAME,
+        },
+        "user": {
+            "id": user.id,
+            "username": user.username,
+            "display_name": user.display_name,
+            "business_role": _business_role(user),
+            "roles": sorted(user.roles),
+        },
+        "active_project_id": project.id,
+        "projects": [serialize_project(item) for item in projects],
+    }
+
+
+@app.get("/api/projects")
+def list_projects(
+    user: CurrentUser = Depends(require_business_user),
+    session: Session = Depends(get_session),
+) -> list[dict[str, Any]]:
+    projects = accessible_projects(session, user)
+    result = []
+    for project in projects:
+        member_count = session.scalar(select(func.count(ProjectMember.id)).where(ProjectMember.project_id == project.id)) or 0
+        result.append(serialize_project(project, member_count))
+    session.commit()
+    return result
+
+
+@app.post("/api/projects")
+def create_project(
+    payload: ProjectCreate,
+    user: CurrentUser = Depends(require_field_admin),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    sync_platform_account(session, user)
+    code = payload.project_code.strip().upper()
+    if session.scalar(select(ResearchProject.id).where(ResearchProject.project_code == code)):
+        raise HTTPException(409, "课题编号已存在。")
+    project = ResearchProject(
+        project_code=code,
+        project_name=payload.project_name.strip(),
+        description=payload.description.strip() or None,
+        institution_id=INSTITUTION_ID,
+        status="active",
+        created_by=audit_actor(user),
+    )
+    session.add(project)
+    session.flush()
+    seed_public_knowledge_folders(session, project.id)
+    record_permission_audit(
+        session,
+        user,
+        "project_created",
+        "research_project",
+        project.id,
+        project_id=project.id,
+        after={"project_code": project.project_code, "project_name": project.project_name, "status": project.status},
+    )
+    result = serialize_project(project, 0)
+    session.commit()
+    return result
+
+
+@app.patch("/api/projects/{project_id}")
+def update_project(
+    project_id: str,
+    payload: ProjectUpdate,
+    user: CurrentUser = Depends(require_field_admin),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    sync_platform_account(session, user)
+    project = session.get(ResearchProject, project_id)
+    if not project or project.institution_id != INSTITUTION_ID:
+        raise HTTPException(404, "课题不存在。")
+    if project.id == DEFAULT_PROJECT_ID and payload.status == "archived":
+        raise HTTPException(409, "海南南繁默认课题不能停用。")
+    before = {"project_name": project.project_name, "description": project.description or "", "status": project.status}
+    if payload.project_name is not None:
+        project.project_name = payload.project_name.strip()
+    if payload.description is not None:
+        project.description = payload.description.strip() or None
+    if payload.status is not None:
+        project.status = payload.status
+    after = {"project_name": project.project_name, "description": project.description or "", "status": project.status}
+    record_permission_audit(session, user, "project_updated", "research_project", project.id, project_id=project.id, before=before, after=after)
+    session.flush()
+    result = serialize_project(project, session.scalar(select(func.count(ProjectMember.id)).where(ProjectMember.project_id == project.id)) or 0)
+    session.commit()
+    return result
+
+
+@app.get("/api/accounts")
+def list_platform_accounts(
+    user: CurrentUser = Depends(require_field_admin),
+    session: Session = Depends(get_session),
+) -> list[dict[str, Any]]:
+    sync_platform_account(session, user)
+    accounts = session.scalars(select(PlatformAccount).where(
+        PlatformAccount.institution_id == INSTITUTION_ID
+    ).order_by(PlatformAccount.business_role, PlatformAccount.username)).all()
+    session.commit()
+    return [{
+        "username": account.username,
+        "display_name": account.display_name,
+        "business_role": account.business_role,
+        "active": account.active,
+        "identity_bound": bool(account.keycloak_subject),
+        "last_login_at": account.last_login_at.isoformat() if account.last_login_at else None,
+    } for account in accounts]
+
+
+@app.patch("/api/accounts/{username}")
+def update_platform_account(
+    username: str,
+    payload: PlatformAccountUpdate,
+    user: CurrentUser = Depends(require_field_admin),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    sync_platform_account(session, user)
+    account = session.get(PlatformAccount, username)
+    if not account or account.institution_id != INSTITUTION_ID:
+        raise HTTPException(404, "海南南繁账号目录中不存在该账号。")
+    if username == user.username and not payload.active:
+        raise HTTPException(409, "不能停用当前登录的字段管理员账号。")
+    before = {"active": account.active, "business_role": account.business_role}
+    account.active = payload.active
+    record_permission_audit(
+        session,
+        user,
+        "account_activated" if account.active else "account_deactivated",
+        "platform_account",
+        account.username,
+        before=before,
+        after={"active": account.active, "business_role": account.business_role},
+    )
+    result = {
+        "username": account.username,
+        "display_name": account.display_name,
+        "business_role": account.business_role,
+        "active": account.active,
+        "identity_bound": bool(account.keycloak_subject),
+    }
+    session.commit()
+    return result
+
+
+@app.get("/api/projects/{project_id}/members")
+def list_project_members(
+    project_id: str,
+    user: CurrentUser = Depends(require_field_admin),
+    session: Session = Depends(get_session),
+) -> list[dict[str, Any]]:
+    sync_platform_account(session, user)
+    project = session.get(ResearchProject, project_id)
+    if not project or project.institution_id != INSTITUTION_ID:
+        raise HTTPException(404, "课题不存在。")
+    rows = session.execute(
+        select(ProjectMember, PlatformAccount)
+        .join(PlatformAccount, PlatformAccount.username == ProjectMember.username)
+        .where(ProjectMember.project_id == project_id)
+        .order_by(PlatformAccount.display_name)
+    ).all()
+    session.commit()
+    return [{
+        "id": member.id,
+        "username": account.username,
+        "display_name": account.display_name,
+        "business_role": account.business_role,
+        "member_role": member.member_role,
+        "created_by": member.created_by,
+        "created_at": member.created_at.isoformat(),
+    } for member, account in rows]
+
+
+@app.put("/api/projects/{project_id}/members/{username}")
+def upsert_project_member(
+    project_id: str,
+    username: str,
+    payload: ProjectMemberUpdate,
+    user: CurrentUser = Depends(require_field_admin),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    sync_platform_account(session, user)
+    project = session.get(ResearchProject, project_id)
+    account = session.get(PlatformAccount, username)
+    if not project or project.institution_id != INSTITUTION_ID:
+        raise HTTPException(404, "课题不存在。")
+    if not account or account.institution_id != INSTITUTION_ID:
+        raise HTTPException(404, "海南南繁账号目录中不存在该账号。")
+    if account.business_role != "researcher":
+        raise HTTPException(422, "只有科研人员需要配置课题成员关系；数据处理员和字段管理员按岗位访问课题。")
+    member = session.scalar(select(ProjectMember).where(
+        ProjectMember.project_id == project_id,
+        ProjectMember.username == username,
+    ))
+    created = member is None
+    if not member:
+        member = ProjectMember(
+            project_id=project_id,
+            username=username,
+            member_role=payload.member_role,
+            created_by=audit_actor(user),
+        )
+        session.add(member)
+        session.flush()
+    else:
+        member.member_role = payload.member_role
+    record_permission_audit(
+        session,
+        user,
+        "project_member_added" if created else "project_member_updated",
+        "project_member",
+        member.id,
+        project_id=project_id,
+        after={"username": username, "member_role": member.member_role},
+    )
+    result = {"id": member.id, "project_id": project_id, "username": username, "member_role": member.member_role}
+    session.commit()
+    return result
+
+
+@app.delete("/api/projects/{project_id}/members/{username}")
+def remove_project_member(
+    project_id: str,
+    username: str,
+    user: CurrentUser = Depends(require_field_admin),
+    session: Session = Depends(get_session),
+) -> dict[str, bool]:
+    sync_platform_account(session, user)
+    member = session.scalar(select(ProjectMember).where(
+        ProjectMember.project_id == project_id,
+        ProjectMember.username == username,
+    ))
+    if not member:
+        raise HTTPException(404, "课题成员关系不存在。")
+    member_id = member.id
+    record_permission_audit(
+        session,
+        user,
+        "project_member_removed",
+        "project_member",
+        member_id,
+        project_id=project_id,
+        before={"username": username, "member_role": member.member_role},
+    )
+    session.delete(member)
+    session.commit()
+    return {"deleted": True}
+
+
+@app.get("/api/permission-audits")
+def list_permission_audits(
+    project_id: str | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=500),
+    user: CurrentUser = Depends(require_field_admin),
+    session: Session = Depends(get_session),
+) -> list[dict[str, Any]]:
+    sync_platform_account(session, user)
+    statement = select(PermissionAudit)
+    if project_id:
+        statement = statement.where(PermissionAudit.project_id == project_id)
+    rows = session.scalars(statement.order_by(PermissionAudit.created_at.desc()).limit(limit)).all()
+    session.commit()
+    return [{
+        "id": item.id,
+        "actor_name": item.actor_name,
+        "action": item.action,
+        "target_type": item.target_type,
+        "target_id": item.target_id,
+        "project_id": item.project_id,
+        "before": item.before_state,
+        "after": item.after_state,
+        "created_at": item.created_at.isoformat(),
+    } for item in rows]
+
+
 @app.get("/api/trial-packages")
 def get_trial_packages(
+    x_project_id: str | None = Header(default=None, alias="X-Project-Id"),
     user: CurrentUser = Depends(require_data_processor),
     session: Session = Depends(get_session),
 ) -> list[dict[str, Any]]:
     """List regional-trial packages visible to the data processor."""
-    return list_trial_import_batches(session)
+    project = resolve_project_access(session, user, x_project_id)
+    return list_trial_import_batches(session, project.id)
 
 
 @app.get("/api/trial-packages/{batch_id}")
 def get_trial_package(
     batch_id: str,
+    x_project_id: str | None = Header(default=None, alias="X-Project-Id"),
     user: CurrentUser = Depends(require_data_processor),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
     try:
-        return get_trial_import_batch(session, batch_id)
+        project = resolve_project_access(session, user, x_project_id)
+        return get_trial_import_batch(session, batch_id, project.id)
     except ValueError as exc:
         raise HTTPException(404, str(exc)) from exc
 
@@ -2373,16 +3082,19 @@ def get_trial_package(
 @app.post("/api/trial-packages/upload")
 async def upload_trial_package_endpoint(
     file: UploadFile = File(...),
+    x_project_id: str | None = Header(default=None, alias="X-Project-Id"),
     user: CurrentUser = Depends(require_data_processor),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
     try:
+        project = resolve_project_access(session, user, x_project_id)
         return upload_trial_package(
             session,
             file.filename or "regional-trial-package.zip",
             await file.read(),
             audit_actor(user),
             RAW_STORAGE_DIR,
+            project.id,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -2391,12 +3103,14 @@ async def upload_trial_package_endpoint(
 @app.post("/api/trial-packages/{batch_id}/publish")
 def publish_trial_package_endpoint(
     batch_id: str,
+    x_project_id: str | None = Header(default=None, alias="X-Project-Id"),
     user: CurrentUser = Depends(require_data_processor),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
     try:
-        result = publish_trial_package(session, batch_id, audit_actor(user))
-        dossier_count = seed_mock_breeding_dossiers(session)
+        project = resolve_project_access(session, user, x_project_id)
+        result = publish_trial_package(session, batch_id, audit_actor(user), project.id)
+        dossier_count = seed_mock_breeding_dossiers(session, project.id)
         session.commit()
         if dossier_count:
             result["simulated_breeding_dossiers"] = dossier_count
@@ -2453,6 +3167,7 @@ def list_research_skills(
 @app.post("/api/research/skills/{skill_code}/launch")
 def launch_research_skill(
     skill_code: str,
+    x_project_id: str | None = Header(default=None, alias="X-Project-Id"),
     user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
 ) -> dict[str, Any]:
@@ -2462,8 +3177,10 @@ def launch_research_skill(
         raise HTTPException(404, "未找到该科研技能。")
     if skill["status"] != "available":
         raise HTTPException(409, "该技能尚在规划中，当前版本未接入执行能力。")
+    project = resolve_project_access(session, user, x_project_id)
     audit = ResearchAudit(
         owner_id=user.id,
+        project_id=project.id,
         session_id=None,
         action="research_skill_opened",
         audit_metadata={
@@ -2528,7 +3245,7 @@ def create_private_genotype_asset(
     session: Session = Depends(get_research_session),
 ) -> dict[str, Any]:
     try:
-        result = create_genotype_asset(session, user.id, payload)
+        result = create_genotype_asset(session, user.id, payload, active_project_id(session))
         session.commit()
         return result
     except GenotypeAssetError as exc:
@@ -2714,10 +3431,13 @@ def submit_genotype_governance_request(
 
 @app.get("/api/genotype-governance-requests")
 def get_genotype_governance_requests(
+    x_project_id: str | None = Header(default=None, alias="X-Project-Id"),
     user: CurrentUser = Depends(require_data_processor),
     session: Session = Depends(get_session),
 ) -> list[dict[str, Any]]:
     """Metadata-only queue for data processors; raw genotype files stay private."""
+    project = resolve_project_access(session, user, x_project_id)
+    _set_active_project(session, project.id)
     session.execute(text("SELECT set_config('app.genotype_governance_processor', 'true', true)"))
     return list_genotype_governance_requests(session)
 
@@ -2726,10 +3446,13 @@ def get_genotype_governance_requests(
 def resolve_genotype_governance_request_endpoint(
     request_id: str,
     payload: GovernanceRequestResolution,
+    x_project_id: str | None = Header(default=None, alias="X-Project-Id"),
     user: CurrentUser = Depends(require_data_processor),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
     try:
+        project = resolve_project_access(session, user, x_project_id)
+        _set_active_project(session, project.id)
         session.execute(text("SELECT set_config('app.genotype_governance_processor', 'true', true)"))
         result = resolve_genotype_governance_request(session, request_id, audit_actor(user), payload)
         session.commit()
@@ -2794,7 +3517,7 @@ def create_gwas_analysis_plan(
     session: Session = Depends(get_research_session),
 ) -> dict[str, Any]:
     try:
-        result = create_gwas_plan(session, user.id, payload)
+        result = create_gwas_plan(session, user.id, payload, active_project_id(session))
         session.commit()
         return result
     except GenomicsError as exc:
@@ -2914,9 +3637,11 @@ def queue_gwas_analysis_plan(
         result = run_requested_local_execution(session, plan_id, RESEARCH_STORAGE_DIR)
         if result["status"] == "completed":
             content, file_name, metadata = build_local_gwas_result_bundle(session, plan_id, RESEARCH_STORAGE_DIR)
+            project_id = session.execute(text("SELECT project_id FROM gwas_analysis_plan WHERE id = :id"), {"id": plan_id}).scalar_one()
             saved = _store_gwas_result_bundle(
                 session,
                 owner_id=user.id,
+                project_id=str(project_id),
                 plan_id=plan_id,
                 content=content,
                 file_name=file_name,
@@ -2954,9 +3679,11 @@ def archive_completed_gwas_result(
     """Archive an already-completed plan, including runs completed before auto-archive existed."""
     try:
         content, file_name, metadata = build_local_gwas_result_bundle(session, plan_id, RESEARCH_STORAGE_DIR)
+        project_id = session.execute(text("SELECT project_id FROM gwas_analysis_plan WHERE id = :id"), {"id": plan_id}).scalar_one()
         saved = _store_gwas_result_bundle(
             session,
             owner_id=user.id,
+            project_id=str(project_id),
             plan_id=plan_id,
             content=content,
             file_name=file_name,
@@ -2985,10 +3712,12 @@ def research_standard_fields(user: CurrentUser = Depends(require_researcher)) ->
 def research_published_variety_options(
     q: str = Query(default="", max_length=100),
     scope: Literal["rice_phenotype", "root_phenotype"] = Query(default="rice_phenotype"),
+    x_project_id: str | None = Header(default=None, alias="X-Project-Id"),
     user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
 ) -> list[dict[str, Any]]:
     """Search only the published varieties that belong to the active standard template."""
+    project = resolve_project_access(session, user, x_project_id)
     keyword = q.strip()
     if scope == "root_phenotype":
         observation_filter = """
@@ -2996,6 +3725,7 @@ def research_published_variety_options(
                 SELECT 1
                 FROM root_phenotype_observation observation
                 WHERE observation.variety_id = v.id
+                  AND observation.project_id = :project_id
             )
         """
     else:
@@ -3004,6 +3734,7 @@ def research_published_variety_options(
                 SELECT 1
                 FROM phenotype_observation observation
                 WHERE observation.variety_id = v.id
+                  AND observation.project_id = :project_id
                   AND observation.publish_status = 'published'
             )
         """
@@ -3011,6 +3742,7 @@ def research_published_variety_options(
         SELECT v.id, v.variety_name, v.alias_names, v.variety_type, v.approval_number
         FROM variety_basic v
         WHERE v.data_status = 'published'
+          AND v.project_id = :project_id
           AND {observation_filter}
           AND (
               :keyword = ''
@@ -3024,6 +3756,7 @@ def research_published_variety_options(
         LIMIT 20
     """), {
         "keyword": keyword,
+        "project_id": project.id,
         "pattern": f"%{keyword}%",
         "exact": keyword,
     }).mappings().all()
@@ -3039,10 +3772,12 @@ def research_published_variety_options(
 @app.post("/api/research/published-data/query")
 def research_published_data_query(
     payload: ResearchStructuredQueryRequest,
+    x_project_id: str | None = Header(default=None, alias="X-Project-Id"),
     user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
 ) -> dict[str, Any]:
     """Run a user-built query plan through the same guarded templates as the agent."""
+    project = resolve_project_access(session, user, x_project_id)
     normalized_names = [name.strip() for name in payload.variety_names if name.strip()]
     request = StructuredQueryRequest(
         query_needed=True,
@@ -3056,25 +3791,28 @@ def research_published_data_query(
         request,
         TRAITS,
         ROOT_TRAITS,
+        project.id,
     )
     if not plan:
         if unresolved_names:
             raise HTTPException(404, f"未在已发布标准数据中找到：{'、'.join(unresolved_names)}")
         raise HTTPException(422, "请至少选择一个标准字段、填写一个品种/材料名称，或添加一个数值筛选条件。")
     plan = plan.model_copy(update={"limit": payload.limit})
-    execution = execute_published_data_query(session, plan)
+    execution = execute_published_data_query(session, plan, project.id)
     execution.unresolved_variety_names = unresolved_names
     return serialize_public_query_execution(execution)
 
 
 @app.get("/api/research/sessions")
 def list_research_sessions(
+    x_project_id: str | None = Header(default=None, alias="X-Project-Id"),
     user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
 ) -> list[dict[str, Any]]:
+    project = resolve_project_access(session, user, x_project_id)
     items = session.scalars(
         select(ResearchSession)
-        .where(ResearchSession.owner_id == user.id)
+        .where(ResearchSession.owner_id == user.id, ResearchSession.project_id == project.id)
         .order_by(ResearchSession.updated_at.desc())
     ).all()
     return [serialize_research_session(item) for item in items]
@@ -3083,10 +3821,12 @@ def list_research_sessions(
 @app.post("/api/research/sessions")
 def create_research_session(
     payload: ResearchSessionCreate,
+    x_project_id: str | None = Header(default=None, alias="X-Project-Id"),
     user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
 ) -> dict[str, Any]:
-    item = ResearchSession(owner_id=user.id, title=payload.title.strip())
+    project = resolve_project_access(session, user, x_project_id)
+    item = ResearchSession(owner_id=user.id, project_id=project.id, title=payload.title.strip())
     session.add(item)
     session.flush()
     result = serialize_research_session(item)
@@ -3098,6 +3838,15 @@ def get_owned_research_session(session: Session, session_id: str) -> ResearchSes
     item = session.get(ResearchSession, session_id)
     if not item:
         raise HTTPException(404, "未找到该会话，或当前账号无权访问。")
+    username = str(session.info.get("research_username") or "")
+    roles = set(session.info.get("research_roles") or ())
+    if username and "researcher" in roles and not {"field_admin", "data_processor"}.intersection(roles):
+        membership = session.scalar(select(ProjectMember.id).where(
+            ProjectMember.project_id == item.project_id,
+            ProjectMember.username == username,
+        ))
+        if not membership:
+            raise HTTPException(404, "未找到该会话，或当前账号已无权访问所属课题。")
     return item
 
 
@@ -3146,7 +3895,7 @@ def delete_research_session(
             # The database record is gone. A future local maintenance job can
             # remove an orphaned file without retaining research content.
             pass
-    session_dir = RESEARCH_STORAGE_DIR / user.id / research_session_id
+    session_dir = RESEARCH_STORAGE_DIR / item.project_id / user.id / research_session_id
     try:
         session_dir.rmdir()
     except OSError:
@@ -3159,7 +3908,7 @@ def list_research_messages(
     research_session_id: str,
     session: Session = Depends(get_research_session),
 ) -> list[dict[str, Any]]:
-    get_owned_research_session(session, research_session_id)
+    research_session = get_owned_research_session(session, research_session_id)
     items = session.scalars(
         select(ResearchMessage)
         .where(ResearchMessage.session_id == research_session_id)
@@ -3173,7 +3922,7 @@ def list_research_attachments(
     research_session_id: str,
     session: Session = Depends(get_research_session),
 ) -> list[dict[str, Any]]:
-    get_owned_research_session(session, research_session_id)
+    research_session = get_owned_research_session(session, research_session_id)
     items = session.scalars(
         select(ResearchAttachment)
         .where(ResearchAttachment.session_id == research_session_id)
@@ -3189,7 +3938,7 @@ async def upload_research_attachment(
     user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
 ) -> dict[str, Any]:
-    get_owned_research_session(session, research_session_id)
+    research_session = get_owned_research_session(session, research_session_id)
     original_name = (file.filename or "附件").strip()
     suffix = Path(original_name).suffix.lower()
     if suffix not in SUPPORTED_SUFFIXES and suffix not in VISION_IMAGE_SUFFIXES:
@@ -3202,7 +3951,7 @@ async def upload_research_attachment(
 
     safe_name = re.sub(r"[^\w.\-()（）]+", "_", original_name).strip("._") or f"attachment{suffix}"
     attachment_id = str(uuid.uuid4())
-    directory = RESEARCH_STORAGE_DIR / user.id / research_session_id
+    directory = RESEARCH_STORAGE_DIR / research_session.project_id / user.id / research_session_id
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{attachment_id}_{safe_name}"
     path.write_bytes(content)
@@ -3211,6 +3960,7 @@ async def upload_research_attachment(
         attachment = ResearchAttachment(
             id=attachment_id,
             session_id=research_session_id,
+            project_id=research_session.project_id,
             owner_id=user.id,
             file_name=original_name,
             content_type=file.content_type,
@@ -3226,6 +3976,7 @@ async def upload_research_attachment(
             attachment = ResearchAttachment(
                 id=attachment_id,
                 session_id=research_session_id,
+                project_id=research_session.project_id,
                 owner_id=user.id,
                 file_name=original_name,
                 content_type=file.content_type,
@@ -3241,6 +3992,7 @@ async def upload_research_attachment(
             attachment = ResearchAttachment(
                 id=attachment_id,
                 session_id=research_session_id,
+                project_id=research_session.project_id,
                 owner_id=user.id,
                 file_name=original_name,
                 content_type=file.content_type,
@@ -3252,6 +4004,7 @@ async def upload_research_attachment(
     session.add(attachment)
     session.add(ResearchAudit(
         owner_id=user.id,
+        project_id=research_session.project_id,
         session_id=research_session_id,
         action="attachment_uploaded",
         audit_metadata={"file_name": original_name, "size_bytes": len(content), "status": attachment.parsing_status},
@@ -3324,7 +4077,7 @@ def knowledge_folder_for_document(session: Session, document: KnowledgeDocument)
 
 def get_visible_knowledge_document(session: Session, document_id: str) -> KnowledgeDocument:
     document = session.get(KnowledgeDocument, document_id)
-    if not document:
+    if not document or document.project_id != active_project_id(session):
         raise HTTPException(404, "未找到该知识库资料，或当前账号无权访问。")
     return document
 
@@ -3341,7 +4094,7 @@ def validate_knowledge_folder(
     if not folder_id:
         raise HTTPException(422, "公共知识库资料必须选择一个资料分类。")
     folder = session.get(KnowledgeFolder, folder_id)
-    if not folder or folder.scope != scope:
+    if not folder or folder.scope != scope or folder.project_id != active_project_id(session):
         raise HTTPException(422, "所选资料夹不存在，或不属于当前知识库范围。")
     if scope == "private" and folder.owner_id != user.id:
         raise HTTPException(403, "不能将资料保存到其他科研人员的私人文件夹。")
@@ -3424,6 +4177,7 @@ def process_knowledge_document(document_id: str) -> None:
                 for ordinal, ((content, locator), vector) in enumerate(zip(chunks, vectors), start=1):
                     session.add(KnowledgeChunk(
                         document_id=document.id,
+                        project_id=document.project_id,
                         scope=document.scope,
                         owner_id=document.owner_id,
                         folder_id=document.folder_id,
@@ -3504,10 +4258,11 @@ def knowledge_summary(
     user: CurrentUser = Depends(require_knowledge_user),
     session: Session = Depends(get_knowledge_session),
 ) -> dict[str, Any]:
-    private_count = session.scalar(select(func.count(KnowledgeDocument.id)).where(KnowledgeDocument.scope == "private")) or 0
-    private_bytes = session.scalar(select(func.coalesce(func.sum(KnowledgeDocument.size_bytes), 0)).where(KnowledgeDocument.scope == "private")) or 0
+    project_id = active_project_id(session)
+    private_count = session.scalar(select(func.count(KnowledgeDocument.id)).where(KnowledgeDocument.scope == "private", KnowledgeDocument.project_id == project_id)) or 0
+    private_bytes = session.scalar(select(func.coalesce(func.sum(KnowledgeDocument.size_bytes), 0)).where(KnowledgeDocument.scope == "private", KnowledgeDocument.project_id == project_id)) or 0
     public_count = session.scalar(
-        select(func.count(KnowledgeDocument.id)).where(KnowledgeDocument.scope == "public", KnowledgeDocument.status == "published")
+        select(func.count(KnowledgeDocument.id)).where(KnowledgeDocument.scope == "public", KnowledgeDocument.status == "published", KnowledgeDocument.project_id == project_id)
     ) or 0
     result = {
         "private_document_count": private_count,
@@ -3517,7 +4272,7 @@ def knowledge_summary(
     }
     if "field_admin" in user.roles:
         result["public_review_count"] = session.scalar(
-            select(func.count(KnowledgeDocument.id)).where(KnowledgeDocument.scope == "public", KnowledgeDocument.status.in_(("processing", "review", "failed")))
+            select(func.count(KnowledgeDocument.id)).where(KnowledgeDocument.scope == "public", KnowledgeDocument.status.in_(("processing", "review", "failed")), KnowledgeDocument.project_id == project_id)
         ) or 0
     return result
 
@@ -3532,7 +4287,7 @@ def list_knowledge_folders(
         ensure_private_uncategorized_folder(session, user)
     items = session.scalars(
         select(KnowledgeFolder)
-        .where(KnowledgeFolder.scope == scope)
+        .where(KnowledgeFolder.scope == scope, KnowledgeFolder.project_id == active_project_id(session))
         .order_by(KnowledgeFolder.parent_id.nullsfirst(), KnowledgeFolder.folder_name)
     ).all()
     return [serialize_knowledge_folder(item) for item in items]
@@ -3550,12 +4305,13 @@ def create_knowledge_folder(
     parent = None
     if payload.parent_id:
         parent = session.get(KnowledgeFolder, payload.parent_id)
-        if not parent or parent.scope != scope:
+        if not parent or parent.scope != scope or parent.project_id != active_project_id(session):
             raise HTTPException(422, "上级文件夹不存在，或不属于当前知识库范围。")
         if scope == "private" and parent.owner_id != user.id:
             raise HTTPException(403, "不能在其他科研人员的私人文件夹下新建目录。")
     duplicate_conditions = [
         KnowledgeFolder.scope == scope,
+        KnowledgeFolder.project_id == active_project_id(session),
         KnowledgeFolder.parent_id == (parent.id if parent else None),
         KnowledgeFolder.folder_name == payload.folder_name.strip(),
     ]
@@ -3565,6 +4321,7 @@ def create_knowledge_folder(
     if duplicate:
         raise HTTPException(409, "同一目录下已存在同名文件夹。")
     item = KnowledgeFolder(
+        project_id=active_project_id(session),
         scope=scope,
         owner_id=user.id,
         parent_id=parent.id if parent else None,
@@ -3587,7 +4344,7 @@ def update_knowledge_folder(
     session: Session = Depends(get_knowledge_session),
 ) -> dict[str, Any]:
     folder = session.get(KnowledgeFolder, folder_id)
-    if not folder:
+    if not folder or folder.project_id != active_project_id(session):
         raise HTTPException(404, "未找到该文件夹。")
     if folder.scope == "public" and "field_admin" not in user.roles:
         raise HTTPException(403, "公共知识库分类仅允许字段管理员维护。")
@@ -3597,7 +4354,7 @@ def update_knowledge_folder(
         raise HTTPException(422, "文件夹不能移动到自己下面。")
     if payload.parent_id:
         parent = session.get(KnowledgeFolder, payload.parent_id)
-        if not parent or parent.scope != folder.scope:
+        if not parent or parent.scope != folder.scope or parent.project_id != active_project_id(session):
             raise HTTPException(422, "目标文件夹不存在，或不属于当前知识库范围。")
         if folder.scope == "private" and parent.owner_id != user.id:
             raise HTTPException(403, "不能移动到其他科研人员的私人文件夹。")
@@ -3608,6 +4365,7 @@ def update_knowledge_folder(
             ancestor = session.get(KnowledgeFolder, ancestor.parent_id) if ancestor.parent_id else None
     duplicate_conditions = [
         KnowledgeFolder.scope == folder.scope,
+        KnowledgeFolder.project_id == active_project_id(session),
         KnowledgeFolder.parent_id == payload.parent_id,
         KnowledgeFolder.folder_name == payload.folder_name.strip(),
         KnowledgeFolder.id != folder.id,
@@ -3632,7 +4390,7 @@ def delete_knowledge_folder(
     session: Session = Depends(get_knowledge_session),
 ) -> dict[str, bool]:
     folder = session.get(KnowledgeFolder, folder_id)
-    if not folder:
+    if not folder or folder.project_id != active_project_id(session):
         raise HTTPException(404, "未找到该文件夹。")
     if folder.scope == "public" and "field_admin" not in user.roles:
         raise HTTPException(403, "公共知识库分类仅允许字段管理员维护。")
@@ -3656,7 +4414,8 @@ def list_knowledge_documents(
     user: CurrentUser = Depends(require_knowledge_user),
     session: Session = Depends(get_knowledge_session),
 ) -> list[dict[str, Any]]:
-    statement = select(KnowledgeDocument).where(KnowledgeDocument.scope == scope)
+    project_id = active_project_id(session)
+    statement = select(KnowledgeDocument).where(KnowledgeDocument.scope == scope, KnowledgeDocument.project_id == project_id)
     if scope == "public" and not (include_unpublished and "field_admin" in user.roles):
         statement = statement.where(KnowledgeDocument.status == "published")
     if folder_id:
@@ -3671,7 +4430,7 @@ def list_knowledge_documents(
             | func.coalesce(KnowledgeDocument.source_organization, "").ilike(pattern)
         )
     items = session.scalars(statement.order_by(KnowledgeDocument.updated_at.desc())).all()
-    folders = {item.id: item for item in session.scalars(select(KnowledgeFolder).where(KnowledgeFolder.scope == scope)).all()}
+    folders = {item.id: item for item in session.scalars(select(KnowledgeFolder).where(KnowledgeFolder.scope == scope, KnowledgeFolder.project_id == project_id)).all()}
     return [serialize_knowledge_document(item, folders.get(item.folder_id)) for item in items]
 
 
@@ -3701,7 +4460,7 @@ async def upload_knowledge_documents(
     previous: KnowledgeDocument | None = None
     if supersedes_document_id:
         previous = session.get(KnowledgeDocument, supersedes_document_id)
-        if not previous or previous.scope != "public":
+        if not previous or previous.scope != "public" or previous.project_id != active_project_id(session):
             raise HTTPException(404, "未找到需要替代的公共知识库资料。")
         if not version_change_summary.strip():
             raise HTTPException(422, "发布公共资料新版本时必须说明本次新增或修改内容。")
@@ -3724,6 +4483,7 @@ async def upload_knowledge_documents(
         content_hash = hashlib.sha256(content).hexdigest()
         duplicate_conditions = [
             KnowledgeDocument.scope == scope,
+            KnowledgeDocument.project_id == active_project_id(session),
             KnowledgeDocument.content_hash == content_hash,
             KnowledgeDocument.status.not_in(("withdrawn", "superseded", "deleted")),
         ]
@@ -3733,12 +4493,13 @@ async def upload_knowledge_documents(
         if duplicate:
             raise HTTPException(409, f"{original_name} 的相同内容已存在于当前知识库，未重复保存。")
         document_id = str(uuid.uuid4())
-        directory = KNOWLEDGE_STORAGE_DIR / scope / (user.id if scope == "private" else "public") / document_id
+        directory = KNOWLEDGE_STORAGE_DIR / active_project_id(session) / scope / (user.id if scope == "private" else "public") / document_id
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / safe_knowledge_filename(original_name)
         path.write_bytes(content)
         item = KnowledgeDocument(
             id=document_id,
+            project_id=active_project_id(session),
             scope=scope,
             owner_id=user.id,
             folder_id=folder.id,
@@ -3943,8 +4704,10 @@ def ensure_research_rls(session: Session) -> None:
         session.execute(text(f"DROP POLICY IF EXISTS research_owner_only ON {table_name}"))
         session.execute(text(
             f"CREATE POLICY research_owner_only ON {table_name} "
-            "FOR ALL USING (owner_id = current_setting('app.research_user_id', true)) "
-            "WITH CHECK (owner_id = current_setting('app.research_user_id', true))"
+            "FOR ALL USING (owner_id = current_setting('app.research_user_id', true) "
+            "AND project_id = current_setting('app.project_id', true)) "
+            "WITH CHECK (owner_id = current_setting('app.research_user_id', true) "
+            "AND project_id = current_setting('app.project_id', true))"
         ))
     session.commit()
 
@@ -3959,17 +4722,19 @@ PUBLIC_KNOWLEDGE_FOLDERS = (
 )
 
 
-def seed_public_knowledge_folders(session: Session) -> None:
+def seed_public_knowledge_folders(session: Session, project_id: str = DEFAULT_PROJECT_ID) -> None:
     for folder_name, description in PUBLIC_KNOWLEDGE_FOLDERS:
         exists = session.scalar(
             select(KnowledgeFolder).where(
                 KnowledgeFolder.scope == "public",
+                KnowledgeFolder.project_id == project_id,
                 KnowledgeFolder.parent_id.is_(None),
                 KnowledgeFolder.folder_name == folder_name,
             )
         )
         if not exists:
             session.add(KnowledgeFolder(
+                project_id=project_id,
                 scope="public",
                 owner_id="system-public",
                 folder_name=folder_name,
@@ -3980,9 +4745,11 @@ def seed_public_knowledge_folders(session: Session) -> None:
 
 
 def ensure_private_uncategorized_folder(session: Session, user: CurrentUser) -> KnowledgeFolder:
+    project_id = active_project_id(session)
     folder = session.scalar(
         select(KnowledgeFolder).where(
             KnowledgeFolder.scope == "private",
+            KnowledgeFolder.project_id == project_id,
             KnowledgeFolder.owner_id == user.id,
             KnowledgeFolder.parent_id.is_(None),
             KnowledgeFolder.folder_name == "未分类",
@@ -3991,6 +4758,7 @@ def ensure_private_uncategorized_folder(session: Session, user: CurrentUser) -> 
     if folder:
         return folder
     folder = KnowledgeFolder(
+        project_id=project_id,
         scope="private",
         owner_id=user.id,
         folder_name="未分类",
@@ -4007,25 +4775,25 @@ def ensure_knowledge_rls(session: Session) -> None:
     """Enforce public/private knowledge visibility in PostgreSQL, not only in APIs."""
     policies = {
         "knowledge_folder": (
-            "(owner_id = current_setting('app.research_user_id', true) "
+            "(project_id = current_setting('app.project_id', true) AND (owner_id = current_setting('app.research_user_id', true) "
             "OR scope = 'public' "
-            "OR COALESCE(current_setting('app.knowledge_is_admin', true), 'false') = 'true')",
-            "((scope = 'private' AND owner_id = current_setting('app.research_user_id', true)) "
-            "OR COALESCE(current_setting('app.knowledge_is_admin', true), 'false') = 'true')",
+            "OR COALESCE(current_setting('app.knowledge_is_admin', true), 'false') = 'true'))",
+            "(project_id = current_setting('app.project_id', true) AND ((scope = 'private' AND owner_id = current_setting('app.research_user_id', true)) "
+            "OR COALESCE(current_setting('app.knowledge_is_admin', true), 'false') = 'true'))",
         ),
         "knowledge_document": (
-            "(owner_id = current_setting('app.research_user_id', true) "
+            "(project_id = current_setting('app.project_id', true) AND (owner_id = current_setting('app.research_user_id', true) "
             "OR (scope = 'public' AND status = 'published') "
-            "OR COALESCE(current_setting('app.knowledge_is_admin', true), 'false') = 'true')",
-            "((scope = 'private' AND owner_id = current_setting('app.research_user_id', true)) "
-            "OR COALESCE(current_setting('app.knowledge_is_admin', true), 'false') = 'true')",
+            "OR COALESCE(current_setting('app.knowledge_is_admin', true), 'false') = 'true'))",
+            "(project_id = current_setting('app.project_id', true) AND ((scope = 'private' AND owner_id = current_setting('app.research_user_id', true)) "
+            "OR COALESCE(current_setting('app.knowledge_is_admin', true), 'false') = 'true'))",
         ),
         "knowledge_chunk": (
-            "(owner_id = current_setting('app.research_user_id', true) "
+            "(project_id = current_setting('app.project_id', true) AND (owner_id = current_setting('app.research_user_id', true) "
             "OR (scope = 'public' AND document_status = 'published') "
-            "OR COALESCE(current_setting('app.knowledge_is_admin', true), 'false') = 'true')",
-            "((scope = 'private' AND owner_id = current_setting('app.research_user_id', true)) "
-            "OR COALESCE(current_setting('app.knowledge_is_admin', true), 'false') = 'true')",
+            "OR COALESCE(current_setting('app.knowledge_is_admin', true), 'false') = 'true'))",
+            "(project_id = current_setting('app.project_id', true) AND ((scope = 'private' AND owner_id = current_setting('app.research_user_id', true)) "
+            "OR COALESCE(current_setting('app.knowledge_is_admin', true), 'false') = 'true'))",
         ),
     }
     for table_name, (using_clause, check_clause) in policies.items():
@@ -4044,12 +4812,17 @@ def ensure_knowledge_rls(session: Session) -> None:
     session.commit()
 
 
-async def build_published_evidence_context(session: Session, question: str, requested_by: str = "系统") -> tuple[str, list[dict[str, Any]]]:
+async def build_published_evidence_context(
+    session: Session,
+    question: str,
+    requested_by: str = "系统",
+    project_id: str = DEFAULT_PROJECT_ID,
+) -> tuple[str, list[dict[str, Any]]]:
     """Use controlled templates instead of sending a bulk database snapshot to the model."""
-    trial_context, trial_cards = build_published_trial_evidence(session, question, requested_by)
+    trial_context, trial_cards = build_published_trial_evidence(session, question, requested_by, project_id)
     if trial_context:
         return trial_context, trial_cards
-    query_plan = plan_query_from_question(session, question, TRAITS, ROOT_TRAITS)
+    query_plan = plan_query_from_question(session, question, TRAITS, ROOT_TRAITS, project_id)
     likely_data_query = is_likely_data_query(question)
     query_planner = "规则解析"
     clarification: str | None = None
@@ -4071,6 +4844,7 @@ async def build_published_evidence_context(session: Session, question: str, requ
                     structured_request,
                     TRAITS,
                     ROOT_TRAITS,
+                    project_id,
                 )
                 query_planner = "神农受控参数解析"
             except ValueError:
@@ -4095,7 +4869,7 @@ async def build_published_evidence_context(session: Session, question: str, requ
             "query_planner": query_planner,
         }]
 
-    execution = execute_published_data_query(session, query_plan)
+    execution = execute_published_data_query(session, query_plan, project_id)
     if not execution.records:
         template_title = SQL_TEMPLATES.get(execution.template_code)
         label = template_title.title if template_title else "已发布标准数据查询"
@@ -4543,7 +5317,7 @@ async def research_chat_stream(
     breeding_cards: list[dict[str, Any]] = []
     if breeding_report_requested:
         try:
-            breeding_report_context = build_breeding_report_context(session, payload.content)
+            breeding_report_context = build_breeding_report_context(session, payload.content, research_session.project_id)
             breeding_context, breeding_cards = build_breeding_report_evidence_context(breeding_report_context)
         except BreedingDossierError as exc:
             raise HTTPException(422, str(exc)) from exc
@@ -4564,9 +5338,23 @@ async def research_chat_stream(
         .order_by(ResearchMessage.created_at.desc())
         .limit(8)
     ).all()
+    previous_session_title = research_session.title
+    automatic_session_title = auto_title_for_first_message(
+        research_session.title,
+        payload.content,
+        has_messages=bool(history_items),
+    )
+    if automatic_session_title:
+        research_session.title = automatic_session_title
+        research_session.updated_at = datetime.now(timezone.utc)
     context_attachment_ids = referenced_attachment_ids(history_items) | set(current_turn_attachment_ids)
     context_attachments = [item for item in attachments if item.id in context_attachment_ids]
-    published_context, published_cards = await build_published_evidence_context(session, payload.content, audit_actor(user))
+    published_context, published_cards = await build_published_evidence_context(
+        session,
+        payload.content,
+        audit_actor(user),
+        research_session.project_id,
+    )
     analysis_run_id = _trial_analysis_run_id_from_context(published_context)
     attachment_context, attachment_cards = build_attachment_evidence_context(context_attachments)
     knowledge_context, knowledge_cards = build_knowledge_evidence_context(
@@ -4595,6 +5383,7 @@ async def research_chat_stream(
     static_evidence = [*published_cards, *breeding_cards, *attachment_cards, *knowledge_cards, *vision_cards]
     user_message = ResearchMessage(
         session_id=research_session_id,
+        project_id=research_session.project_id,
         owner_id=user.id,
         role="user",
         content=payload.content.strip(),
@@ -4610,8 +5399,21 @@ async def research_chat_stream(
     )
     research_session.updated_at = datetime.now(timezone.utc)
     session.add(user_message)
+    if automatic_session_title:
+        session.add(ResearchAudit(
+            owner_id=user.id,
+            project_id=research_session.project_id,
+            session_id=research_session_id,
+            action="assistant_session_auto_renamed",
+            audit_metadata={
+                "previous_title": previous_session_title,
+                "title": automatic_session_title,
+                "source": "first_user_message",
+            },
+        ))
     session.add(ResearchAudit(
         owner_id=user.id,
+        project_id=research_session.project_id,
         session_id=research_session_id,
         action="assistant_question_submitted",
         audit_metadata={
@@ -4629,6 +5431,11 @@ async def research_chat_stream(
     session.commit()
 
     async def event_stream() -> Any:
+        if automatic_session_title:
+            yield sse_event("session_title", {
+                "session_id": research_session_id,
+                "title": automatic_session_title,
+            })
         yield sse_event("status", {"label": "正在读取已发布标准数据、当前会话附件和本地知识库证据"})
         full_text = ""
         model_answer_started = False
@@ -4699,12 +5506,14 @@ async def research_chat_stream(
 
                 with SessionLocal() as write_session:
                     _set_research_owner(write_session, user.id)
+                    _set_active_project(write_session, research_session.project_id)
                     stored_session = get_owned_research_session(write_session, research_session_id)
                     stored_session.memory_state = result["memory_state"]
                     stored_session.memory_summary = result.get("memory_summary")
                     stored_session.updated_at = datetime.now(timezone.utc)
                     assistant_message = ResearchMessage(
                         session_id=research_session_id,
+                        project_id=stored_session.project_id,
                         owner_id=user.id,
                         role="assistant",
                         content=result["content"],
@@ -4725,6 +5534,7 @@ async def research_chat_stream(
                     write_session.add(assistant_message)
                     write_session.add(ResearchAudit(
                         owner_id=user.id,
+                        project_id=stored_session.project_id,
                         session_id=research_session_id,
                         action="assistant_answer_completed",
                         audit_metadata={
@@ -4776,10 +5586,12 @@ async def research_chat_stream(
             )
             with SessionLocal() as write_session:
                 _set_research_owner(write_session, user.id)
+                _set_active_project(write_session, research_session.project_id)
                 stored_session = get_owned_research_session(write_session, research_session_id)
                 stored_session.updated_at = datetime.now(timezone.utc)
                 assistant_message = ResearchMessage(
                     session_id=research_session_id,
+                    project_id=stored_session.project_id,
                     owner_id=user.id,
                     role="assistant",
                     content=fallback_content,
@@ -4804,6 +5616,7 @@ async def research_chat_stream(
                 write_session.add(assistant_message)
                 write_session.add(ResearchAudit(
                     owner_id=user.id,
+                    project_id=stored_session.project_id,
                     session_id=research_session_id,
                     action="assistant_report_completed_without_model_text",
                     audit_metadata={
@@ -4903,7 +5716,7 @@ def download_research_message_report(
     breeding_report_context: dict[str, Any] | None = None
     if report_kind == "breeding_dossier" or is_breeding_report_request(question):
         try:
-            breeding_report_context = build_breeding_report_context(session, question)
+            breeding_report_context = build_breeding_report_context(session, question, message.project_id)
         except BreedingDossierError as exc:
             raise HTTPException(422, str(exc)) from exc
         report_bytes = build_breeding_report_pdf(
@@ -4925,6 +5738,7 @@ def download_research_message_report(
     saved = _store_research_result(
         session,
         owner_id=user.id,
+        project_id=message.project_id,
         source_message_id=message.id,
         session_id=message.session_id,
         analysis_run_id=str(analysis_run_id) if analysis_run_id else None,
@@ -4950,6 +5764,7 @@ def download_research_message_report(
         }
     session.add(ResearchAudit(
         owner_id=user.id,
+        project_id=message.project_id,
         session_id=message.session_id,
         action="research_result_saved",
         audit_metadata={"result_type": "pdf_report", "result_id": saved.id, "source_message_id": message.id},
@@ -5040,6 +5855,7 @@ def delete_research_result(
     session.delete(result)
     session.add(ResearchAudit(
         owner_id=user.id,
+        project_id=result.project_id,
         session_id=result.session_id,
         action="research_result_deleted",
         audit_metadata={"result_id": result_id, "result_type": result.result_type},
@@ -5059,20 +5875,20 @@ def catalog(user: CurrentUser = Depends(require_data_platform_user)) -> dict[str
 
 
 @app.get("/api/templates")
-def list_templates(user: CurrentUser = Depends(require_data_platform_user), session: Session = Depends(get_session)) -> list[dict[str, Any]]:
+def list_templates(user: CurrentUser = Depends(require_data_platform_user), session: Session = Depends(get_business_project_session)) -> list[dict[str, Any]]:
     templates = session.scalars(select(DataTemplate).order_by(DataTemplate.template_code)).all()
     return [serialize_template(item, session.get(TemplateVersion, item.current_version_id)) for item in templates]
 
 
 @app.get("/api/template-change-requests")
-def list_template_change_requests(user: CurrentUser = Depends(require_field_admin), session: Session = Depends(get_session)) -> list[dict[str, Any]]:
+def list_template_change_requests(user: CurrentUser = Depends(require_field_admin), session: Session = Depends(get_business_project_session)) -> list[dict[str, Any]]:
     templates = {item.id: item for item in session.scalars(select(DataTemplate)).all()}
     requests = session.scalars(select(FieldChangeRequest).order_by(FieldChangeRequest.created_at.desc())).all()
     return [{"id": item.id, "template_id": item.template_id, "template_name": templates[item.template_id].template_name if item.template_id in templates else "未知模板", "source_review_id": item.source_review_id, "source_field": item.source_field, "sample_value": item.sample_value, "request_note": item.request_note, "status": item.status, "submitted_by": item.submitted_by, "created_at": item.created_at.isoformat()} for item in requests]
 
 
 @app.post("/api/templates/{template_id}/versions")
-def create_template_version(template_id: str, payload: TemplateVersionCreate, user: CurrentUser = Depends(require_field_admin), session: Session = Depends(get_session)) -> dict[str, Any]:
+def create_template_version(template_id: str, payload: TemplateVersionCreate, user: CurrentUser = Depends(require_field_admin), session: Session = Depends(get_business_project_session)) -> dict[str, Any]:
     payload.actor = audit_actor(user)
     template = session.get(DataTemplate, template_id)
     current = session.get(TemplateVersion, template.current_version_id) if template else None
@@ -5106,7 +5922,7 @@ def create_template_version(template_id: str, payload: TemplateVersionCreate, us
 
 
 @app.post("/api/template-change-requests")
-def create_template_change_request(payload: FieldChangeRequestCreate, user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_session)) -> dict[str, Any]:
+def create_template_change_request(payload: FieldChangeRequestCreate, user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_business_project_session)) -> dict[str, Any]:
     payload.actor = audit_actor(user)
     source = session.get(SourceReview, payload.source_review_id)
     if not source or not source.template_version_id:
@@ -5125,7 +5941,7 @@ def create_template_change_request(payload: FieldChangeRequestCreate, user: Curr
 
 
 @app.get("/api/dashboard")
-def dashboard(user: CurrentUser = Depends(require_data_platform_user), session: Session = Depends(get_session)) -> dict[str, Any]:
+def dashboard(user: CurrentUser = Depends(require_data_platform_user), session: Session = Depends(get_business_project_session)) -> dict[str, Any]:
     varieties = session.scalar(select(func.count(Variety.id))) or 0
     published = session.scalar(select(func.count(PhenotypeObservation.id)).where(PhenotypeObservation.publish_status == "published")) or 0
     pending = session.scalar(select(func.count(PhenotypeObservation.id)).where(PhenotypeObservation.publish_status == "pending")) or 0
@@ -5134,7 +5950,7 @@ def dashboard(user: CurrentUser = Depends(require_data_platform_user), session: 
 
 
 @app.get("/api/workbench")
-def workbench(user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_session)) -> dict[str, Any]:
+def workbench(user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_business_project_session)) -> dict[str, Any]:
     sources = session.scalars(select(SourceReview).order_by(SourceReview.created_at.desc())).all()
     observations = session.scalars(select(PhenotypeObservation).where(PhenotypeObservation.publish_status != "published").order_by(PhenotypeObservation.created_at.desc())).all()
     variety_map = {item.id: item for item in session.scalars(select(Variety)).all()}
@@ -5146,7 +5962,7 @@ def workbench(user: CurrentUser = Depends(require_data_processor), session: Sess
 
 
 @app.post("/api/imports/upload")
-async def upload_import(file: UploadFile = File(...), template_version_id: str = Query(...), actor: str = Query("数据处理员-张三"), user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_session)) -> dict[str, Any]:
+async def upload_import(file: UploadFile = File(...), template_version_id: str = Query(...), actor: str = Query("数据处理员-张三"), user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_business_project_session)) -> dict[str, Any]:
     actor = audit_actor(user)
     template, version = get_template_version(session, template_version_id)
     content = await file.read()
@@ -5168,7 +5984,9 @@ async def upload_import(file: UploadFile = File(...), template_version_id: str =
             reject_duplicate_source(existing, reason or "相同文件内容")
     source_id = str(uuid.uuid4())
     safe_name = re.sub(r"[^\w.\-]+", "_", file.filename or "upload")
-    target = RAW_STORAGE_DIR / f"{source_id}_{safe_name}"
+    project_raw_dir = RAW_STORAGE_DIR / active_project_id(session)
+    project_raw_dir.mkdir(parents=True, exist_ok=True)
+    target = project_raw_dir / f"{source_id}_{safe_name}"
     target.write_bytes(content)
     source = SourceReview(id=source_id, source_type=source_type, source_name=file.filename or "上传文件", source_url=saved_page_url, file_path=str(target), file_hash=content_hash, raw_text=raw_text, page_or_locator="上传文件", parsing_status=parsing_status, quality_status=quality_status, template_version_id=version.id)
     append_history(source, actor, "上传并解析文件", {"file_name": file.filename, "template": template.template_name, "template_version": version.version, "template_auto_switched": template_auto_switched, "candidate_count": len(candidates), "saved_page_url": saved_page_url, "approval_context": approval_context})
@@ -5181,7 +5999,7 @@ async def upload_import(file: UploadFile = File(...), template_version_id: str =
 
 
 @app.post("/api/imports/url")
-async def import_url(payload: UrlImport, user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_session)) -> dict[str, Any]:
+async def import_url(payload: UrlImport, user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_business_project_session)) -> dict[str, Any]:
     payload.actor = audit_actor(user)
     template, version = get_template_version(session, payload.template_version_id)
     if template.template_code == "rice_root_phenotype":
@@ -5212,7 +6030,9 @@ async def import_url(payload: UrlImport, user: CurrentUser = Depends(require_dat
     raw_text, approval_context = keep_first_approval_section(raw_text)
     name, aliases = parse_title(raw_title)
     source_id = str(uuid.uuid4())
-    target = RAW_STORAGE_DIR / f"{source_id}.html"
+    project_raw_dir = RAW_STORAGE_DIR / active_project_id(session)
+    project_raw_dir.mkdir(parents=True, exist_ok=True)
+    target = project_raw_dir / f"{source_id}.html"
     target.write_bytes(content)
     source = SourceReview(id=source_id, source_type="webpage", source_name=raw_title or source_url, source_url=source_url, file_path=str(target), file_hash=content_hash, raw_text=raw_text, page_or_locator="网页正文", parsing_status="partial" if masked_digits else "parsed", quality_status="requires_manual_check" if masked_digits else "pending", template_version_id=version.id)
     append_history(source, payload.actor, "读取单个网页", {"url": source_url, "resolved_digit_glyphs": resolved_digits, "approval_context": approval_context})
@@ -5232,7 +6052,7 @@ async def import_url(payload: UrlImport, user: CurrentUser = Depends(require_dat
 
 
 @app.post("/api/imports/{source_id}/reprocess")
-async def reprocess_import(source_id: str, actor: str = Query("数据处理员-张三"), user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_session)) -> dict[str, Any]:
+async def reprocess_import(source_id: str, actor: str = Query("数据处理员-张三"), user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_business_project_session)) -> dict[str, Any]:
     actor = audit_actor(user)
     source = session.get(SourceReview, source_id)
     if not source or not source.template_version_id or not source.file_path:
@@ -5260,7 +6080,7 @@ async def reprocess_import(source_id: str, actor: str = Query("数据处理员-�
 
 
 @app.post("/api/imports/{source_id}/commit")
-def commit_import(source_id: str, payload: ImportCommit, user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_session)) -> dict[str, Any]:
+def commit_import(source_id: str, payload: ImportCommit, user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_business_project_session)) -> dict[str, Any]:
     payload.actor = audit_actor(user)
     source = session.get(SourceReview, source_id)
     if not source:
@@ -5350,7 +6170,7 @@ def commit_import(source_id: str, payload: ImportCommit, user: CurrentUser = Dep
 
 
 @app.post("/api/varieties")
-def create_variety(payload: VarietyCreate, user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_session)) -> dict[str, Any]:
+def create_variety(payload: VarietyCreate, user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_business_project_session)) -> dict[str, Any]:
     payload.actor = audit_actor(user)
     if session.scalars(select(Variety).where(Variety.normalized_name == normalize_name(payload.variety_name))).first():
         raise HTTPException(409, "标准品种名称已存在，请在详情页中补充别名或数据。")
@@ -5363,7 +6183,7 @@ def create_variety(payload: VarietyCreate, user: CurrentUser = Depends(require_d
 
 
 @app.post("/api/observations")
-def create_observation(payload: ObservationCreate, user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_session)) -> dict[str, Any]:
+def create_observation(payload: ObservationCreate, user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_business_project_session)) -> dict[str, Any]:
     payload.actor = audit_actor(user)
     variety = session.get(Variety, payload.variety_id)
     if not variety:
@@ -5388,12 +6208,12 @@ def create_observation(payload: ObservationCreate, user: CurrentUser = Depends(r
 
 
 @app.get("/api/manage/varieties")
-def manage_varieties(user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_session)) -> list[dict[str, Any]]:
+def manage_varieties(user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_business_project_session)) -> list[dict[str, Any]]:
     return [serialize_variety(item) for item in session.scalars(select(Variety).order_by(Variety.variety_name)).all()]
 
 
 @app.post("/api/manual/record")
-def create_manual_record(payload: ManualRecord, user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_session)) -> dict[str, Any]:
+def create_manual_record(payload: ManualRecord, user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_business_project_session)) -> dict[str, Any]:
     payload.actor = audit_actor(user)
     trait = TRAITS.get(payload.trait_code)
     if not trait:
@@ -5430,7 +6250,7 @@ def create_manual_record(payload: ManualRecord, user: CurrentUser = Depends(requ
 
 
 @app.patch("/api/observations/{observation_id}")
-def update_observation(observation_id: str, payload: ObservationUpdate, user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_session)) -> dict[str, Any]:
+def update_observation(observation_id: str, payload: ObservationUpdate, user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_business_project_session)) -> dict[str, Any]:
     payload.actor = audit_actor(user)
     item = session.get(PhenotypeObservation, observation_id)
     if not item:
@@ -5451,7 +6271,7 @@ def update_observation(observation_id: str, payload: ObservationUpdate, user: Cu
 
 
 @app.post("/api/observations/publish")
-def publish_observations(payload: PublishRequest, user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_session)) -> dict[str, Any]:
+def publish_observations(payload: PublishRequest, user: CurrentUser = Depends(require_data_processor), session: Session = Depends(get_business_project_session)) -> dict[str, Any]:
     payload.actor = audit_actor(user)
     published, blocked, skipped_duplicates = [], [], []
     quality_rules = active_custom_quality_rules(session)
@@ -5499,13 +6319,13 @@ def publish_observations(payload: PublishRequest, user: CurrentUser = Depends(re
 
 
 @app.get("/api/rules")
-def list_rules(user: CurrentUser = Depends(require_field_admin), session: Session = Depends(get_session)) -> list[dict[str, Any]]:
+def list_rules(user: CurrentUser = Depends(require_field_admin), session: Session = Depends(get_business_project_session)) -> list[dict[str, Any]]:
     rules = session.scalars(select(DataRule).order_by(DataRule.rule_code, DataRule.created_at.desc())).all()
     return [{"id": item.id, "rule_code": item.rule_code, "rule_name": item.rule_name, "rule_type": item.rule_type, "version": item.version, "severity": item.severity, "config": item.config, "status": item.status, "change_reason": item.change_reason, "created_by": item.created_by, "created_at": item.created_at.isoformat()} for item in rules]
 
 
 @app.post("/api/rules")
-def create_rule(payload: RuleCreate, user: CurrentUser = Depends(require_field_admin), session: Session = Depends(get_session)) -> dict[str, Any]:
+def create_rule(payload: RuleCreate, user: CurrentUser = Depends(require_field_admin), session: Session = Depends(get_business_project_session)) -> dict[str, Any]:
     payload.created_by = audit_actor(user)
     existing = session.scalars(select(DataRule).where(DataRule.rule_code == payload.rule_code).order_by(DataRule.created_at.desc())).first()
     version = "v1.0"
@@ -5519,7 +6339,7 @@ def create_rule(payload: RuleCreate, user: CurrentUser = Depends(require_field_a
 
 
 @app.post("/api/rules/{rule_id}/retire")
-def retire_rule(rule_id: str, actor: str = Query("数据处理员-张三"), user: CurrentUser = Depends(require_field_admin), session: Session = Depends(get_session)) -> dict[str, Any]:
+def retire_rule(rule_id: str, actor: str = Query("数据处理员-张三"), user: CurrentUser = Depends(require_field_admin), session: Session = Depends(get_business_project_session)) -> dict[str, Any]:
     actor = audit_actor(user)
     rule = session.get(DataRule, rule_id)
     if not rule:
@@ -5537,7 +6357,7 @@ def search_varieties(
     grain_weight_min: float | None = None,
     blast_max: float | None = None,
     user: CurrentUser = Depends(require_published_data_reader),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_business_project_session),
 ) -> list[dict[str, Any]]:
     varieties = session.scalars(select(Variety).order_by(Variety.variety_name)).all()
     result = []
@@ -5564,7 +6384,7 @@ def search_varieties(
 def variety_detail(
     variety_id: str,
     user: CurrentUser = Depends(require_published_data_reader),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_business_project_session),
 ) -> dict[str, Any]:
     variety = session.get(Variety, variety_id)
     if not variety or variety.data_status != "published":
@@ -5596,7 +6416,11 @@ def raw_source(
 
 
 @app.post("/api/reports/pdf")
-def pdf_report(payload: PdfReport) -> Response:
+def pdf_report(
+    payload: PdfReport,
+    user: CurrentUser = Depends(require_published_data_reader),
+    session: Session = Depends(get_business_project_session),
+) -> Response:
     pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
     buffer = io.BytesIO()
     document = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=14 * mm, leftMargin=14 * mm, topMargin=14 * mm, bottomMargin=14 * mm)
@@ -5673,6 +6497,8 @@ async def acps_leader_dispatch(
 ) -> dict[str, Any]:
     """Let an authenticated researcher use Longyun as an ACPs Leader."""
     try:
+        project = resolve_project_access(session, user, x_project_id)
+        _set_active_project(session, project.id)
         result = await dispatch_partner_task(payload, ACPS_SETTINGS)
     except TimeoutError as exc:
         raise HTTPException(504, str(exc)) from exc

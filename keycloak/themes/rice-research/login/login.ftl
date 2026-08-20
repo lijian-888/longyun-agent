@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>${realm.displayName!"隆耘 Agent 育种智能体"}</title>
+  <title>${realm.displayName!"海南南繁 · 隆耘 Agent 育种智能体"}</title>
   <link rel="stylesheet" href="${url.resourcesPath}/css/login.css" />
 </head>
 <body class="rice-login-page">
@@ -16,7 +16,7 @@
           <small>Longyun Agent · Breeding Intelligence</small>
         </span>
       </a>
-      <div class="deployment-note"><span></span> 本地部署 · 研究数据受控访问</div>
+      <div class="deployment-note"><span></span> 海南南繁单机构 · 研究数据受控访问</div>
     </header>
 
     <section class="rice-login-content" aria-label="登录与平台能力介绍">
@@ -59,7 +59,7 @@
         <div class="sign-in-heading">
           <p>安全登录</p>
           <h2>进入科研工作台</h2>
-          <span>使用院内分配账号访问已授权的数据与工具。</span>
+          <span>使用海南南繁分配账号访问已授权课题的数据与工具。</span>
         </div>
 
         <#if message?has_content>
@@ -88,7 +88,7 @@
           <button tabindex="4" class="login-button" name="login" id="kc-login" type="submit">安全登录 <span aria-hidden="true">→</span></button>
         </form>
 
-        <p class="sign-in-footnote">首次登录可能需要按院内安全策略更新密码。</p>
+        <p class="sign-in-footnote">首次登录可能需要按海南南繁安全策略更新密码。</p>
       </section>
     </section>
   </main>
