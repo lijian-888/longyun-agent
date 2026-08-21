@@ -34,19 +34,28 @@ function AppRouter() {
     })();
   }, []);
 
-  function changeProject(projectId) {
+  async function changeProject(projectId) {
     if (!projectId || projectId === platformContext?.active_project_id) return;
+    const previousProjectId = platformContext?.active_project_id || "";
     setActiveProjectId(projectId);
-    window.location.reload();
+    try {
+      const context = await request("/api/context");
+      setPlatformContext(context);
+      setContextError("");
+    } catch (error) {
+      setActiveProjectId(previousProjectId);
+      throw error;
+    }
   }
 
   if (contextError) return <main className="auth-error">{contextError}</main>;
   if (!platformContext) return <main className="auth-error">正在进入海南南繁工作环境…</main>;
 
   let page = <main className="auth-error">当前账号未配置三类业务角色，请联系字段管理员。</main>;
-  if (roles.includes("field_admin")) page = <DataGovernanceApp user={user} accessRole="field_admin" platformContext={platformContext} onProjectChange={changeProject} />;
-  else if (roles.includes("data_processor")) page = <DataGovernanceApp user={user} accessRole="data_processor" platformContext={platformContext} onProjectChange={changeProject} />;
-  else if (roles.includes("researcher")) page = <ResearchAssistant platformContext={platformContext} onProjectChange={changeProject} />;
+  const workspaceKey = `${roles.join(",")}:${platformContext.active_project_id}`;
+  if (roles.includes("field_admin")) page = <DataGovernanceApp key={workspaceKey} user={user} accessRole="field_admin" platformContext={platformContext} onProjectChange={changeProject} />;
+  else if (roles.includes("data_processor")) page = <DataGovernanceApp key={workspaceKey} user={user} accessRole="data_processor" platformContext={platformContext} onProjectChange={changeProject} />;
+  else if (roles.includes("researcher")) page = <ResearchAssistant key={workspaceKey} platformContext={platformContext} onProjectChange={changeProject} />;
   return <Suspense fallback={<main className="auth-error">正在加载工作台…</main>}>{page}</Suspense>;
 }
 

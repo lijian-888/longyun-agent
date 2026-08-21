@@ -497,7 +497,7 @@ function ProjectAdministration({ platformContext, onProjectChange, onNotice }) {
       }));
       event.currentTarget.reset();
       onNotice(`已建立课题“${project.project_name}”。`);
-      onProjectChange(project.id);
+      await onProjectChange(project.id);
     } catch (error) {
       onNotice(error.message);
     }
