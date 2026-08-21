@@ -2826,6 +2826,11 @@ def create_project(
     )
     session.add(project)
     session.flush()
+    # Public knowledge folders are protected by project-aware RLS.  A newly
+    # created project cannot come from the request header yet, so establish
+    # the verified field-admin and project context before seeding its folders.
+    _set_knowledge_context(session, user)
+    _set_active_project(session, project.id)
     seed_public_knowledge_folders(session, project.id)
     record_permission_audit(
         session,
