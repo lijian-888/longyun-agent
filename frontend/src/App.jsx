@@ -490,12 +490,15 @@ function ProjectAdministration({ platformContext, onProjectChange, onNotice }) {
 
   async function createProject(event) {
     event.preventDefault();
-    const form = new FormData(event.currentTarget);
+    // React clears currentTarget after the handler yields, so retain the form
+    // element before awaiting the API request.
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
     try {
       const project = await request("/api/projects", jsonRequest("POST", {
         project_code: form.get("project_code"), project_name: form.get("project_name"), description: form.get("description") || "",
       }));
-      event.currentTarget.reset();
+      formElement.reset();
       onNotice(`已建立课题“${project.project_name}”。`);
       await onProjectChange(project.id);
     } catch (error) {
