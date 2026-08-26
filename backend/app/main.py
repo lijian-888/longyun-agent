@@ -18,7 +18,7 @@ from urllib.parse import quote, urljoin
 import fitz
 import httpx
 from bs4 import BeautifulSoup
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
@@ -138,6 +138,23 @@ from .breeding_dossier import (
     is_breeding_report_request,
     seed_mock_breeding_dossiers,
 )
+from .institution_data import (
+    DATASET_LABELS,
+    FIELD_ALIASES,
+    SUPPORTED_SUFFIXES,
+    InstitutionDataError,
+    InstitutionDataSettings,
+    InstitutionDatabaseManager,
+    MinioInstitutionStore,
+    default_access_policy,
+    import_into_institution_database,
+    list_batches as list_institution_batches,
+    object_key_for,
+    parse_field_mapping,
+    safe_identifier,
+    stage_upload,
+    trace_entity as trace_institution_entity,
+)
 from .trial_package import (
     build_published_trial_evidence,
     ensure_trial_package_schema,
@@ -170,8 +187,9 @@ TRUSTED_HOSTS = [
 RAW_STORAGE_DIR = Path(os.getenv("RAW_STORAGE_DIR", "./data/raw"))
 RESEARCH_STORAGE_DIR = Path(os.getenv("RESEARCH_STORAGE_DIR", "./data/research"))
 
-# The application is intentionally single-institution.  This identifier is
-# server-owned and is never accepted from a browser form or access token.
+# 海南南繁 is the server-owned default institution. Accounts can be
+# pre-provisioned into another institution, but users never create, select, or
+# switch institutions from the browser or from an access-token claim.
 INSTITUTION_ID = "hainan-nanfan"
 INSTITUTION_CODE = "HNNF"
 INSTITUTION_NAME = "海南南繁"
@@ -179,6 +197,12 @@ DEFAULT_PROJECT_ID = "00000000-0000-4000-8000-000000000001"
 DEFAULT_PROJECT_CODE = "HNNF-DEFAULT"
 DEFAULT_PROJECT_NAME = "海南南繁水稻育种研究"
 BUSINESS_ROLES = ("data_processor", "field_admin", "researcher")
+INSTITUTION_DATA_ENABLED = os.getenv("INSTITUTION_DATA_ENABLED", "false").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+INSTITUTION_DATA_SETTINGS = InstitutionDataSettings.from_env()
+INSTITUTION_OBJECT_STORE = MinioInstitutionStore(INSTITUTION_DATA_SETTINGS)
+INSTITUTION_DATABASES = InstitutionDatabaseManager(INSTITUTION_DATA_SETTINGS)
 
 
 def _unsafe_production_value(value: str) -> bool:
@@ -215,6 +239,11 @@ def validate_runtime_configuration() -> None:
         "CORS_ALLOWED_ORIGINS": ",".join(CORS_ALLOWED_ORIGINS),
         "TRUSTED_HOSTS": ",".join(TRUSTED_HOSTS),
     }
+    if INSTITUTION_DATA_ENABLED:
+        checks.update({
+            "MINIO_ROOT_USER": INSTITUTION_DATA_SETTINGS.minio_access_key,
+            "MINIO_ROOT_PASSWORD": INSTITUTION_DATA_SETTINGS.minio_secret_key,
+        })
     invalid = [key for key, value in checks.items() if _unsafe_production_value(value)]
     if invalid:
         raise RuntimeError(f"生产环境配置缺失或仍是演示值: {', '.join(invalid)}")
@@ -330,6 +359,25 @@ class Institution(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
+class InstitutionDataConfig(Base):
+    """Control-plane routing for one institution's isolated data plane."""
+
+    __tablename__ = "institution_data_config"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    institution_id: Mapped[str] = mapped_column(
+        ForeignKey("institution.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    minio_bucket: Mapped[str] = mapped_column(String(200), unique=True)
+    business_database: Mapped[str] = mapped_column(String(63), unique=True)
+    access_policy: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(30), default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc)
+    )
+
+
 class PlatformAccount(Base):
     """Application directory entry backed by a Keycloak account."""
 
@@ -383,6 +431,7 @@ class PermissionAudit(Base):
     action: Mapped[str] = mapped_column(String(100), index=True)
     target_type: Mapped[str] = mapped_column(String(80), index=True)
     target_id: Mapped[str] = mapped_column(String(160), index=True)
+    institution_id: Mapped[str] = mapped_column(String(80), default=INSTITUTION_ID, index=True)
     project_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     before_state: Mapped[dict] = mapped_column(JSON, default=dict)
     after_state: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -753,7 +802,9 @@ def sync_platform_account(session: Session, user: CurrentUser) -> PlatformAccoun
         account.keycloak_subject = user.id
         account.display_name = user.display_name or user.username
         account.business_role = role
-        account.institution_id = INSTITUTION_ID
+        # Institution assignment is provisioned by the platform directory and
+        # must not be overwritten on every login. New accounts still enter the
+        # default Hainan NanFan institution automatically.
     account.last_login_at = datetime.now(timezone.utc)
     session.flush()
     if not account.active:
@@ -762,9 +813,9 @@ def sync_platform_account(session: Session, user: CurrentUser) -> PlatformAccoun
 
 
 def accessible_projects(session: Session, user: CurrentUser) -> list[ResearchProject]:
-    sync_platform_account(session, user)
+    account = sync_platform_account(session, user)
     statement = select(ResearchProject).where(
-        ResearchProject.institution_id == INSTITUTION_ID,
+        ResearchProject.institution_id == account.institution_id,
         ResearchProject.status == "active",
     )
     if "researcher" in user.roles and not {"field_admin", "data_processor"}.intersection(user.roles):
@@ -798,12 +849,14 @@ def record_permission_audit(
     before: dict[str, Any] | None = None,
     after: dict[str, Any] | None = None,
 ) -> None:
+    account = session.get(PlatformAccount, user.username)
     session.add(PermissionAudit(
         actor_id=user.id,
         actor_name=audit_actor(user),
         action=action,
         target_type=target_type,
         target_id=target_id,
+        institution_id=account.institution_id if account else INSTITUTION_ID,
         project_id=project_id,
         before_state=before or {},
         after_state=after or {},
@@ -817,7 +870,7 @@ def serialize_project(project: ResearchProject, member_count: int | None = None)
         "project_name": project.project_name,
         "description": project.description or "",
         "institution_id": project.institution_id,
-        "institution_name": INSTITUTION_NAME,
+        "institution_name": INSTITUTION_NAME if project.institution_id == INSTITUTION_ID else project.institution_id,
         "status": project.status,
         "created_by": project.created_by,
         "created_at": project.created_at.isoformat(),
@@ -2639,8 +2692,8 @@ def ensure_single_institution_schema(session: Session) -> None:
                 institution_id=INSTITUTION_ID,
                 active=True,
             ))
-        else:
-            account.institution_id = INSTITUTION_ID
+        # Existing directory assignments may belong to another provisioned
+        # institution; startup must never silently move those accounts.
 
     project = session.get(ResearchProject, DEFAULT_PROJECT_ID)
     if not project:
@@ -2714,6 +2767,56 @@ def ensure_single_institution_schema(session: Session) -> None:
     session.commit()
 
 
+def ensure_institution_data_planes(session: Session) -> None:
+    """Provision one private bucket and one business database per institution."""
+    if not INSTITUTION_DATA_ENABLED:
+        return
+    institutions = session.scalars(select(Institution).where(Institution.status == "active")).all()
+    for institution in institutions:
+        config = session.scalar(select(InstitutionDataConfig).where(
+            InstitutionDataConfig.institution_id == institution.id
+        ))
+        bucket_name = safe_identifier(institution.institution_code, "longyun").replace("_", "-")
+        database_name = INSTITUTION_DATABASES.database_name(institution.institution_code)
+        if not config:
+            config = InstitutionDataConfig(
+                institution_id=institution.id,
+                minio_bucket=bucket_name,
+                business_database=database_name,
+                access_policy=default_access_policy(institution.id, bucket_name),
+                status="provisioning",
+            )
+            session.add(config)
+            session.commit()
+        try:
+            INSTITUTION_OBJECT_STORE.ensure_private_bucket(config.minio_bucket)
+            INSTITUTION_DATABASES.ensure_database(config.business_database)
+            config.status = "active"
+            config.access_policy = default_access_policy(institution.id, config.minio_bucket)
+            session.commit()
+        except Exception:
+            config.status = "error"
+            session.commit()
+            raise
+
+
+def institution_data_config_for_user(
+    session: Session,
+    user: CurrentUser,
+) -> tuple[PlatformAccount, InstitutionDataConfig]:
+    if not INSTITUTION_DATA_ENABLED:
+        raise HTTPException(503, "机构数据接入层尚未启用。")
+    account = sync_platform_account(session, user)
+    config = session.scalar(select(InstitutionDataConfig).where(
+        InstitutionDataConfig.institution_id == account.institution_id
+    ))
+    if not config:
+        raise HTTPException(503, "当前机构尚未配置独立 MinIO Bucket 和业务数据库。")
+    if config.status != "active":
+        raise HTTPException(503, f"当前机构数据平面状态为 {config.status}，请联系管理员。")
+    return account, config
+
+
 @app.on_event("startup")
 def startup() -> None:
     validate_runtime_configuration()
@@ -2734,6 +2837,15 @@ def startup() -> None:
         ensure_genomics_schema(session)
         ensure_genotype_asset_schema(session)
         ensure_single_institution_schema(session)
+        session.execute(text(
+            "ALTER TABLE permission_audit ADD COLUMN IF NOT EXISTS institution_id VARCHAR(80) "
+            f"NOT NULL DEFAULT '{INSTITUTION_ID}'"
+        ))
+        session.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_permission_audit_institution_id "
+            "ON permission_audit(institution_id)"
+        ))
+        ensure_institution_data_planes(session)
         retire_legacy_seeded_trial_demo(session)
         session.execute(text("ALTER TABLE source_review ADD COLUMN IF NOT EXISTS template_version_id VARCHAR(36)"))
         session.execute(text("ALTER TABLE research_session ADD COLUMN IF NOT EXISTS memory_state JSONB NOT NULL DEFAULT '{}'::jsonb"))
@@ -2765,6 +2877,183 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+INSTITUTION_TEMPLATE_DATASETS = {
+    "germplasm_master": {"germplasm"},
+    "pedigree_relationship": {"pedigree"},
+    "field_trial_package": {"phenotype", "environment"},
+    "genotype_dataset": {"genotype"},
+    "knowledge_document": {"literature"},
+}
+
+
+@app.get("/api/institution-data/contracts")
+def institution_data_contracts(
+    user: CurrentUser = Depends(require_business_user),
+    session: Session = Depends(get_business_project_session),
+) -> dict[str, Any]:
+    account, config = institution_data_config_for_user(session, user)
+    return {
+        "institution_id": account.institution_id,
+        "project_id": active_project_id(session),
+        "bucket": config.minio_bucket,
+        "business_database": config.business_database,
+        "limits": {"regular_bytes": 200 * 1024 * 1024, "genotype_archive_bytes": 2 * 1024 * 1024 * 1024},
+        "datasets": [
+            {
+                "id": dataset_type,
+                "label": label,
+                "formats": sorted({suffix.lstrip(".").upper() for suffix in SUPPORTED_SUFFIXES[dataset_type]}),
+                "standard_fields": sorted(FIELD_ALIASES.get(dataset_type, {})),
+            }
+            for dataset_type, label in DATASET_LABELS.items()
+        ],
+        "field_mapping_contract": "source-column -> standard-field",
+    }
+
+
+@app.get("/api/institution-data/config")
+def institution_data_config(
+    user: CurrentUser = Depends(require_business_user),
+    session: Session = Depends(get_business_project_session),
+) -> dict[str, Any]:
+    account, config = institution_data_config_for_user(session, user)
+    institution = session.get(Institution, account.institution_id)
+    return {
+        "institution_id": account.institution_id,
+        "institution_name": institution.institution_name if institution else account.institution_id,
+        "minio_bucket": config.minio_bucket,
+        "business_database": config.business_database,
+        "access_policy": config.access_policy,
+        "status": config.status,
+    }
+
+
+@app.post("/api/institution-data/imports")
+async def import_institution_data(
+    dataset_type: str = Form(...),
+    field_mapping: str | None = Form(default=None),
+    template_version_id: str | None = Form(default=None),
+    file: UploadFile = File(...),
+    user: CurrentUser = Depends(require_data_processor),
+    session: Session = Depends(get_business_project_session),
+) -> dict[str, Any]:
+    account, config = institution_data_config_for_user(session, user)
+    project_id = active_project_id(session)
+    mapping = parse_field_mapping(field_mapping)
+    resolved_template_version_id: str | None = None
+    if template_version_id:
+        version = session.get(TemplateVersion, template_version_id)
+        template = session.get(DataTemplate, version.template_id) if version else None
+        if not version or not template or version.status != "published":
+            raise HTTPException(422, "所选标准模板版本不存在或尚未发布。")
+        allowed_datasets = INSTITUTION_TEMPLATE_DATASETS.get(template.template_code, set())
+        if dataset_type not in allowed_datasets:
+            raise HTTPException(422, f"模板“{template.template_name}”不适用于 {DATASET_LABELS.get(dataset_type, dataset_type)}。")
+        resolved_template_version_id = version.id
+    staged = None
+    raw_stored = False
+    try:
+        staged = await stage_upload(file, dataset_type, INSTITUTION_DATA_SETTINGS.staging_dir)
+        batch_id = str(uuid.uuid4())
+        object_key = object_key_for(account.institution_id, project_id, dataset_type, batch_id, staged.file_name)
+        INSTITUTION_OBJECT_STORE.put_file(
+            config.minio_bucket,
+            object_key,
+            staged,
+            file.content_type or "application/octet-stream",
+        )
+        raw_stored = True
+        result = import_into_institution_database(
+            INSTITUTION_DATABASES.engine(config.business_database),
+            batch_id=batch_id,
+            institution_id=account.institution_id,
+            project_id=project_id,
+            dataset_type=dataset_type,
+            upload=staged,
+            bucket_name=config.minio_bucket,
+            object_key=object_key,
+            field_mapping=mapping,
+            template_version_id=resolved_template_version_id,
+        )
+        record_permission_audit(
+            session,
+            user,
+            "institution_data_imported",
+            "institution_import_batch",
+            batch_id,
+            project_id=project_id,
+            after={
+                "institution_id": account.institution_id,
+                "dataset_type": dataset_type,
+                "bucket": config.minio_bucket,
+                "object_key": object_key,
+                "entity_count": result["entity_count"],
+                "issue_count": result["issue_count"],
+            },
+        )
+        session.commit()
+        return {
+            "batch_id": batch_id,
+            "institution_id": account.institution_id,
+            "project_id": project_id,
+            "dataset_type": dataset_type,
+            "dataset_label": DATASET_LABELS[dataset_type],
+            "raw_object": {"bucket": config.minio_bucket, "key": object_key, "sha256": staged.sha256, "size_bytes": staged.size_bytes},
+            "structured_database": config.business_database,
+            "template_version_id": resolved_template_version_id,
+            "mapping_mode": "field_mapping" if mapping else "standard_template",
+            **result,
+        }
+    except InstitutionDataError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Institution data import failed")
+        suffix = "；原始文件已安全保存到机构 Bucket，可修复后重新处理" if raw_stored else ""
+        raise HTTPException(502, f"机构数据导入失败：{str(exc)[:180]}{suffix}") from exc
+    finally:
+        if staged:
+            staged.path.unlink(missing_ok=True)
+
+
+@app.get("/api/institution-data/imports")
+def get_institution_imports(
+    limit: int = Query(default=100, ge=1, le=500),
+    user: CurrentUser = Depends(require_business_user),
+    session: Session = Depends(get_business_project_session),
+) -> list[dict[str, Any]]:
+    account, config = institution_data_config_for_user(session, user)
+    return list_institution_batches(
+        INSTITUTION_DATABASES.engine(config.business_database),
+        account.institution_id,
+        active_project_id(session),
+        limit,
+    )
+
+
+@app.get("/api/institution-data/trace/{entity_key}")
+def get_institution_entity_trace(
+    entity_key: str,
+    user: CurrentUser = Depends(require_business_user),
+    session: Session = Depends(get_business_project_session),
+) -> dict[str, Any]:
+    account, config = institution_data_config_for_user(session, user)
+    trace = trace_institution_entity(
+        INSTITUTION_DATABASES.engine(config.business_database),
+        account.institution_id,
+        active_project_id(session),
+        entity_key,
+    )
+    if not trace["entities"] and not trace["relations"] and not trace["issues"]:
+        raise HTTPException(404, "当前机构和课题下未找到该实体标识。")
+    return {
+        "institution_id": account.institution_id,
+        "project_id": active_project_id(session),
+        **trace,
+    }
+
+
 @app.get("/api/context")
 def platform_context(
     x_project_id: str | None = Header(default=None, alias="X-Project-Id"),
@@ -2773,12 +3062,14 @@ def platform_context(
 ) -> dict[str, Any]:
     project = resolve_project_access(session, user, x_project_id)
     projects = accessible_projects(session, user)
+    account = session.get(PlatformAccount, user.username)
+    institution = session.get(Institution, account.institution_id) if account else None
     session.commit()
     return {
         "institution": {
-            "id": INSTITUTION_ID,
-            "code": INSTITUTION_CODE,
-            "name": INSTITUTION_NAME,
+            "id": institution.id if institution else project.institution_id,
+            "code": institution.institution_code if institution else project.institution_id,
+            "name": institution.institution_name if institution else project.institution_id,
         },
         "user": {
             "id": user.id,
@@ -2812,7 +3103,7 @@ def create_project(
     user: CurrentUser = Depends(require_field_admin),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    sync_platform_account(session, user)
+    account = sync_platform_account(session, user)
     code = payload.project_code.strip().upper()
     if session.scalar(select(ResearchProject.id).where(ResearchProject.project_code == code)):
         raise HTTPException(409, "课题编号已存在。")
@@ -2820,7 +3111,7 @@ def create_project(
         project_code=code,
         project_name=payload.project_name.strip(),
         description=payload.description.strip() or None,
-        institution_id=INSTITUTION_ID,
+        institution_id=account.institution_id,
         status="active",
         created_by=audit_actor(user),
     )
@@ -2853,9 +3144,9 @@ def update_project(
     user: CurrentUser = Depends(require_field_admin),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    sync_platform_account(session, user)
+    account = sync_platform_account(session, user)
     project = session.get(ResearchProject, project_id)
-    if not project or project.institution_id != INSTITUTION_ID:
+    if not project or project.institution_id != account.institution_id:
         raise HTTPException(404, "课题不存在。")
     if project.id == DEFAULT_PROJECT_ID and payload.status == "archived":
         raise HTTPException(409, "海南南繁默认课题不能停用。")
@@ -2879,9 +3170,9 @@ def list_platform_accounts(
     user: CurrentUser = Depends(require_field_admin),
     session: Session = Depends(get_session),
 ) -> list[dict[str, Any]]:
-    sync_platform_account(session, user)
+    current_account = sync_platform_account(session, user)
     accounts = session.scalars(select(PlatformAccount).where(
-        PlatformAccount.institution_id == INSTITUTION_ID
+        PlatformAccount.institution_id == current_account.institution_id
     ).order_by(PlatformAccount.business_role, PlatformAccount.username)).all()
     session.commit()
     return [{
@@ -2901,10 +3192,10 @@ def update_platform_account(
     user: CurrentUser = Depends(require_field_admin),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    sync_platform_account(session, user)
+    current_account = sync_platform_account(session, user)
     account = session.get(PlatformAccount, username)
-    if not account or account.institution_id != INSTITUTION_ID:
-        raise HTTPException(404, "海南南繁账号目录中不存在该账号。")
+    if not account or account.institution_id != current_account.institution_id:
+        raise HTTPException(404, "当前机构账号目录中不存在该账号。")
     if username == user.username and not payload.active:
         raise HTTPException(409, "不能停用当前登录的字段管理员账号。")
     before = {"active": account.active, "business_role": account.business_role}
@@ -2935,9 +3226,9 @@ def list_project_members(
     user: CurrentUser = Depends(require_field_admin),
     session: Session = Depends(get_session),
 ) -> list[dict[str, Any]]:
-    sync_platform_account(session, user)
+    account = sync_platform_account(session, user)
     project = session.get(ResearchProject, project_id)
-    if not project or project.institution_id != INSTITUTION_ID:
+    if not project or project.institution_id != account.institution_id:
         raise HTTPException(404, "课题不存在。")
     rows = session.execute(
         select(ProjectMember, PlatformAccount)
@@ -2965,13 +3256,13 @@ def upsert_project_member(
     user: CurrentUser = Depends(require_field_admin),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    sync_platform_account(session, user)
+    current_account = sync_platform_account(session, user)
     project = session.get(ResearchProject, project_id)
     account = session.get(PlatformAccount, username)
-    if not project or project.institution_id != INSTITUTION_ID:
+    if not project or project.institution_id != current_account.institution_id:
         raise HTTPException(404, "课题不存在。")
-    if not account or account.institution_id != INSTITUTION_ID:
-        raise HTTPException(404, "海南南繁账号目录中不存在该账号。")
+    if not account or account.institution_id != current_account.institution_id:
+        raise HTTPException(404, "当前机构账号目录中不存在该账号。")
     if account.business_role != "researcher":
         raise HTTPException(422, "只有科研人员需要配置课题成员关系；数据处理员和字段管理员按岗位访问课题。")
     member = session.scalar(select(ProjectMember).where(
@@ -3011,7 +3302,10 @@ def remove_project_member(
     user: CurrentUser = Depends(require_field_admin),
     session: Session = Depends(get_session),
 ) -> dict[str, bool]:
-    sync_platform_account(session, user)
+    account = sync_platform_account(session, user)
+    project = session.get(ResearchProject, project_id)
+    if not project or project.institution_id != account.institution_id:
+        raise HTTPException(404, "课题不存在。")
     member = session.scalar(select(ProjectMember).where(
         ProjectMember.project_id == project_id,
         ProjectMember.username == username,
@@ -3040,9 +3334,12 @@ def list_permission_audits(
     user: CurrentUser = Depends(require_field_admin),
     session: Session = Depends(get_session),
 ) -> list[dict[str, Any]]:
-    sync_platform_account(session, user)
-    statement = select(PermissionAudit)
+    account = sync_platform_account(session, user)
+    statement = select(PermissionAudit).where(PermissionAudit.institution_id == account.institution_id)
     if project_id:
+        project = session.get(ResearchProject, project_id)
+        if not project or project.institution_id != account.institution_id:
+            raise HTTPException(404, "课题不存在。")
         statement = statement.where(PermissionAudit.project_id == project_id)
     rows = session.scalars(statement.order_by(PermissionAudit.created_at.desc()).limit(limit)).all()
     session.commit()

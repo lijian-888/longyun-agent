@@ -373,3 +373,33 @@ body:has(.research-shell), body:has(.assistant-loading), body:has(.auth-error) {
 .template-compatibility[open] summary { margin-bottom: 12px; }
 .field-chip-list span small { display: inline-block; margin-right: 5px; border-right: 1px solid #c9ddd3; padding-right: 5px; color: #6f8e82; font-size: 10px; }
 @media (max-width: 760px) { .template-grid { grid-template-columns: 1fr; }.template-group > header { display: grid; gap: 3px; } }
+
+/* Institution-scoped MinIO and business-database intake. */
+.institution-data-page { width: min(1180px, 100%); margin: 0 auto; }
+.institution-data-intro { border-left: 4px solid #2f8a6c; }
+.institution-data-intro h2, .institution-upload-panel h3, .institution-trace-panel h3, .institution-import-history h3 { display: flex; align-items: center; gap: 7px; margin: 3px 0 5px; color: #285c4b; }
+.institution-data-intro p, .institution-upload-panel p, .institution-trace-panel p, .institution-import-history p { margin: 0; color: #69867a; font-size: 12px; line-height: 1.6; }
+.institution-plane-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 9px; margin-top: 14px; }
+.institution-plane-grid div { display: grid; gap: 4px; border: 1px solid #d9e8e0; border-radius: 5px; padding: 10px; background: #f7fbf9; }
+.institution-plane-grid span { color: #7a9188; font-size: 10px; text-transform: uppercase; }
+.institution-plane-grid strong { overflow-wrap: anywhere; color: #315f50; font-size: 12px; }
+.institution-upload-form { display: grid; grid-template-columns: 190px minmax(240px, 1fr); gap: 10px; margin-top: 13px; }
+.institution-upload-form label { display: grid; gap: 5px; color: #527366; font-size: 12px; }
+.institution-upload-form select, .institution-upload-form input, .institution-upload-form textarea, .institution-trace-form input { min-width: 0; border: 1px solid #cfded6; border-radius: 4px; padding: 9px; background: #fff; }
+.institution-mapping-field { grid-column: 1 / -1; }
+.institution-mapping-field textarea { min-height: 70px; resize: vertical; font-family: Consolas, monospace; }
+.institution-contract-note { grid-column: 1 / -1; display: grid; gap: 4px; border: 1px solid #dae8e1; border-radius: 4px; padding: 10px; color: #547669; background: #f8fbf9; font-size: 11px; }
+.institution-contract-note small { color: #7a9188; }
+.institution-upload-form .primary-button { justify-self: start; }
+.institution-trace-form { display: flex; gap: 8px; margin-top: 12px; }
+.institution-trace-form input { flex: 1; }
+.institution-trace-result { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; margin-top: 12px; }
+.institution-trace-result > div { display: grid; align-content: start; gap: 6px; border: 1px solid #dce9e3; border-radius: 4px; padding: 10px; color: #526f64; font-size: 11px; }
+.institution-trace-result code { overflow-wrap: anywhere; color: #2f6c58; }
+.institution-trace-result span { display: flex; flex-wrap: wrap; gap: 4px; }
+.institution-trace-result em { color: #7a9188; }
+.institution-trace-result .trace-issue { color: #9a5b31; }
+.institution-import-history td small { display: block; color: #8a9d95; font-family: Consolas, monospace; }
+.institution-import-history .issue-count { color: #a35f30; font-weight: 700; }
+@media (max-width: 860px) { .institution-plane-grid, .institution-trace-result { grid-template-columns: repeat(2, minmax(0, 1fr)); }.institution-upload-form { grid-template-columns: 1fr; }.institution-mapping-field, .institution-contract-note { grid-column: auto; } }
+@media (max-width: 560px) { .institution-plane-grid, .institution-trace-result { grid-template-columns: 1fr; }.institution-trace-form { display: grid; } }

@@ -1,0 +1,3 @@
+# Kept separate so object-storage changes do not invalidate the large
+# OCR/document-analysis dependency layer in requirements.txt.
+minio==7.2.15

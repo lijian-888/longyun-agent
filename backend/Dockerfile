@@ -22,6 +22,9 @@ RUN pip install --no-cache-dir --retries 8 --timeout 300 \
 # stack so protocol upgrades do not trigger multi-gigabyte image rebuilds.
 COPY requirements-acps.txt .
 RUN pip install --no-cache-dir --retries 8 --timeout 300 -r requirements-acps.txt
+# Institution object-storage client is also a small independent layer.
+COPY requirements-institution-data.txt .
+RUN pip install --no-cache-dir --retries 8 --timeout 300 -r requirements-institution-data.txt
 # Keep the local GWAS numerical stack in a separate layer so changing it does
 # not invalidate the much larger OCR/document-analysis dependency cache.
 RUN pip install --no-cache-dir numpy==2.1.3 matplotlib==3.9.2

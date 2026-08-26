@@ -1,0 +1,6 @@
+##fileformat=VCFv4.2
+##source=LongyunInstitutionDemo
+##contig=<ID=1,length=43270923>
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	HNNF-G001	HNNF-G002
+1	1001	rsDemo1	A	G	60	PASS	.	GT	0/1	1/1
+1	2048	rsDemo2	C	T	60	PASS	.	GT	0/0	0/1
