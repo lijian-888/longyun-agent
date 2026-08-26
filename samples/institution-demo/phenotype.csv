@@ -1,0 +1,4 @@
+observation_id,germplasm_id,trial_id,environment_id,trait_code,value,unit
+OBS-001,HNNF-G001,TRIAL-2026-01,ENV-SY-2026,plant_height,102.4,cm
+OBS-002,HNNF-G001,TRIAL-2026-01,ENV-SY-2026,yield_per_mu,612.8,kg/亩
+OBS-003,HNNF-G002,TRIAL-2026-01,ENV-SY-2026,plant_height,98.7,cm

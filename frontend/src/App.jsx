@@ -37,6 +37,7 @@ import { authorizedFetch, jsonRequest, request } from "./api";
 import { keycloak } from "./auth";
 import KnowledgeLibrary from "./KnowledgeLibrary";
 import TrialPackageWorkspace from "./TrialPackageWorkspace";
+import InstitutionDataWorkspace from "./InstitutionDataWorkspace";
 
 const roles = [
   { id: "processor", label: "数据处理员", user: "数据处理员-张三", icon: ClipboardCheck, description: "导入、规则、质检、逐条审核与发布" },
@@ -403,7 +404,7 @@ function App({ user, accessRole = "data_processor", platformContext, onProjectCh
   }
 
   const navItems = roleId === "processor"
-    ? [{ id: "workbench", label: "数据处理工作台", icon: FolderInput }, { id: "trial-packages", label: "区域试验数据导入", icon: FileSpreadsheet }, { id: "manual", label: "手工补录", icon: FilePlus2 }, { id: "genotype-governance", label: "基因型治理申请", icon: FlaskConical }]
+    ? [{ id: "institution-data", label: "机构数据导入", icon: Database }, { id: "workbench", label: "数据处理工作台", icon: FolderInput }, { id: "trial-packages", label: "区域试验数据导入", icon: FileSpreadsheet }, { id: "manual", label: "手工补录", icon: FilePlus2 }, { id: "genotype-governance", label: "基因型治理申请", icon: FlaskConical }]
     : roleId === "researcher"
       ? [{ id: "research", label: "科研查询与分析", icon: Search }]
     : [{ id: "projects", label: "课题与账号", icon: UsersRound }, { id: "templates", label: "标准模板管理", icon: ShieldCheck }, { id: "rules", label: "规则版本与字段映射", icon: SlidersHorizontal }, { id: "knowledge", label: "公共知识库", icon: BookOpen }, { id: "overview", label: "系统概览", icon: LayoutDashboard }];
@@ -431,6 +432,7 @@ function App({ user, accessRole = "data_processor", platformContext, onProjectCh
       <header className="topbar"><div><p>{platformContext?.institution?.name || "海南南繁"} · {platformContext?.projects?.find((item) => item.id === platformContext.active_project_id)?.project_name || "课题工作区"}</p><h1>{navItems.find((item) => item.id === page)?.label || "隆耘平台"}</h1></div><div className="top-actions"><button className="icon-button" title="刷新数据" onClick={loadBase}><RefreshCw size={18} /></button></div></header>
       {message && <div className="toast"><Info size={17} /><span>{message}</span><button onClick={() => setMessage("")}><X size={16} /></button></div>}
       {page === "workbench" && <Workbench dashboard={dashboard} workbench={workbench} preview={preview} url={url} setUrl={setUrl} fileInput={fileInput} uploadFile={uploadFile} importUrl={importUrl} templates={templates} templateVersionId={templateVersionId} setTemplateVersionId={setTemplateVersionId} updatePreviewCandidate={updatePreviewCandidate} commitPreview={commitPreview} commitAllPreview={commitAllPreview} submitFieldRequest={submitFieldRequest} reprocessSource={reprocessSource} setEditing={setEditing} publish={publish} onOpenTrialPackages={() => setPage("trial-packages")} />}
+      {page === "institution-data" && <InstitutionDataWorkspace onNotice={setMessage} />}
       {page === "trial-packages" && <TrialPackageWorkspace onNotice={setMessage} />}
       {page === "genotype-governance" && <GenotypeGovernanceQueue requests={genotypeGovernanceRequests} onResolve={resolveGenotypeGovernanceRequest} />}
       {page === "rules" && <Rules rules={rules} catalog={catalog} actor={role.user} createRule={createRule} retireRule={retireRule} readOnly={false} />}

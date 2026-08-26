@@ -15,6 +15,23 @@ services:
     ports:
       - "54329:5432"
 
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-longyun-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-longyun_minio_demo_2026}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   api:
     build: ./backend
     environment:
@@ -22,6 +39,12 @@ services:
       MIGRATION_DATABASE_URL: postgresql+psycopg://rice:${POSTGRES_PASSWORD:-rice_demo_password}@db:5432/rice_demo
       APP_DATABASE_ROLE: rice_app
       APP_DATABASE_PASSWORD: ${APP_DATABASE_PASSWORD:-rice_app_demo_password}
+      INSTITUTION_DATA_ENABLED: ${INSTITUTION_DATA_ENABLED:-true}
+      INSTITUTION_UPLOAD_STAGING_DIR: /data/raw/institution-staging
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-longyun-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-longyun_minio_demo_2026}
+      MINIO_SECURE: "false"
       # Vite's local reverse proxy sends its Docker service name as Host.
       # Keep the local development boundary explicit instead of allowing '*'.
       TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,api,web}
@@ -75,6 +98,8 @@ services:
       BGE_M3_MODEL_PATH: /data/models/bge-m3
     depends_on:
       db:
+        condition: service_healthy
+      minio:
         condition: service_healthy
       mineru:
         condition: service_healthy
@@ -179,6 +204,7 @@ services:
 
 volumes:
   postgres_data:
+  minio_data:
   raw_data:
   research_data:
   model_data:
