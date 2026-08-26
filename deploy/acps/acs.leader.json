@@ -1,25 +1,25 @@
 {
   "aic": "",
   "active": true,
-  "lastModifiedTime": "2026-08-19T00:00:00+08:00",
+  "lastModifiedTime": "2026-08-21T00:00:00+08:00",
   "protocolVersion": "02.01",
   "name": "隆耘 Agent 育种智能体（Leader）",
-  "description": "面向水稻育种科研的协作 Leader。接收科研人员问题，通过 ACPs Discovery 选择合适 Partner，按 AIP 下发、轮询、确认或取消任务，并把协作结果返回给科研人员。",
-  "version": "1.0.0",
-  "documentationUrl": "https://agent.example.cn/acps/info",
-  "webAppUrl": "https://agent.example.cn",
+  "description": "面向水稻育种科研的 ACPs Group Leader。通过 Discovery 选择多个 Partner，创建 RabbitMQ 群组会话，使用 groupId 和 mentions 下发 AIP 任务、汇集状态与产出，并在终态或超时后释放群组。",
+  "version": "2.0.0",
+  "documentationUrl": "https://longyun.e-farmer.cn/acps/info",
+  "webAppUrl": "https://longyun.e-farmer.cn/",
   "provider": {
     "countryCode": "CN",
-    "organization": "请替换为真实机构名称",
-    "department": "请替换为真实部门名称",
-    "url": "https://agent.example.cn",
-    "license": "请替换为真实备案或资质信息",
-    "name": "请替换为联系人",
-    "email": "acps@example.cn",
+    "organization": "江西省亿发姆科技发展有限公司",
+    "department": "隆耘智能体项目组",
+    "url": "https://longyun.e-farmer.cn/",
+    "license": "REPLACE_WITH_PROVIDER_LICENSE_OR_SERVICE_TERMS",
+    "name": "李键",
+    "email": "13437975781@163.com",
     "domainRegistrations": [
       {
-        "domain": "example.cn",
-        "registrationNumber": "请替换为真实 ICP 或 WHOIS 登记号",
+        "domain": "e-farmer.cn",
+        "registrationNumber": "REPLACE_WITH_ICP_REGISTRATION",
         "registrationType": "ICP"
       }
     ]
@@ -27,14 +27,26 @@
   "securitySchemes": {
     "mtls": {
       "type": "mutualTLS",
-      "description": "Leader 使用 ACPs CA 签发的 clientAuth 身份证书调用 Discovery 和 Partner"
+      "description": "Leader 使用 ACPs CA 签发的独立 clientAuth 身份证书连接 RabbitMQ 并调用 MQ Auth"
     }
   },
-  "endPoints": [],
+  "endPoints": [
+    {
+      "url": "amqps://rabbitmq.acps.example.cn:5671/acps?inbox=inbox_{AIC}",
+      "transport": "AMQP",
+      "security": [
+        {
+          "mtls": []
+        }
+      ]
+    }
+  ],
   "capabilities": {
     "streaming": false,
     "notification": false,
-    "messageQueue": []
+    "messageQueue": [
+      "rabbitmq:>=4.2"
+    ]
   },
   "defaultInputModes": [],
   "defaultOutputModes": [],
@@ -43,7 +55,9 @@
     "runtimeRoles": [
       "leader"
     ],
-    "aipTransport": "direct-jsonrpc",
-    "partnerSelection": "acps-discovery"
+    "aipTransport": "group-rabbitmq-inbox",
+    "partnerSelection": "acps-discovery",
+    "sharedApplication": "longyun-agent",
+    "internalSessionOwner": "acps.researcher"
   }
 }

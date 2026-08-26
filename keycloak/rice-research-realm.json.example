@@ -80,6 +80,29 @@
       ]
     },
     {
+      "username": "acps.researcher",
+      "enabled": true,
+      "firstName": "ACPs",
+      "lastName": "External Research Agent",
+      "email": "13437975781@163.com",
+      "emailVerified": true,
+      "realmRoles": [
+        "researcher"
+      ],
+      "attributes": {
+        "accountPurpose": [
+          "acps-external-calls"
+        ]
+      },
+      "credentials": [
+        {
+          "type": "password",
+          "value": "CHANGE_ME_BEFORE_USE",
+          "temporary": true
+        }
+      ]
+    },
+    {
       "username": "zhang.processor",
       "enabled": true,
       "firstName": "Zhang",

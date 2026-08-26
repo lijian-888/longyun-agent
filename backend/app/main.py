@@ -37,9 +37,9 @@ from pgvector.sqlalchemy import Vector
 
 from .acps_adapter import (
     AcpsExecutionResult,
-    AcpsLeaderDispatchRequest,
+    AcpsGroupCommandRequest,
+    AcpsGroupDispatchRequest,
     AcpsSettings,
-    dispatch_partner_task,
     mount_acps_routes,
 )
 from .auth import (
@@ -2626,6 +2626,7 @@ def ensure_single_institution_schema(session: Session) -> None:
     default_accounts = (
         ("wang.researcher", "王研究员", "researcher"),
         ("li.researcher", "李研究员", "researcher"),
+        ("acps.researcher", "ACPs外部调用科研账号", "researcher"),
         ("zhang.processor", "张数据处理员", "data_processor"),
         ("chen.fieldadmin", "陈字段管理员", "field_admin"),
     )
@@ -2641,6 +2642,11 @@ def ensure_single_institution_schema(session: Session) -> None:
             ))
         else:
             account.institution_id = INSTITUTION_ID
+        if (
+            username == ACPS_SETTINGS.session_owner_username
+            and ACPS_SETTINGS.session_owner_subject
+        ):
+            account.keycloak_subject = ACPS_SETTINGS.session_owner_subject
 
     project = session.get(ResearchProject, DEFAULT_PROJECT_ID)
     if not project:
@@ -2658,7 +2664,7 @@ def ensure_single_institution_schema(session: Session) -> None:
         project.institution_id = INSTITUTION_ID
     session.flush()
 
-    for username in ("wang.researcher", "li.researcher"):
+    for username in ("wang.researcher", "li.researcher", "acps.researcher"):
         membership = session.scalar(select(ProjectMember).where(
             ProjectMember.project_id == DEFAULT_PROJECT_ID,
             ProjectMember.username == username,
@@ -2826,6 +2832,11 @@ def create_project(
     )
     session.add(project)
     session.flush()
+    # Public knowledge folders are protected by project-aware RLS.  A newly
+    # created project cannot come from the request header yet, so establish
+    # the verified field-admin and project context before seeding its folders.
+    _set_knowledge_context(session, user)
+    _set_active_project(session, project.id)
     seed_public_knowledge_folders(session, project.id)
     record_permission_audit(
         session,
@@ -6444,7 +6455,11 @@ def pdf_report(
     return Response(content=buffer.getvalue(), media_type="application/pdf", headers={"Content-Disposition": "attachment; filename=rice-phenotype-report.pdf"})
 
 
-async def execute_longyun_acps_partner(question: str, caller_aic: str) -> AcpsExecutionResult:
+async def execute_longyun_acps_partner(
+    question: str,
+    caller_aic: str,
+    acps_context: dict[str, str],
+) -> AcpsExecutionResult:
     """Run an ACPs Partner task inside the published-data-only boundary.
 
     External ACPs callers never inherit a browser user's private knowledge
@@ -6480,8 +6495,69 @@ async def execute_longyun_acps_partner(question: str, caller_aic: str) -> AcpsEx
         }
         for card in evidence_cards
     ]
+    answer = str(completed["content"]).strip()
+    with SessionLocal() as session:
+        owner = session.get(PlatformAccount, ACPS_SETTINGS.session_owner_username)
+        if not owner or not owner.active:
+            raise ResearchAgentError(
+                "ACPs 私人会话所有者账号不存在或已停用。"
+            )
+        owner_id = ACPS_SETTINGS.session_owner_subject or owner.keycloak_subject
+        if not owner_id:
+            raise ResearchAgentError(
+                "ACPs 私人会话所有者尚未完成 Keycloak 身份绑定；"
+                "请让该账号登录一次，或配置 ACPS_SESSION_OWNER_SUBJECT。"
+            )
+        research_session = ResearchSession(
+            project_id=DEFAULT_PROJECT_ID,
+            owner_id=owner_id,
+            title=f"ACPs · {question.strip()[:80]}",
+            memory_state={
+                "source": "acps-group",
+                "callerAic": caller_aic,
+                **acps_context,
+            },
+        )
+        session.add(research_session)
+        session.flush()
+        session.add_all([
+            ResearchMessage(
+                project_id=DEFAULT_PROJECT_ID,
+                session_id=research_session.id,
+                owner_id=owner_id,
+                role="user",
+                content=question.strip(),
+                evidence=[],
+                operation_state=[{"source": "acps-group", **acps_context}],
+            ),
+            ResearchMessage(
+                project_id=DEFAULT_PROJECT_ID,
+                session_id=research_session.id,
+                owner_id=owner_id,
+                role="assistant",
+                content=answer,
+                evidence=evidence_summary,
+                operation_state=[{
+                    "source": "acps-group",
+                    "callerAic": caller_aic,
+                    **acps_context,
+                }],
+            ),
+            ResearchAudit(
+                project_id=DEFAULT_PROJECT_ID,
+                owner_id=owner_id,
+                session_id=research_session.id,
+                action="acps_partner_result_saved",
+                audit_metadata={
+                    "callerAic": caller_aic,
+                    "dataBoundary": "published-standard-data-only",
+                    **acps_context,
+                },
+            ),
+        ])
+        session.commit()
     return AcpsExecutionResult(
-        text=str(completed["content"]).strip(),
+        text=answer,
         structured_data={
             "dataBoundary": "published-standard-data-only",
             "evidenceCount": len(evidence_summary),
@@ -6490,28 +6566,98 @@ async def execute_longyun_acps_partner(question: str, caller_aic: str) -> AcpsEx
     )
 
 
-@app.post("/api/acps/leader/dispatch", tags=["ACPs"])
-async def acps_leader_dispatch(
-    payload: AcpsLeaderDispatchRequest,
+ACPS_GROUP_RUNTIME = mount_acps_routes(app, ACPS_SETTINGS, execute_longyun_acps_partner)
+
+
+@app.post("/api/acps/leader/group/dispatch", tags=["ACPs"])
+async def acps_group_leader_dispatch(
+    payload: AcpsGroupDispatchRequest,
+    x_project_id: str | None = Header(default=None, alias="X-Project-Id"),
     user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
 ) -> dict[str, Any]:
-    """Let an authenticated researcher use Longyun as an ACPs Leader."""
+    """Create a Group, invite one or more Partners and run a shared AIP task."""
     try:
         project = resolve_project_access(session, user, x_project_id)
         _set_active_project(session, project.id)
-        result = await dispatch_partner_task(payload, ACPS_SETTINGS)
+        result = await ACPS_GROUP_RUNTIME.dispatch(payload, user.id)
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
     except TimeoutError as exc:
         raise HTTPException(504, str(exc)) from exc
-    except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except (httpx.HTTPError, RuntimeError) as exc:
         raise HTTPException(502, str(exc)) from exc
     except Exception as exc:
-        logger.exception("ACPs Leader dispatch failed")
-        raise HTTPException(502, "ACPs Leader 调度失败，请检查 Partner、Discovery 和证书配置。") from exc
+        logger.exception("ACPs Group Leader dispatch failed")
+        raise HTTPException(502, "ACPs Group 调度失败，请检查 Partner、RabbitMQ、Discovery 和证书配置。") from exc
     return {
         **result,
         "requestedBy": audit_actor(user),
-        "leaderAic": ACPS_SETTINGS.aic or None,
+        "leaderAic": ACPS_SETTINGS.leader_aic or None,
     }
 
 
-mount_acps_routes(app, ACPS_SETTINGS, execute_longyun_acps_partner)
+@app.get("/api/acps/leader/group/sessions/{session_id}/tasks/{task_id}", tags=["ACPs"])
+async def acps_group_task_status(
+    session_id: str,
+    task_id: str,
+    x_project_id: str | None = Header(default=None, alias="X-Project-Id"),
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> dict[str, Any]:
+    project = resolve_project_access(session, user, x_project_id)
+    _set_active_project(session, project.id)
+    try:
+        return ACPS_GROUP_RUNTIME.status_for_owner(session_id, task_id, user.id)
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/acps/leader/group/sessions/{session_id}/tasks/{task_id}/command", tags=["ACPs"])
+async def acps_group_task_command(
+    session_id: str,
+    task_id: str,
+    payload: AcpsGroupCommandRequest,
+    x_project_id: str | None = Header(default=None, alias="X-Project-Id"),
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> dict[str, Any]:
+    project = resolve_project_access(session, user, x_project_id)
+    _set_active_project(session, project.id)
+    try:
+        result = await ACPS_GROUP_RUNTIME.command(session_id, task_id, payload, user.id)
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    except TimeoutError as exc:
+        raise HTTPException(504, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return {
+        **result,
+        "requestedBy": audit_actor(user),
+        "leaderAic": ACPS_SETTINGS.leader_aic or None,
+    }
+
+
+@app.delete("/api/acps/leader/group/sessions/{session_id}", tags=["ACPs"])
+async def acps_group_session_dissolve(
+    session_id: str,
+    x_project_id: str | None = Header(default=None, alias="X-Project-Id"),
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> dict[str, Any]:
+    project = resolve_project_access(session, user, x_project_id)
+    _set_active_project(session, project.id)
+    try:
+        await ACPS_GROUP_RUNTIME.dissolve(session_id, user.id)
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return {"sessionId": session_id, "dissolved": True}

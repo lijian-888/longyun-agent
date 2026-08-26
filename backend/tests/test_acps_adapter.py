@@ -1,15 +1,8 @@
-import asyncio
-import uuid
 import unittest
 from dataclasses import replace
-from datetime import datetime, timezone
 
 import httpx
 from fastapi import FastAPI
-
-from acps_sdk.acs import AgentCapabilitySpec
-from acps_sdk.aip import TaskCommand, TaskCommandType, TaskState, TextDataItem
-from acps_sdk.aip.aip_rpc_server import TaskManager
 
 from app.acps_adapter import (
     AcpsExecutionResult,
@@ -19,179 +12,101 @@ from app.acps_adapter import (
 )
 
 
+LEADER_AIC = "1.2.156.3088.1.1.CIQJUQ.HELDGD.1.03LE"
+PARTNER_AIC = "1.2.156.3088.1.1.CIQJUQ.HELDGD.1.03PA"
+
+
 def _settings(**changes):
-    return replace(
-        AcpsSettings.from_env(),
-        enabled=True,
-        role="partner",
-        aic="partner-aic",
-        public_base_url="https://longyun.example.cn",
-        documentation_url="https://longyun.example.cn/acps/health",
-        rpc_url="https://longyun.example.cn:9443/acps/rpc",
-        **changes,
-    )
-
-
-def _command(command_type: TaskCommandType, task_id: str, text: str | None = None) -> TaskCommand:
-    return TaskCommand(
-        id=f"command-{uuid.uuid4()}",
-        sentAt=datetime.now(timezone.utc).isoformat(),
-        senderRole="leader",
-        senderId="leader-aic",
-        sessionId="session-1",
-        taskId=task_id,
-        command=command_type,
-        dataItems=[TextDataItem(text=text)] if text is not None else None,
-    )
-
-
-def _rpc_body(command: TaskCommand) -> dict:
-    return {
-        "jsonrpc": "2.0",
-        "id": f"rpc-{uuid.uuid4()}",
-        "method": "rpc",
-        "params": {"command": command.model_dump(mode="json", exclude_none=True)},
+    values = {
+        "enabled": True,
+        "role": "hybrid",
+        "transport": "group",
+        "leader_aic": LEADER_AIC,
+        "partner_aic": PARTNER_AIC,
+        "public_base_url": "https://longyun.e-farmer.cn",
+        "documentation_url": "https://longyun.e-farmer.cn/acps/info",
+        "rabbitmq_host": "acps-mq.internal.example.cn",
+        "rabbitmq_port": 5671,
+        "rabbitmq_vhost": "acps",
+        "rabbitmq_user": "local-test",
+        "rabbitmq_password": "local-test-password",
+        "allow_plain_rabbitmq": True,
+        "rabbitmq_auth_service_url": "https://acps-mq-auth.internal.example.cn:9007",
+        "mtls_enabled": False,
     }
+    values.update(changes)
+    return replace(AcpsSettings.from_env(), **values)
 
 
 class AcpsAcsTests(unittest.TestCase):
-    def test_partner_and_leader_acs_validate_with_sdk(self):
-        settings = _settings(mtls_enabled=True, certificate_dns_names=("longyun.example.cn",))
-        partner = build_acs_document(settings, "partner")
+    def test_leader_and_partner_have_independent_aics_and_amqp_only(self):
+        settings = _settings()
         leader = build_acs_document(settings, "leader")
+        partner = build_acs_document(settings, "partner")
 
-        AgentCapabilitySpec.from_dict(partner)
-        AgentCapabilitySpec.from_dict(leader)
-        self.assertEqual(partner["protocolVersion"], "02.01")
-        self.assertEqual(partner["endPoints"][0]["transport"], "JSONRPC")
-        self.assertEqual(partner["certificate"]["altNames"]["dns"], ["longyun.example.cn"])
-        self.assertEqual(leader["endPoints"], [])
+        self.assertEqual(leader["aic"], LEADER_AIC)
+        self.assertEqual(partner["aic"], PARTNER_AIC)
+        self.assertNotEqual(leader["aic"], partner["aic"])
+        self.assertEqual([item["transport"] for item in leader["endPoints"]], ["AMQP"])
+        self.assertEqual([item["transport"] for item in partner["endPoints"]], ["AMQP"])
+        self.assertNotIn("groupInvitationUrl", partner["entityMeta"])
         self.assertEqual(leader["skills"], [])
+        self.assertEqual(len(partner["skills"]), 2)
+        self.assertEqual(
+            partner["capabilities"]["messageQueue"],
+            ["rabbitmq:>=4.2"],
+        )
+        self.assertIn("application/pdf", partner["defaultOutputModes"])
+        self.assertIn(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            partner["defaultOutputModes"],
+        )
+
+    def test_provider_defaults_match_longyun_registration(self):
+        provider = build_acs_document(_settings(), "partner")["provider"]
+
+        self.assertEqual(provider["organization"], "江西省亿发姆科技发展有限公司")
+        self.assertEqual(provider["department"], "隆耘智能体项目组")
+        self.assertEqual(provider["name"], "李键")
+        self.assertEqual(provider["email"], "13437975781@163.com")
 
 
-class AcpsPartnerRpcTests(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        TaskManager._tasks.clear()
-
-    async def asyncTearDown(self):
-        await asyncio.sleep(0)
-        TaskManager._tasks.clear()
-
-    async def test_full_direct_aip_state_machine(self):
-        calls = []
-
-        async def execute(prompt: str, caller_aic: str) -> AcpsExecutionResult:
-            calls.append((prompt, caller_aic))
-            await asyncio.sleep(0.02)
-            return AcpsExecutionResult(
-                text=f"已分析：{prompt}",
-                structured_data={"dataBoundary": "published-standard-data-only"},
-            )
-
-        app = FastAPI()
-        mount_acps_routes(app, _settings(), execute)
-        transport = httpx.ASGITransport(app=app)
-        task_id = "task-complete"
-
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            start = await client.post(
-                "/acps/rpc",
-                json=_rpc_body(_command(TaskCommandType.Start, task_id, "比较候选材料产量")),
-            )
-            self.assertEqual(start.status_code, 200)
-            self.assertIn(start.json()["result"]["status"]["state"], {"accepted", "working"})
-
-            state = "accepted"
-            result = None
-            for _ in range(30):
-                await asyncio.sleep(0.01)
-                response = await client.post(
-                    "/acps/rpc",
-                    json=_rpc_body(_command(TaskCommandType.Get, task_id)),
-                )
-                result = response.json()["result"]
-                state = result["status"]["state"]
-                if state == "awaiting-completion":
-                    break
-
-            self.assertEqual(state, "awaiting-completion")
-            self.assertEqual(result["products"][0]["dataItems"][0]["text"], "已分析：比较候选材料产量")
-            self.assertEqual(result["senderId"], "partner-aic")
-
-            complete = await client.post(
-                "/acps/rpc",
-                json=_rpc_body(_command(TaskCommandType.Complete, task_id)),
-            )
-            self.assertEqual(complete.json()["result"]["status"]["state"], "completed")
-
-        self.assertEqual(calls, [("比较候选材料产量", "leader-aic")])
-
-    async def test_missing_input_continue_and_cancel(self):
-        gate = asyncio.Event()
-
-        async def execute(prompt: str, caller_aic: str) -> AcpsExecutionResult:
-            await gate.wait()
+class AcpsMetadataRouteTests(unittest.IsolatedAsyncioTestCase):
+    async def test_role_specific_cards_and_no_rpc_ingress(self):
+        async def execute(prompt, caller_aic, context):
             return AcpsExecutionResult(text=prompt)
 
         app = FastAPI()
         mount_acps_routes(app, _settings(), execute)
         transport = httpx.ASGITransport(app=app)
-        task_id = "task-cancel"
-
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            start = await client.post(
-                "/acps/rpc",
-                json=_rpc_body(_command(TaskCommandType.Start, task_id)),
-            )
-            self.assertEqual(start.json()["result"]["status"]["state"], "awaiting-input")
+            partner = await client.get("/.well-known/acps-agent.json?role=partner")
+            leader = await client.get("/.well-known/acps-agent.json?role=leader")
+            health = await client.get("/acps/health")
+            direct = await client.post("/acps/rpc", json={})
+            rpc_invitation = await client.post("/acps/group/rpc", json={})
 
-            continued = await client.post(
-                "/acps/rpc",
-                json=_rpc_body(_command(TaskCommandType.Continue, task_id, "补充问题")),
-            )
-            self.assertEqual(continued.json()["result"]["status"]["state"], "accepted")
+        self.assertEqual(partner.status_code, 200)
+        self.assertEqual(partner.json()["aic"], PARTNER_AIC)
+        self.assertEqual(leader.status_code, 200)
+        self.assertEqual(leader.json()["aic"], LEADER_AIC)
+        self.assertEqual(
+            health.json()["identities"],
+            {"leader": LEADER_AIC, "partner": PARTNER_AIC},
+        )
+        self.assertEqual(direct.status_code, 404)
+        self.assertEqual(rpc_invitation.status_code, 404)
 
-            canceled = await client.post(
-                "/acps/rpc",
-                json=_rpc_body(_command(TaskCommandType.Cancel, task_id)),
-            )
-            self.assertEqual(canceled.json()["result"]["status"]["state"], "canceled")
-
-    async def test_mtls_proxy_identity_must_match_sender(self):
-        async def execute(prompt: str, caller_aic: str) -> AcpsExecutionResult:
+    async def test_disabled_role_card_is_hidden(self):
+        async def execute(prompt, caller_aic, context):
             return AcpsExecutionResult(text=prompt)
 
         app = FastAPI()
-        mount_acps_routes(app, _settings(require_verified_client=True), execute)
+        mount_acps_routes(app, _settings(role="partner", leader_aic=""), execute)
         transport = httpx.ASGITransport(app=app)
-        body = _rpc_body(_command(TaskCommandType.Start, "task-identity", "问题"))
-
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            missing = await client.post("/acps/rpc", json=body)
-            self.assertEqual(missing.status_code, 401)
-
-            mismatch = await client.post(
-                "/acps/rpc",
-                json=body,
-                headers={"X-ACPS-Client-AIC": "different-leader"},
-            )
-            self.assertEqual(mismatch.status_code, 403)
-
-            accepted = await client.post(
-                "/acps/rpc",
-                json=body,
-                headers={"X-ACPS-Client-AIC": "leader-aic"},
-            )
-            self.assertEqual(accepted.status_code, 200)
-
-            other_command = _command(TaskCommandType.Get, "task-identity")
-            other_command.senderId = "other-leader"
-            forbidden = await client.post(
-                "/acps/rpc",
-                json=_rpc_body(other_command),
-                headers={"X-ACPS-Client-AIC": "other-leader"},
-            )
-            self.assertEqual(forbidden.status_code, 403)
+            response = await client.get("/.well-known/acps-agent.json?role=leader")
+        self.assertEqual(response.status_code, 404)
 
 
 if __name__ == "__main__":

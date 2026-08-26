@@ -1,48 +1,37 @@
-"""ACPs v2.1 adapter for running Longyun as a Leader, Partner, or both.
+"""ACPs v2.1 Inbox/Group adapter for Longyun.
 
 This module deliberately keeps ACPs transport/state management separate from
-the research business logic in ``main.py``.  The Partner callback receives only
-plain text and returns a text product plus non-sensitive structured metadata.
+the research business logic in ``main.py``.  Leader and Partner use separate
+AICs and client certificates while sharing one Longyun application deployment.
 """
 
 from __future__ import annotations
 
-import asyncio
-import logging
+import copy
 import os
 import ssl
-import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal, cast
 
-import httpx
-from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field, ValidationError
 
 from acps_sdk.acs import AgentCapabilitySpec
-from acps_sdk.adp import DiscoveryRequest, DiscoveryResponse
-from acps_sdk.aip import (
-    AipRpcClient,
-    Product,
-    StructuredDataItem,
-    TaskCommand,
-    TaskResult,
-    TaskState,
-    TextDataItem,
-)
-from acps_sdk.aip.aip_rpc_server import (
-    CommandHandlers,
-    DefaultHandlers,
-    TaskManager,
-    handle_rpc_request,
+
+from .acps_group import (
+    AcpsGroupCommandRequest,
+    AcpsGroupDispatchRequest,
+    AcpsGroupPartnerTarget,
+    AcpsGroupRuntime,
 )
 
 
 AcpsRole = Literal["leader", "partner", "hybrid"]
-PartnerExecutor = Callable[[str, str], Awaitable["AcpsExecutionResult"]]
-logger = logging.getLogger("uvicorn.error")
+AcpsIdentityRole = Literal["leader", "partner"]
+AcpsTransport = Literal["group"]
+PartnerExecutor = Callable[[str, str, dict[str, str]], Awaitable["AcpsExecutionResult"]]
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -50,10 +39,6 @@ def _env_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _env_list(name: str) -> tuple[str, ...]:
-    return tuple(value.strip() for value in os.getenv(name, "").split(",") if value.strip())
 
 
 def _optional_env(name: str) -> str | None:
@@ -71,12 +56,13 @@ class AcpsSettings:
 
     enabled: bool
     role: AcpsRole
-    aic: str
+    transport: AcpsTransport
+    leader_aic: str
+    partner_aic: str
     name: str
     version: str
     public_base_url: str
     documentation_url: str
-    rpc_url: str
     discovery_base_url: str | None
     provider_organization: str
     provider_department: str | None
@@ -88,14 +74,24 @@ class AcpsSettings:
     provider_domain: str | None
     provider_domain_registration_number: str | None
     provider_domain_registration_type: str | None
+    session_owner_username: str
+    session_owner_subject: str | None
     mtls_enabled: bool
-    require_verified_client: bool
-    verified_client_header: str
-    client_certificate_file: str | None
-    client_private_key_file: str | None
+    leader_client_certificate_file: str | None
+    leader_client_private_key_file: str | None
+    partner_client_certificate_file: str | None
+    partner_client_private_key_file: str | None
     trust_bundle_file: str | None
-    certificate_dns_names: tuple[str, ...]
-    certificate_ip_addresses: tuple[str, ...]
+    rabbitmq_host: str | None
+    rabbitmq_port: int
+    rabbitmq_vhost: str
+    rabbitmq_user: str | None
+    rabbitmq_password: str | None
+    allow_plain_rabbitmq: bool
+    rabbitmq_auth_service_url: str | None
+    group_invitation_timeout_seconds: int
+    group_max_partner_groups: int
+    group_max_partners: int
     poll_interval_seconds: float
     task_timeout_seconds: float
 
@@ -104,39 +100,61 @@ class AcpsSettings:
         role = os.getenv("ACPS_ROLE", "hybrid").strip().lower()
         if role not in {"leader", "partner", "hybrid"}:
             raise ValueError("ACPS_ROLE 必须是 leader、partner 或 hybrid。")
+        transport = os.getenv("ACPS_TRANSPORT", "group").strip().lower()
+        if transport != "group":
+            raise ValueError("隆耘生产适配器只支持 ACPS_TRANSPORT=group。")
         public_base_url = _base_url(os.getenv("ACPS_PUBLIC_BASE_URL", "http://localhost:5183"))
         return cls(
-            enabled=_env_bool("ACPS_ENABLED", True),
+            enabled=_env_bool("ACPS_ENABLED", False),
             role=cast(AcpsRole, role),
-            aic=os.getenv("ACPS_AIC", "").strip(),
+            transport=cast(AcpsTransport, transport),
+            leader_aic=os.getenv("ACPS_LEADER_AIC", "").strip(),
+            partner_aic=os.getenv("ACPS_PARTNER_AIC", "").strip(),
             name=os.getenv("ACPS_AGENT_NAME", "隆耘 Agent 育种智能体").strip(),
-            version=os.getenv("ACPS_AGENT_VERSION", "1.0.0").strip(),
+            version=os.getenv("ACPS_AGENT_VERSION", "2.0.0").strip(),
             public_base_url=public_base_url,
             documentation_url=os.getenv(
                 "ACPS_DOCUMENTATION_URL",
-                "https://github.com/lijian-888/longyun-agent/blob/codex/main-rework/docs/ACPS-INTEGRATION.md",
+                "https://github.com/lijian-888/longyun-agent/blob/main/docs/ACPS-INTEGRATION.md",
             ).strip(),
-            rpc_url=os.getenv("ACPS_RPC_URL", f"{public_base_url}/acps/rpc").strip(),
             discovery_base_url=_optional_env("ACPS_DISCOVERY_BASE_URL"),
-            provider_organization=os.getenv("ACPS_PROVIDER_ORGANIZATION", "隆耘智能体项目").strip(),
-            provider_department=_optional_env("ACPS_PROVIDER_DEPARTMENT"),
+            provider_organization=os.getenv(
+                "ACPS_PROVIDER_ORGANIZATION", "江西省亿发姆科技发展有限公司"
+            ).strip(),
+            provider_department=_optional_env("ACPS_PROVIDER_DEPARTMENT") or "隆耘智能体项目组",
             provider_url=_optional_env("ACPS_PROVIDER_URL")
-            or "https://github.com/lijian-888/longyun-agent",
+            or "https://longyun.e-farmer.cn/",
             provider_license=_optional_env("ACPS_PROVIDER_LICENSE"),
-            provider_name=_optional_env("ACPS_PROVIDER_NAME"),
-            provider_email=_optional_env("ACPS_PROVIDER_EMAIL"),
+            provider_name=_optional_env("ACPS_PROVIDER_NAME") or "李键",
+            provider_email=_optional_env("ACPS_PROVIDER_EMAIL") or "13437975781@163.com",
             provider_country_code=os.getenv("ACPS_PROVIDER_COUNTRY_CODE", "CN").strip().upper(),
             provider_domain=_optional_env("ACPS_PROVIDER_DOMAIN"),
             provider_domain_registration_number=_optional_env("ACPS_PROVIDER_DOMAIN_REGISTRATION_NUMBER"),
             provider_domain_registration_type=_optional_env("ACPS_PROVIDER_DOMAIN_REGISTRATION_TYPE"),
+            session_owner_username=os.getenv(
+                "ACPS_SESSION_OWNER_USERNAME", "acps.researcher"
+            ).strip(),
+            session_owner_subject=_optional_env("ACPS_SESSION_OWNER_SUBJECT"),
             mtls_enabled=_env_bool("ACPS_MTLS_ENABLED", False),
-            require_verified_client=_env_bool("ACPS_REQUIRE_VERIFIED_CLIENT", False),
-            verified_client_header=os.getenv("ACPS_VERIFIED_CLIENT_HEADER", "X-ACPS-Client-AIC").strip(),
-            client_certificate_file=_optional_env("ACPS_CLIENT_CERT_FILE"),
-            client_private_key_file=_optional_env("ACPS_CLIENT_KEY_FILE"),
+            leader_client_certificate_file=_optional_env("ACPS_LEADER_CLIENT_CERT_FILE"),
+            leader_client_private_key_file=_optional_env("ACPS_LEADER_CLIENT_KEY_FILE"),
+            partner_client_certificate_file=_optional_env("ACPS_PARTNER_CLIENT_CERT_FILE"),
+            partner_client_private_key_file=_optional_env("ACPS_PARTNER_CLIENT_KEY_FILE"),
             trust_bundle_file=_optional_env("ACPS_TRUST_BUNDLE_FILE"),
-            certificate_dns_names=_env_list("ACPS_CERTIFICATE_DNS_NAMES"),
-            certificate_ip_addresses=_env_list("ACPS_CERTIFICATE_IP_ADDRESSES"),
+            rabbitmq_host=_optional_env("ACPS_RABBITMQ_HOST"),
+            rabbitmq_port=int(os.getenv("ACPS_RABBITMQ_PORT", "5671")),
+            rabbitmq_vhost=os.getenv("ACPS_RABBITMQ_VHOST", "acps").strip(),
+            rabbitmq_user=_optional_env("ACPS_RABBITMQ_USER"),
+            rabbitmq_password=_optional_env("ACPS_RABBITMQ_PASSWORD"),
+            allow_plain_rabbitmq=_env_bool("ACPS_ALLOW_PLAIN_RABBITMQ", False),
+            rabbitmq_auth_service_url=_optional_env("ACPS_RABBITMQ_AUTH_SERVICE_URL"),
+            group_invitation_timeout_seconds=max(
+                int(os.getenv("ACPS_GROUP_INVITATION_TIMEOUT_SECONDS", "300")), 10
+            ),
+            group_max_partner_groups=max(
+                int(os.getenv("ACPS_GROUP_MAX_PARTNER_GROUPS", "16")), 1
+            ),
+            group_max_partners=max(int(os.getenv("ACPS_GROUP_MAX_PARTNERS", "8")), 1),
             poll_interval_seconds=max(float(os.getenv("ACPS_POLL_INTERVAL_SECONDS", "0.5")), 0.05),
             task_timeout_seconds=max(float(os.getenv("ACPS_TASK_TIMEOUT_SECONDS", "180")), 1.0),
         )
@@ -150,6 +168,14 @@ class AcpsSettings:
         return self.enabled and self.role in {"partner", "hybrid"}
 
     @property
+    def supports_group(self) -> bool:
+        return self.enabled
+
+    @property
+    def aip_transport(self) -> str:
+        return "group-rabbitmq-inbox"
+
+    @property
     def runtime_roles(self) -> list[str]:
         if self.role == "hybrid":
             return ["leader", "partner"]
@@ -157,15 +183,37 @@ class AcpsSettings:
 
     @property
     def registered(self) -> bool:
-        return bool(self.aic)
+        return all(self.aic_for(role) for role in self.runtime_roles)
 
-    def outbound_ssl_context(self) -> ssl.SSLContext | None:
-        """Build the Leader's client-auth TLS context when mTLS is enabled."""
+    def aic_for(self, role: AcpsIdentityRole) -> str:
+        return self.leader_aic if role == "leader" else self.partner_aic
+
+    def amqp_url_for(self, role: AcpsIdentityRole) -> str | None:
+        aic = self.aic_for(role)
+        if not self.rabbitmq_host or not aic:
+            return None
+        return (
+            f"amqps://{self.rabbitmq_host}:{self.rabbitmq_port}/"
+            f"{self.rabbitmq_vhost}?inbox=inbox_{aic}"
+        )
+
+    def outbound_ssl_context(self, role: AcpsIdentityRole) -> ssl.SSLContext | None:
+        """Build the selected ACPs identity's client-auth TLS context."""
         if not self.mtls_enabled:
             return None
+        cert = (
+            self.leader_client_certificate_file
+            if role == "leader"
+            else self.partner_client_certificate_file
+        )
+        key = (
+            self.leader_client_private_key_file
+            if role == "leader"
+            else self.partner_client_private_key_file
+        )
         required = {
-            "ACPS_CLIENT_CERT_FILE": self.client_certificate_file,
-            "ACPS_CLIENT_KEY_FILE": self.client_private_key_file,
+            f"ACPS_{role.upper()}_CLIENT_CERT_FILE": cert,
+            f"ACPS_{role.upper()}_CLIENT_KEY_FILE": key,
             "ACPS_TRUST_BUNDLE_FILE": self.trust_bundle_file,
         }
         missing = [name for name, value in required.items() if not value]
@@ -176,10 +224,20 @@ class AcpsSettings:
                 raise RuntimeError(f"{name} 指向的文件不存在：{value}")
         context = ssl.create_default_context(cafile=self.trust_bundle_file)
         context.load_cert_chain(
-            certfile=str(self.client_certificate_file),
-            keyfile=str(self.client_private_key_file),
+            certfile=str(cert),
+            keyfile=str(key),
         )
         return context
+
+
+class AcpsFileArtifact(BaseModel):
+    """A file already stored behind an authorized, time-limited URL."""
+
+    name: str
+    mime_type: str
+    uri: str
+    size_bytes: int = Field(ge=0)
+    sha256: str
 
 
 class AcpsExecutionResult(BaseModel):
@@ -187,17 +245,9 @@ class AcpsExecutionResult(BaseModel):
 
     text: str
     structured_data: dict[str, Any] = Field(default_factory=dict)
+    files: list[AcpsFileArtifact] = Field(default_factory=list)
     product_name: str = "隆耘育种分析结果"
     product_description: str = "基于平台已发布标准数据生成的只读科研分析"
-
-
-class AcpsLeaderDispatchRequest(BaseModel):
-    query: str = Field(min_length=1, max_length=12_000)
-    partner_url: str | None = None
-    partner_aic: str | None = None
-    task_id: str | None = None
-    session_id: str | None = None
-    auto_complete: bool = True
 
 
 def _now_beijing() -> str:
@@ -255,7 +305,14 @@ def _partner_skills() -> list[dict[str, Any]]:
                 "查询某品种的已发布株高、千粒重和生育期性状。",
             ],
             "inputModes": ["text/plain"],
-            "outputModes": ["text/plain", "application/json"],
+            "outputModes": [
+                "text/plain",
+                "application/json",
+                "application/pdf",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "image/png",
+                "image/jpeg",
+            ],
         },
         {
             "id": "longyun.rice.breeding-research",
@@ -271,324 +328,144 @@ def _partner_skills() -> list[dict[str, Any]]:
                 "解释目标性状与候选基因研究时需要关注的验证步骤。",
             ],
             "inputModes": ["text/plain"],
-            "outputModes": ["text/plain", "application/json"],
+            "outputModes": [
+                "text/plain",
+                "application/json",
+                "application/pdf",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "image/png",
+                "image/jpeg",
+            ],
         },
     ]
 
 
-def build_acs_document(settings: AcpsSettings, role: AcpsRole | None = None) -> dict[str, Any]:
-    """Build and validate an ACS 02.01 document for the selected runtime role."""
-    selected_role = role or settings.role
-    if selected_role not in {"leader", "partner", "hybrid"}:
-        raise ValueError("ACS role must be leader, partner, or hybrid")
-    exposes_partner = selected_role in {"partner", "hybrid"}
+def _validate_acs_document(document: dict[str, Any]) -> None:
+    """Validate ACS while tolerating one known acps-sdk 2.1 enum lag.
+
+    The normative ACS 02.01 regex and the official Group demos use
+    ``rabbitmq:>=4.2``.  The Python SDK 2.1.0 model still enumerates only
+    RabbitMQ 3.9-3.11.  Validate the original first; when and only when every
+    error points at ``capabilities.messageQueue``, validate a compatibility
+    copy so all other normative fields remain SDK-checked.
+    """
+    try:
+        AgentCapabilitySpec.from_dict(document)
+        return
+    except ValidationError as exc:
+        errors = exc.errors()
+        if not errors or any(tuple(error.get("loc", ()))[:2] != ("capabilities", "messageQueue") for error in errors):
+            raise
+    compatibility = copy.deepcopy(document)
+    compatibility["capabilities"]["messageQueue"] = ["rabbitmq:3.11"]
+    AgentCapabilitySpec.from_dict(compatibility)
+
+
+def build_acs_document(
+    settings: AcpsSettings,
+    role: AcpsIdentityRole,
+) -> dict[str, Any]:
+    """Build one ACS for one independently registered Longyun identity."""
+    selected_role = role
+    exposes_partner = selected_role == "partner"
     security_schemes: dict[str, Any] = {}
     endpoint_security: list[dict[str, list[str]]] | None = None
     if settings.mtls_enabled:
         security_schemes["mtls"] = {
             "type": "mutualTLS",
-            "description": "使用 ACPs CA 签发的客户端和服务端身份证书进行双向 TLS 认证。",
+            "description": "使用 ACPs CA 签发的 clientAuth 身份证书连接 RabbitMQ。",
         }
         endpoint_security = [{"mtls": []}]
 
+    endpoints: list[dict[str, Any]] = []
+    amqp_url = settings.amqp_url_for(selected_role)
+    if settings.supports_group and amqp_url:
+        endpoints.append({
+            "url": amqp_url,
+            "transport": "AMQP",
+            **({"security": endpoint_security} if endpoint_security else {}),
+        })
+
     document: dict[str, Any] = {
-        "aic": settings.aic,
+        "aic": settings.aic_for(selected_role),
         "active": settings.enabled,
         "lastModifiedTime": _now_beijing(),
         "protocolVersion": "02.01",
-        "name": settings.name,
+        "name": f"{settings.name}（{'Leader' if selected_role == 'leader' else 'Partner'}）",
         "description": (
-            "面向水稻育种科研与数据治理的隆耘智能体。可作为 ACPs Leader 调度协作智能体，"
-            "也可作为 Partner 提供基于已发布标准数据的只读分析能力。"
+            "面向水稻育种科研的隆耘 Group Leader。通过 Discovery 选择 Partner，创建和维护"
+            "RabbitMQ Group，分发任务并汇总产出。"
+            if selected_role == "leader"
+            else "面向水稻育种科研的隆耘 Group Partner。通过 AMQP Inbox 接受邀请，加入"
+            "RabbitMQ Group，并提供基于已发布标准数据的只读研究分析能力。"
         ),
         "version": settings.version,
         "documentationUrl": settings.documentation_url,
         "webAppUrl": settings.public_base_url,
         "provider": _provider(settings),
         "securitySchemes": security_schemes,
-        "endPoints": ([{
-            "url": settings.rpc_url,
-            "transport": "JSONRPC",
-            **({"security": endpoint_security} if endpoint_security else {}),
-        }] if exposes_partner else []),
+        "endPoints": endpoints,
         "capabilities": {
             "streaming": False,
             "notification": False,
-            "messageQueue": [],
+            "messageQueue": (
+                ["rabbitmq:>=4.2"]
+                if settings.supports_group
+                else []
+            ),
         },
-        "defaultInputModes": ["text/plain"],
-        "defaultOutputModes": ["text/plain", "application/json"],
+        "defaultInputModes": ["text/plain"] if exposes_partner else [],
+        "defaultOutputModes": (
+            [
+                "text/plain",
+                "application/json",
+                "application/pdf",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "image/png",
+                "image/jpeg",
+            ]
+            if exposes_partner
+            else []
+        ),
         "skills": _partner_skills() if exposes_partner else [],
         "entityMeta": {
-            "runtimeRoles": ["leader", "partner"] if selected_role == "hybrid" else [selected_role],
+            "runtimeRoles": [selected_role],
             "dataBoundary": "published-standard-data-only",
-            "aipTransport": "direct-jsonrpc",
+            "aipTransport": settings.aip_transport,
+            "sharedApplication": "longyun-agent",
+            "internalSessionOwner": "acps.researcher",
         },
     }
-    if settings.certificate_dns_names or settings.certificate_ip_addresses:
-        document["certificate"] = {
-            "altNames": {
-                "dns": list(settings.certificate_dns_names),
-                "ip": list(settings.certificate_ip_addresses),
-            }
-        }
 
-    # The SDK validates the normative ACS fields.  Registry-specific extension
-    # fields such as certificate are retained in the original dictionary.
-    AgentCapabilitySpec.from_dict(document)
+    _validate_acs_document(document)
     return document
-
-
-def _command_text(command: TaskCommand) -> str:
-    return "\n".join(
-        item.text.strip()
-        for item in command.dataItems or []
-        if isinstance(item, TextDataItem) and item.text.strip()
-    )
-
-
-def _partner_sender_id(settings: AcpsSettings) -> str:
-    return settings.aic or "longyun-unregistered-partner"
-
-
-def build_partner_handlers(
-    settings: AcpsSettings,
-    executor: PartnerExecutor,
-) -> CommandHandlers:
-    """Create the Direct AIP Partner state machine and background job runner."""
-    jobs: dict[str, asyncio.Task[None]] = {}
-
-    def stamp_sender(task: TaskResult) -> TaskResult:
-        task.senderId = _partner_sender_id(settings)
-        task.sentAt = datetime.now(timezone.utc).isoformat()
-        return task
-
-    async def run_task(task_id: str, prompt: str, caller_aic: str) -> None:
-        current = TaskManager.get_task(task_id)
-        if not current or current.status.state == TaskState.Canceled:
-            return
-        TaskManager.update_task_status(task_id, TaskState.Working)
-        try:
-            result = await executor(prompt, caller_aic)
-            current = TaskManager.get_task(task_id)
-            if not current or current.status.state == TaskState.Canceled:
-                return
-            product = Product(
-                id=f"product-{uuid.uuid4()}",
-                name=result.product_name,
-                description=result.product_description,
-                dataItems=[
-                    TextDataItem(text=result.text, metadata={"mimeType": "text/plain; charset=utf-8"}),
-                    StructuredDataItem(
-                        data=result.structured_data,
-                        metadata={"mimeType": "application/json", "dataBoundary": "published-standard-data-only"},
-                    ),
-                ],
-            )
-            TaskManager.set_products(task_id, [product])
-            TaskManager.update_task_status(
-                task_id,
-                TaskState.AwaitingCompletion,
-                [TextDataItem(text="隆耘分析已完成，请由 Leader 确认接收结果。")],
-            )
-            updated = TaskManager.get_task(task_id)
-            if updated:
-                stamp_sender(updated)
-        except asyncio.CancelledError:
-            current = TaskManager.get_task(task_id)
-            if current and current.status.state != TaskState.Canceled:
-                TaskManager.update_task_status(task_id, TaskState.Canceled)
-            raise
-        except Exception:
-            logger.exception("Longyun ACPs Partner task %s failed", task_id)
-            current = TaskManager.get_task(task_id)
-            if current and current.status.state != TaskState.Canceled:
-                TaskManager.update_task_status(
-                    task_id,
-                    TaskState.Failed,
-                    [TextDataItem(text="隆耘任务执行失败，请稍后重试或联系服务管理员。")],
-                )
-                stamp_sender(current)
-        finally:
-            jobs.pop(task_id, None)
-
-    def schedule(task_id: str, prompt: str, caller_aic: str) -> None:
-        previous = jobs.get(task_id)
-        if previous and not previous.done():
-            previous.cancel()
-        jobs[task_id] = asyncio.create_task(run_task(task_id, prompt, caller_aic))
-
-    async def on_start(command: TaskCommand, task: TaskResult | None) -> TaskResult:
-        if not command.taskId:
-            command.taskId = f"task-{uuid.uuid4()}"
-        if task:
-            TaskManager.add_command_to_history(task.taskId, command)
-            return stamp_sender(task)
-        prompt = _command_text(command)
-        task = TaskManager.create_task(command, TaskState.Accepted)
-        stamp_sender(task)
-        if not prompt:
-            return stamp_sender(TaskManager.update_task_status(
-                task.taskId,
-                TaskState.AwaitingInput,
-                [TextDataItem(text="请提供需要隆耘分析的水稻育种或已发布标准数据问题。")],
-            ))
-        schedule(task.taskId, prompt, command.senderId)
-        return task
-
-    async def on_get(command: TaskCommand, task: TaskResult) -> TaskResult:
-        return stamp_sender(await DefaultHandlers.get(command, task))
-
-    async def on_continue(command: TaskCommand, task: TaskResult) -> TaskResult:
-        prompt = _command_text(command)
-        if task.status.state not in {TaskState.AwaitingInput, TaskState.AwaitingCompletion} or not prompt:
-            return stamp_sender(await DefaultHandlers.continue_(command, task))
-        TaskManager.add_command_to_history(task.taskId, command)
-        TaskManager.set_products(task.taskId, [])
-        updated = TaskManager.update_task_status(task.taskId, TaskState.Accepted)
-        schedule(task.taskId, prompt, command.senderId)
-        return stamp_sender(updated)
-
-    async def on_complete(command: TaskCommand, task: TaskResult) -> TaskResult:
-        return stamp_sender(await DefaultHandlers.complete(command, task))
-
-    async def on_cancel(command: TaskCommand, task: TaskResult) -> TaskResult:
-        job = jobs.get(task.taskId)
-        if job and not job.done():
-            job.cancel()
-        return stamp_sender(await DefaultHandlers.cancel(command, task))
-
-    return CommandHandlers(
-        on_start=on_start,
-        on_get=on_get,
-        on_continue=on_continue,
-        on_complete=on_complete,
-        on_cancel=on_cancel,
-    )
-
-
-def _rpc_endpoint(acs: dict[str, Any]) -> str | None:
-    for endpoint in acs.get("endPoints") or []:
-        if str(endpoint.get("transport", "")).upper() == "JSONRPC" and endpoint.get("url"):
-            return str(endpoint["url"])
-    return None
-
-
-async def discover_partner(
-    query: str,
-    settings: AcpsSettings,
-    requested_aic: str | None = None,
-) -> dict[str, Any]:
-    """Use ADP explicit discovery and return the best callable JSON-RPC Partner."""
-    if not settings.discovery_base_url:
-        raise RuntimeError("尚未配置 ACPS_DISCOVERY_BASE_URL，且请求中没有指定 partner_url。")
-    discovery_url = _base_url(settings.discovery_base_url)
-    if not discovery_url.endswith("/discover"):
-        discovery_url = f"{discovery_url}/discover"
-    request = DiscoveryRequest(type="explicit", query=query, limit=10)
-    verify: bool | ssl.SSLContext = settings.outbound_ssl_context() or True
-    async with httpx.AsyncClient(verify=verify, timeout=30.0) as client:
-        response = await client.post(
-            discovery_url,
-            json=request.model_dump(by_alias=True, exclude_none=True),
-        )
-        response.raise_for_status()
-    discovery = DiscoveryResponse.from_dict(response.json())
-    if discovery.error:
-        raise RuntimeError(
-            f"ACPs Discovery 返回错误 {discovery.error.code}: {discovery.error.message}"
-        )
-    if not discovery.result:
-        raise RuntimeError("ACPs Discovery 未返回结果。")
-
-    candidates = sorted(
-        discovery.result.iter_agent_skills(),
-        key=lambda item: item[2].ranking,
-    )
-    seen: set[str] = set()
-    for aic, acs, skill, group in candidates:
-        if aic in seen or (requested_aic and aic != requested_aic):
-            continue
-        seen.add(aic)
-        rpc_url = _rpc_endpoint(acs)
-        if rpc_url:
-            return {
-                "aic": aic,
-                "name": acs.get("name") or aic,
-                "rpcUrl": rpc_url,
-                "skillId": skill.skill_id,
-                "ranking": skill.ranking,
-                "group": group,
-            }
-    raise RuntimeError("ACPs Discovery 没有找到带 JSONRPC 端点且符合条件的 Partner。")
-
-
-def _task_snapshot(task: TaskResult) -> dict[str, Any]:
-    return task.model_dump(by_alias=True, exclude_none=True, mode="json")
-
-
-async def dispatch_partner_task(
-    request: AcpsLeaderDispatchRequest,
-    settings: AcpsSettings,
-) -> dict[str, Any]:
-    """Run the Leader side of a Direct AIP task to completion or a wait state."""
-    if not settings.supports_leader:
-        raise RuntimeError("当前 ACPS_ROLE 未启用 Leader 能力。")
-    selected = {
-        "aic": request.partner_aic or "explicit-partner",
-        "name": request.partner_aic or "显式 Partner",
-        "rpcUrl": request.partner_url,
-        "skillId": None,
-        "ranking": None,
-        "group": None,
-    }
-    if not request.partner_url:
-        selected = await discover_partner(request.query, settings, request.partner_aic)
-    partner_url = str(selected["rpcUrl"] or "")
-    if not partner_url:
-        raise RuntimeError("Partner 没有可调用的 JSONRPC 端点。")
-    if partner_url.lower().startswith("http://") and settings.mtls_enabled:
-        raise RuntimeError("启用 ACPs mTLS 时不允许调用明文 HTTP Partner。")
-
-    client = AipRpcClient(
-        partner_url=partner_url,
-        leader_id=settings.aic or "longyun-unregistered-leader",
-        ssl_context=settings.outbound_ssl_context() if partner_url.lower().startswith("https://") else None,
-    )
-    session_id = request.session_id or f"session-{uuid.uuid4()}"
-    try:
-        task = await client.start_task(session_id, request.query, request.task_id)
-        deadline = asyncio.get_running_loop().time() + settings.task_timeout_seconds
-        while task.status.state in {TaskState.Accepted, TaskState.Working}:
-            if asyncio.get_running_loop().time() >= deadline:
-                await client.cancel_task(task.taskId, session_id)
-                raise TimeoutError(f"Partner 任务超过 {settings.task_timeout_seconds:g} 秒，已请求取消。")
-            await asyncio.sleep(settings.poll_interval_seconds)
-            task = await client.get_task(task.taskId, session_id)
-        if task.status.state == TaskState.AwaitingCompletion and request.auto_complete:
-            task = await client.complete_task(task.taskId, session_id)
-        return {
-            "selectedPartner": selected,
-            "sessionId": session_id,
-            "task": _task_snapshot(task),
-        }
-    finally:
-        await client.close()
 
 
 def mount_acps_routes(
     app: FastAPI,
     settings: AcpsSettings,
     executor: PartnerExecutor,
-) -> None:
-    """Mount public ACS/AIP routes. The caller mounts the authenticated Leader route."""
-    handlers = build_partner_handlers(settings, executor)
+) -> AcpsGroupRuntime:
+    """Mount read-only metadata routes and start the Inbox/Group runtime."""
+    group_runtime = AcpsGroupRuntime(settings, executor)
+
+    @app.on_event("startup")
+    async def start_acps_group_runtime() -> None:
+        await group_runtime.startup()
+
+    @app.on_event("shutdown")
+    async def stop_acps_group_runtime() -> None:
+        await group_runtime.close()
 
     @app.get("/.well-known/acps-agent.json", include_in_schema=False)
-    async def acps_agent_card() -> dict[str, Any]:
+    async def acps_agent_card(
+        role: AcpsIdentityRole = Query(default="partner"),
+    ) -> dict[str, Any]:
         if not settings.enabled:
             raise HTTPException(404, "ACPs adapter is disabled")
-        return build_acs_document(settings)
+        if role not in settings.runtime_roles:
+            raise HTTPException(404, f"当前运行模式未启用 ACPs {role} 身份。")
+        return build_acs_document(settings, role)
 
     @app.get("/acps/health", tags=["ACPs"])
     async def acps_health() -> dict[str, Any]:
@@ -596,11 +473,15 @@ def mount_acps_routes(
             "enabled": settings.enabled,
             "role": settings.role,
             "runtimeRoles": settings.runtime_roles,
-            "aic": settings.aic or None,
+            "identities": {
+                "leader": settings.leader_aic or None,
+                "partner": settings.partner_aic or None,
+            },
             "registered": settings.registered,
             "protocolVersion": "02.01",
-            "aipTransport": "direct-jsonrpc",
+            "aipTransport": settings.aip_transport,
             "mtls": settings.mtls_enabled,
+            "group": group_runtime.status(),
         }
 
     @app.get("/acps/info", tags=["ACPs"])
@@ -609,10 +490,19 @@ def mount_acps_routes(
             "name": settings.name,
             "protocolVersion": "02.01",
             "runtimeRoles": settings.runtime_roles,
+            "identities": {
+                "leader": settings.leader_aic or None,
+                "partner": settings.partner_aic or None,
+            },
             "interfaces": {
-                "acs": "/.well-known/acps-agent.json",
-                "partnerRpc": "/acps/rpc" if settings.supports_partner else None,
-                "leaderDispatch": "/api/acps/leader/dispatch" if settings.supports_leader else None,
+                "leaderAcs": "/.well-known/acps-agent.json?role=leader",
+                "partnerAcs": "/.well-known/acps-agent.json?role=partner",
+                "partnerInvitation": "AMQP Inbox",
+                "groupLeaderDispatch": (
+                    "/api/acps/leader/group/dispatch"
+                    if settings.supports_leader
+                    else None
+                ),
             },
             "aipCommands": ["start", "get", "continue", "complete", "cancel"],
             "dataBoundary": "published-standard-data-only",
@@ -623,30 +513,4 @@ def mount_acps_routes(
             ],
         }
 
-    @app.post("/acps/rpc", tags=["ACPs"])
-    async def acps_rpc(request: Request):
-        if not settings.supports_partner:
-            raise HTTPException(404, "当前运行模式未启用 ACPs Partner。")
-        caller_aic = request.headers.get(settings.verified_client_header, "").strip()
-        if settings.require_verified_client and not caller_aic:
-            raise HTTPException(401, "ACPs Partner 要求由 mTLS 网关验证调用方证书。")
-        try:
-            body = await request.json()
-            command_body = body["params"]["command"]
-            claimed_sender = str(command_body["senderId"]).strip()
-            task_id = str(command_body.get("taskId") or "").strip()
-        except (KeyError, TypeError, ValueError, AttributeError):
-            claimed_sender = ""
-            task_id = ""
-        if settings.require_verified_client and claimed_sender and claimed_sender != caller_aic:
-            raise HTTPException(403, "TaskCommand.senderId 与 mTLS 客户端证书 AIC 不一致。")
-        # A valid Leader certificate may only inspect or mutate tasks that it
-        # originally created. Check before the SDK handler, because its generic
-        # exception path marks a task failed and would let another Leader cause
-        # a denial of service merely by guessing a task ID.
-        existing_task = TaskManager.get_task(task_id) if task_id else None
-        initial_command = (existing_task.commandHistory or [None])[0] if existing_task else None
-        owner_aic = initial_command.senderId if initial_command else ""
-        if owner_aic and claimed_sender and owner_aic != claimed_sender:
-            raise HTTPException(403, "当前 Leader 无权访问其他 Leader 创建的 ACPs 任务。")
-        return await handle_rpc_request(request, handlers)
+    return group_runtime
