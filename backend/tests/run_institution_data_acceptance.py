@@ -44,9 +44,9 @@ def staged(path: Path) -> StagedUpload:
 def generated_fixtures(root: Path, demo_root: Path, chinese_xlsx: Path) -> list[tuple[str, Path]]:
     fixtures: list[tuple[str, Path]] = [
         ("germplasm", demo_root / "germplasm.csv"),
+        ("environment", demo_root / "environment.json"),
         ("pedigree", demo_root / "pedigree.csv"),
         ("phenotype", demo_root / "phenotype.csv"),
-        ("environment", demo_root / "environment.json"),
         ("genotype", demo_root / "genotype.vcf"),
         ("literature", demo_root / "literature.txt"),
         ("germplasm", chinese_xlsx),
@@ -164,6 +164,7 @@ def main() -> None:
     assert counts["entities"] > 0 and counts["relations"] > 0
     assert counts["issues"] > 0
     assert trace["entities"] and trace["relations"]
+    assert all(item["status"] == "linked" for item in trace["relations"]), trace["relations"]
     assert any(item["file"] == args.chinese_xlsx.name and item["entity_count"] == 10 for item in results)
     assert any(item["issue_count"] > 0 for item in results)
 

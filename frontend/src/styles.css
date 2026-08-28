@@ -403,6 +403,7 @@ body:has(.research-shell), body:has(.assistant-loading), body:has(.auth-error) {
 .institution-trace-result span { display: flex; flex-wrap: wrap; gap: 4px; }
 .institution-trace-result em { color: #7a9188; }
 .institution-trace-result .trace-issue { color: #9a5b31; }
+.institution-trace-result .trace-issue.resolved { color: #678177; text-decoration: line-through; }
 .institution-import-history td small { display: block; color: #8a9d95; font-family: Consolas, monospace; }
 .institution-import-history .issue-count { color: #a35f30; font-weight: 700; }
 @media (max-width: 860px) { .institution-plane-grid, .institution-trace-result { grid-template-columns: repeat(2, minmax(0, 1fr)); }.institution-upload-form { grid-template-columns: 1fr; }.institution-mapping-field, .institution-contract-note { grid-column: auto; } }

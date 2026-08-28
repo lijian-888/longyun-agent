@@ -623,6 +623,46 @@ def _upsert_entity(
         "batch_id": batch_id,
         "payload": json.dumps(payload, ensure_ascii=False, default=str),
     })
+    # Imports do not have to arrive in dependency order. When a referenced
+    # germplasm/environment is imported later, repair inbound unresolved
+    # relations and resolve the source issue once no unresolved target remains.
+    repaired_sources = connection.execute(text("""
+        UPDATE data_relation
+        SET status='linked', message=NULL
+        WHERE institution_id=:institution_id AND project_id=:project_id
+          AND target_entity_type=:entity_type AND target_entity_key=:entity_key
+          AND status='unresolved'
+        RETURNING source_entity_type, source_entity_key
+    """), {
+        "institution_id": institution_id,
+        "project_id": project_id,
+        "entity_type": entity_type,
+        "entity_key": entity_key,
+    }).all()
+    for source_type, source_key in set(repaired_sources):
+        connection.execute(text("""
+            UPDATE data_issue AS issue
+            SET resolved=TRUE
+            WHERE issue.institution_id=:institution_id
+              AND issue.project_id=:project_id
+              AND issue.issue_type='association_anomaly'
+              AND issue.entity_type=:source_type
+              AND issue.entity_key=:source_key
+              AND issue.resolved=FALSE
+              AND NOT EXISTS (
+                SELECT 1 FROM data_relation AS relation
+                WHERE relation.institution_id=issue.institution_id
+                  AND relation.project_id=issue.project_id
+                  AND relation.source_entity_type=:source_type
+                  AND relation.source_entity_key=:source_key
+                  AND relation.status='unresolved'
+              )
+        """), {
+            "institution_id": institution_id,
+            "project_id": project_id,
+            "source_type": source_type,
+            "source_key": source_key,
+        })
 
 
 def _add_issue(
