@@ -24,6 +24,7 @@ export default function InstitutionDataWorkspace({ onNotice }) {
   const [datasetType, setDatasetType] = useState("germplasm");
   const [mapping, setMapping] = useState("");
   const [busy, setBusy] = useState(false);
+  const [importFeedback, setImportFeedback] = useState(null);
   const [traceKey, setTraceKey] = useState("");
   const [trace, setTrace] = useState(null);
   const fileRef = useRef(null);
@@ -68,14 +69,17 @@ export default function InstitutionDataWorkspace({ onNotice }) {
     form.append("file", file);
     if (mapping.trim()) form.append("field_mapping", mapping.trim());
     setBusy(true);
+    setImportFeedback(null);
     try {
       const result = await request("/api/institution-data/imports", { method: "POST", body: form });
+      setImportFeedback({ kind: result.issue_count ? "warning" : "success", result });
       onNotice(result.issue_count
         ? `已导入 ${result.entity_count} 个实体，发现 ${result.issue_count} 个需要处理的问题。`
         : `已导入 ${result.entity_count} 个实体，原始文件和结构化数据均已安全落库。`);
       fileRef.current.value = "";
       await load();
     } catch (error) {
+      setImportFeedback({ kind: "error", message: error.message });
       onNotice(error.message);
     } finally {
       setBusy(false);
@@ -102,11 +106,16 @@ export default function InstitutionDataWorkspace({ onNotice }) {
     <section className="panel institution-upload-panel">
       <div className="panel-title-row"><div><h3><HardDriveUpload size={19} />上传并导入</h3><p>可使用标准列名，或填写“原始列名 → 标准字段” JSON 映射。</p></div></div>
       <form className="institution-upload-form" onSubmit={upload}>
-        <label>数据类型<select value={datasetType} onChange={(event) => { setDatasetType(event.target.value); if (fileRef.current) fileRef.current.value = ""; }}>{contracts?.datasets?.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
+        <label>数据类型<select value={datasetType} onChange={(event) => { setDatasetType(event.target.value); setImportFeedback(null); if (fileRef.current) fileRef.current.value = ""; }}>{contracts?.datasets?.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
         <label>文件<input ref={fileRef} type="file" accept={MIME_ACCEPT[datasetType]} /></label>
         <label className="institution-mapping-field">可选字段映射<textarea value={mapping} onChange={(event) => setMapping(event.target.value)} placeholder={'{"原材料号":"germplasm_id","名称":"name"}'} /></label>
         <div className="institution-contract-note"><strong>允许格式：{selectedContract?.formats?.join("、") || "-"}</strong><span>常规文件 ≤200MB；VCF.GZ/PLINK ZIP ≤2GB</span>{selectedContract?.standard_fields?.length > 0 && <small>标准字段：{selectedContract.standard_fields.join("、")}</small>}</div>
         <button className="primary-button" type="submit" disabled={busy}><Upload size={16} />{busy ? "正在上传与导入…" : "开始导入"}</button>
+        {importFeedback && <div className={`institution-import-feedback ${importFeedback.kind}`}>
+          {importFeedback.kind === "error"
+            ? <><strong>导入未完成</strong><span>{importFeedback.message}</span></>
+            : <><strong>{importFeedback.kind === "success" ? "导入完成" : "导入完成，但需要处理数据问题"}</strong><span>结构化实体：{importFeedback.result.entity_count}；问题：{importFeedback.result.issue_count}；数据库：{importFeedback.result.structured_database}</span>{importFeedback.result.issues?.slice(0, 20).map((issue) => <span key={issue.id} className="feedback-issue"><AlertTriangle size={14} />{issue.message} 受影响：{issue.affected_features?.join("、")}</span>)}</>}
+        </div>}
       </form>
     </section>
 

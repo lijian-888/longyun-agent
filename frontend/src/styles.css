@@ -391,6 +391,10 @@ body:has(.research-shell), body:has(.assistant-loading), body:has(.auth-error) {
 .institution-contract-note { grid-column: 1 / -1; display: grid; gap: 4px; border: 1px solid #dae8e1; border-radius: 4px; padding: 10px; color: #547669; background: #f8fbf9; font-size: 11px; }
 .institution-contract-note small { color: #7a9188; }
 .institution-upload-form .primary-button { justify-self: start; }
+.institution-import-feedback { grid-column: 1 / -1; display: grid; gap: 6px; border: 1px solid #cfe3d9; border-radius: 4px; padding: 10px 12px; color: #3f6d5c; background: #f3faf7; font-size: 12px; }
+.institution-import-feedback.warning { border-color: #ead4ad; color: #855d25; background: #fffaf0; }
+.institution-import-feedback.error { border-color: #e5b7b2; color: #963f36; background: #fff5f4; }
+.institution-import-feedback .feedback-issue { display: flex; align-items: flex-start; gap: 6px; }
 .institution-trace-form { display: flex; gap: 8px; margin-top: 12px; }
 .institution-trace-form input { flex: 1; }
 .institution-trace-result { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; margin-top: 12px; }

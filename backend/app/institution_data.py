@@ -56,7 +56,7 @@ SUPPORTED_SUFFIXES = {
 
 FIELD_ALIASES: dict[str, dict[str, tuple[str, ...]]] = {
     "germplasm": {
-        "germplasm_id": ("germplasm_id", "material_id", "accession_id", "种质编号", "材料编号", "资源编号"),
+        "germplasm_id": ("germplasm_id", "material_id", "material_code", "accession_id", "种质编号", "材料编号", "材料编码", "资源编号"),
         "name": ("name", "material_name", "germplasm_name", "种质名称", "材料名称", "品种名称"),
         "species": ("species", "crop", "物种", "作物"),
         "origin": ("origin", "source", "原产地", "来源"),
@@ -68,10 +68,10 @@ FIELD_ALIASES: dict[str, dict[str, tuple[str, ...]]] = {
         "generation": ("generation", "世代"),
     },
     "phenotype": {
-        "observation_id": ("observation_id", "record_id", "观测编号", "记录编号"),
-        "germplasm_id": ("germplasm_id", "material_id", "accession_id", "种质编号", "材料编号"),
+        "observation_id": ("observation_id", "record_id", "iid", "观测编号", "记录编号"),
+        "germplasm_id": ("germplasm_id", "material_id", "material_code", "accession_id", "种质编号", "材料编号", "材料编码"),
         "trial_id": ("trial_id", "experiment_id", "试验编号"),
-        "environment_id": ("environment_id", "site_year_id", "环境编号", "点位年份编号"),
+        "environment_id": ("environment_id", "site_year_id", "analysis_environment", "环境编号", "分析环境", "点位年份编号"),
         "trait_code": ("trait_code", "trait", "性状编号", "性状"),
         "value": ("value", "trait_value", "观测值", "性状值"),
         "unit": ("unit", "单位"),
@@ -150,9 +150,19 @@ def safe_identifier(value: str, prefix: str, max_length: int = 63) -> str:
 
 
 def safe_object_name(value: str) -> str:
-    name = Path(value or "upload").name
-    cleaned = re.sub(r"[^A-Za-z0-9._()\-]+", "_", name).strip("._")
-    return cleaned[:240] or "upload"
+    # Browser filenames may contain Chinese characters. Sanitising the entire
+    # name with an ASCII-only expression used to turn `连续性状.xlsx` into
+    # `xlsx`, silently losing the dot and causing a false "no extension" 422.
+    # Split and preserve the complete extension before cleaning the stem.
+    name = re.split(r"[\\/]", str(value or "upload"))[-1]
+    suffix = complete_suffix(name)
+    stem = name[:-len(suffix)] if suffix else name
+    cleaned_stem = re.sub(r"[^\w()（）\-]+", "_", stem, flags=re.UNICODE).strip("._-")
+    if not cleaned_stem:
+        cleaned_stem = f"upload-{hashlib.sha256(name.encode('utf-8')).hexdigest()[:12]}"
+    safe_suffix = re.sub(r"[^A-Za-z0-9.]+", "", suffix.lower())
+    available = max(1, 240 - len(safe_suffix))
+    return f"{cleaned_stem[:available].rstrip('._-')}{safe_suffix}"
 
 
 def complete_suffix(file_name: str) -> str:
@@ -224,7 +234,7 @@ def _decode_text(raw: bytes) -> str:
     raise InstitutionDataError("文本编码无法识别，请使用 UTF-8 或 GB18030。")
 
 
-def parse_tabular_file(path: Path, suffix: str) -> list[dict[str, Any]]:
+def parse_tabular_file(path: Path, suffix: str, dataset_type: str | None = None) -> list[dict[str, Any]]:
     if suffix == ".csv":
         content = _decode_text(path.read_bytes())
         try:
@@ -235,17 +245,36 @@ def parse_tabular_file(path: Path, suffix: str) -> list[dict[str, Any]]:
     if suffix == ".xlsx":
         try:
             workbook = load_workbook(path, read_only=True, data_only=True)
-            sheet = workbook.active
-            rows = sheet.iter_rows(values_only=True)
-            headers = [str(value or "").strip() for value in next(rows)]
+            aliases = {
+                _normalized_header(alias)
+                for values in FIELD_ALIASES.get(dataset_type or "", {}).values()
+                for alias in values
+            }
+            candidates: list[tuple[tuple[int, int, int, int], Any, int, list[str]]] = []
+            for sheet_index, sheet in enumerate(workbook.worksheets):
+                for row_index, row in enumerate(sheet.iter_rows(min_row=1, max_row=30, values_only=True)):
+                    headers = [str(value or "").strip() for value in row]
+                    non_empty = [header for header in headers if header]
+                    if len(non_empty) < 2:
+                        continue
+                    recognized = sum(_normalized_header(header) in aliases for header in non_empty)
+                    candidates.append(((recognized, len(non_empty), -sheet_index, -row_index), sheet, row_index, headers))
+            if not candidates:
+                raise InstitutionDataError("XLSX 中没有找到至少包含两列的表头。")
+            _, sheet, header_index, headers = max(candidates, key=lambda item: item[0])
+            rows = sheet.iter_rows(min_row=header_index + 2, values_only=True)
             result = [
                 {headers[index]: value for index, value in enumerate(row) if index < len(headers) and headers[index]}
                 for row in rows
                 if any(value not in (None, "") for value in row)
             ]
             workbook.close()
+            if not result:
+                raise InstitutionDataError("XLSX 表头下没有可导入的数据行。")
             return result
-        except (StopIteration, OSError, ValueError) as exc:
+        except InstitutionDataError:
+            raise
+        except (StopIteration, OSError, ValueError, zipfile.BadZipFile) as exc:
             raise InstitutionDataError("无法读取 XLSX，请按标准模板重新保存。") from exc
     if suffix == ".json":
         try:
@@ -279,6 +308,12 @@ def normalize_records(
         for alias in values
     }
     canonical_fields = set(FIELD_ALIASES[dataset_type])
+    invalid_targets = sorted(set(explicit.values()) - canonical_fields)
+    if invalid_targets:
+        raise InstitutionDataError(
+            f"字段映射包含当前数据类型不支持的标准字段：{'、'.join(invalid_targets)}；"
+            f"允许：{'、'.join(sorted(canonical_fields))}。"
+        )
     output: list[dict[str, Any]] = []
     for row_number, row in enumerate(rows, start=2):
         normalized: dict[str, Any] = {"_row_number": row_number, "_source": dict(row)}
@@ -288,6 +323,12 @@ def normalize_records(
             if target in canonical_fields:
                 normalized[target] = value.strip() if isinstance(value, str) else value
         output.append(normalized)
+    if not output:
+        raise InstitutionDataError("文件中没有可导入的数据行。")
+    if not any(any(field in row for field in canonical_fields) for row in output):
+        raise InstitutionDataError(
+            f"未识别到{DATASET_LABELS[dataset_type]}标准字段；请确认数据类型，或填写“原始列名 -> 标准字段”映射。"
+        )
     return output
 
 
@@ -701,7 +742,11 @@ def import_into_institution_database(
         })
 
         if dataset_type in TABULAR_DATASETS:
-            rows = normalize_records(dataset_type, parse_tabular_file(upload.path, upload.suffix), field_mapping)
+            rows = normalize_records(
+                dataset_type,
+                parse_tabular_file(upload.path, upload.suffix, dataset_type),
+                field_mapping,
+            )
             for row in rows:
                 missing = [field for field in REQUIRED_FIELDS[dataset_type] if row.get(field) in (None, "")]
                 provisional_key = str(row.get(next(iter(REQUIRED_FIELDS[dataset_type]), ""), f"row-{row['_row_number']}"))

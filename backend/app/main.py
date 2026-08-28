@@ -2939,20 +2939,21 @@ async def import_institution_data(
 ) -> dict[str, Any]:
     account, config = institution_data_config_for_user(session, user)
     project_id = active_project_id(session)
-    mapping = parse_field_mapping(field_mapping)
+    mapping: dict[str, str] = {}
     resolved_template_version_id: str | None = None
-    if template_version_id:
-        version = session.get(TemplateVersion, template_version_id)
-        template = session.get(DataTemplate, version.template_id) if version else None
-        if not version or not template or version.status != "published":
-            raise HTTPException(422, "所选标准模板版本不存在或尚未发布。")
-        allowed_datasets = INSTITUTION_TEMPLATE_DATASETS.get(template.template_code, set())
-        if dataset_type not in allowed_datasets:
-            raise HTTPException(422, f"模板“{template.template_name}”不适用于 {DATASET_LABELS.get(dataset_type, dataset_type)}。")
-        resolved_template_version_id = version.id
     staged = None
     raw_stored = False
     try:
+        mapping = parse_field_mapping(field_mapping)
+        if template_version_id:
+            version = session.get(TemplateVersion, template_version_id)
+            template = session.get(DataTemplate, version.template_id) if version else None
+            if not version or not template or version.status != "published":
+                raise HTTPException(422, "所选标准模板版本不存在或尚未发布。")
+            allowed_datasets = INSTITUTION_TEMPLATE_DATASETS.get(template.template_code, set())
+            if dataset_type not in allowed_datasets:
+                raise HTTPException(422, f"模板“{template.template_name}”不适用于 {DATASET_LABELS.get(dataset_type, dataset_type)}。")
+            resolved_template_version_id = version.id
         staged = await stage_upload(file, dataset_type, INSTITUTION_DATA_SETTINGS.staging_dir)
         batch_id = str(uuid.uuid4())
         object_key = object_key_for(account.institution_id, project_id, dataset_type, batch_id, staged.file_name)
@@ -3005,7 +3006,16 @@ async def import_institution_data(
             **result,
         }
     except InstitutionDataError as exc:
-        raise HTTPException(422, str(exc)) from exc
+        logger.warning(
+            "Institution data import rejected institution=%s project=%s dataset=%s file=%s reason=%s",
+            account.institution_id,
+            project_id,
+            dataset_type,
+            getattr(file, "filename", "upload"),
+            str(exc),
+        )
+        suffix = "；原始文件已保存到机构 Bucket，可修正数据或映射后重新导入" if raw_stored else ""
+        raise HTTPException(422, f"{exc}{suffix}") from exc
     except HTTPException:
         raise
     except Exception as exc:

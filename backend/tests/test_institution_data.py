@@ -20,6 +20,8 @@ from app.institution_data import (
     parse_field_mapping,
     parse_tabular_file,
     safe_identifier,
+    safe_object_name,
+    stage_upload,
     upload_limit,
     validate_file_contract,
 )
@@ -57,6 +59,38 @@ class InstitutionFileContractTests(unittest.TestCase):
     def test_complete_vcfgz_suffix(self):
         self.assertEqual(complete_suffix("DATA.VCF.GZ"), ".vcf.gz")
 
+    def test_chinese_file_name_keeps_complete_extension(self):
+        safe_name = safe_object_name("连续性状表型测试数据.xlsx")
+        self.assertEqual(safe_name, "连续性状表型测试数据.xlsx")
+        self.assertEqual(complete_suffix(safe_name), ".xlsx")
+        self.assertTrue(validate_file_contract("germplasm", safe_name, 1024))
+        self.assertEqual(complete_suffix(safe_object_name("南繁基因型.vcf.gz")), ".vcf.gz")
+
+    def test_path_components_are_removed_without_losing_extension(self):
+        self.assertEqual(safe_object_name("../../目录/材料数据.xlsx"), "材料数据.xlsx")
+
+
+class InstitutionUploadStagingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_chinese_xlsx_upload_is_staged_with_extension(self):
+        class Upload:
+            filename = "连续性状表型测试数据.xlsx"
+
+            def __init__(self, payload):
+                self.payload = payload
+
+            async def read(self, _size):
+                payload, self.payload = self.payload, b""
+                return payload
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            upload = await stage_upload(Upload(b"xlsx-test"), "germplasm", Path(temp_dir))
+            try:
+                self.assertEqual(upload.file_name, "连续性状表型测试数据.xlsx")
+                self.assertEqual(upload.suffix, ".xlsx")
+                self.assertEqual(upload.size_bytes, 9)
+            finally:
+                upload.path.unlink(missing_ok=True)
+
 
 class InstitutionTabularParserTests(unittest.TestCase):
     def setUp(self):
@@ -88,6 +122,23 @@ class InstitutionTabularParserTests(unittest.TestCase):
         self.assertEqual(xlsx_rows[0]["environment_id"], "ENV-1")
         self.assertEqual(xlsx_rows[0]["year"], 2026)
 
+        phenotype_template = self.root / "连续性状表型测试数据.xlsx"
+        workbook = Workbook()
+        instructions = workbook.active
+        instructions.title = "填写说明"
+        instructions.append(["项目", "要求"])
+        instructions.append(["样本标识", "不要修改"])
+        data_sheet = workbook.create_sheet("连续性状表型")
+        data_sheet.append(["FID", "IID", "material_code", "material_name", "analysis_environment", "trait_value"])
+        data_sheet.append(["SEQ-1", "SEQ-1", "G-1", "材料一", "ENV-1", 92.4])
+        workbook.save(phenotype_template)
+        template_rows = normalize_records(
+            "germplasm",
+            parse_tabular_file(phenotype_template, ".xlsx", "germplasm"),
+        )
+        self.assertEqual(template_rows[0]["germplasm_id"], "G-1")
+        self.assertEqual(template_rows[0]["name"], "材料一")
+
         json_path = self.root / "phenotype.json"
         json_path.write_text(json.dumps({"records": [{"材料编号": "G-1", "性状": "plant_height", "观测值": 100}]}), encoding="utf-8")
         json_rows = normalize_records("phenotype", parse_tabular_file(json_path, ".json"))
@@ -98,6 +149,10 @@ class InstitutionTabularParserTests(unittest.TestCase):
         self.assertEqual(parse_field_mapping('{"原材料号":"germplasm_id"}'), {"原材料号": "germplasm_id"})
         with self.assertRaisesRegex(InstitutionDataError, "字符串对象"):
             parse_field_mapping('{"原材料号":1}')
+
+    def test_mapping_rejects_unknown_standard_target(self):
+        with self.assertRaisesRegex(InstitutionDataError, "不支持的标准字段"):
+            normalize_records("germplasm", [{"原材料号": "G-1"}], {"原材料号": "unknown_field"})
 
 
 class InstitutionGenotypeAndLiteratureTests(unittest.TestCase):
