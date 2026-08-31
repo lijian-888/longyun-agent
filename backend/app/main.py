@@ -5716,6 +5716,36 @@ def knowledge_crop_terms(question: str) -> list[str]:
     return [term for term in KNOWLEDGE_CROP_TERMS if term in lowered]
 
 
+KNOWLEDGE_LEXICAL_TOPICS = frozenset({
+    "品种", "种质", "材料", "基因", "qtl", "gwas", "性状", "表型", "产量", "株高",
+    "育种", "亲本", "选育", "试验", "区试", "田间", "病害", "抗病", "品质", "环境",
+})
+
+
+def knowledge_lexical_matches(question: str, document_text: str) -> list[str]:
+    """Return strong exact identifiers or multiple controlled topic matches.
+
+    Vector similarity can be conservative for very short governed records.  A
+    material/gene identifier that occurs verbatim in both the question and the
+    indexed evidence is stronger than a generic semantic near-match.  Topic
+    fallback requires at least two controlled terms to avoid accepting a
+    document merely because both sides contain a broad word such as “材料”.
+    """
+    identifier_pattern = r"(?i)\b[a-z][a-z0-9]*(?:[-_.][a-z0-9]+)+\b"
+    question_identifiers = {item.lower() for item in re.findall(identifier_pattern, question)}
+    document_identifiers = {item.lower() for item in re.findall(identifier_pattern, document_text)}
+    identifier_matches = question_identifiers & document_identifiers
+    if identifier_matches:
+        return sorted(identifier_matches)
+    lowered_question = question.lower()
+    lowered_document = document_text.lower()
+    topic_matches = {
+        term for term in KNOWLEDGE_LEXICAL_TOPICS
+        if term in lowered_question and term in lowered_document
+    }
+    return sorted(topic_matches) if len(topic_matches) >= 2 else []
+
+
 def explicitly_requested_knowledge_documents(
     question: str,
     documents: list[KnowledgeDocument],
@@ -5800,13 +5830,20 @@ def build_knowledge_evidence_context(
     selected_by_document: dict[str, list[tuple[KnowledgeChunk, KnowledgeDocument, KnowledgeFolder | None, float]]] = {}
     for chunk, document, folder, chunk_distance in rows:
         numeric_distance = float(chunk_distance)
-        document_text = f"{document.display_title}\n{chunk.content}".lower()
+        document_text = (
+            f"{document.display_title}\n{' '.join(document.topic_tags or [])}\n{chunk.content}"
+        ).lower()
         is_explicit_document = document.id in explicit_document_ids
+        lexical_matches = knowledge_lexical_matches(retrieval_question, document_text)
         # A named document is an explicit retrieval scope.  Once the user has
         # named it, always retain its best matching segment after crop checks;
         # an embedding-distance threshold must not erase the requested source.
         # Unspecified documents still require a strict semantic threshold.
-        if not is_explicit_document and numeric_distance > MAX_KNOWLEDGE_COSINE_DISTANCE:
+        if (
+            not is_explicit_document
+            and numeric_distance > MAX_KNOWLEDGE_COSINE_DISTANCE
+            and not lexical_matches
+        ):
             continue
         if requested_crops and not all(term in document_text for term in requested_crops):
             continue
@@ -5829,10 +5866,21 @@ def build_knowledge_evidence_context(
     blocks: list[str] = []
     cards: list[dict[str, Any]] = []
     for document_rows in selected_by_document.values():
-        chunk, document, folder, _distance = document_rows[0]
+        chunk, document, folder, best_distance = document_rows[0]
         scope_label = "我的知识库" if document.scope == "private" else "公共知识库"
         locators = "、".join(item.source_locator for item, _, _, _ in document_rows)
         excerpts = [re.sub(r"\s+", " ", item.content).strip()[:200] for item, _, _, _ in document_rows]
+        matched_terms = knowledge_lexical_matches(
+            retrieval_question,
+            f"{document.display_title}\n{' '.join(document.topic_tags or [])}\n{chunk.content}",
+        )
+        retrieval_method = (
+            "explicit_document"
+            if document.id in explicit_document_ids
+            else "semantic_vector"
+            if best_distance <= MAX_KNOWLEDGE_COSINE_DISTANCE
+            else "hybrid_exact_or_topic"
+        )
         selected_chunks = "\n\n".join(
             f"片段位置：{item.source_locator}\n{item.content}"
             for item, _, _, _ in document_rows
@@ -5851,6 +5899,8 @@ def build_knowledge_evidence_context(
             "detail": f"{folder.folder_name if folder else '未分类'} · {document.source_organization or document.author or '来源待补充'} · {document.license_scope or '私人资料'} · {locators}",
             "excerpt": "\n".join(excerpts),
             "topic_tags": document.topic_tags or [],
+            "retrieval_method": retrieval_method,
+            "matched_terms": matched_terms,
         })
     return "\n\n".join(blocks), cards
 
