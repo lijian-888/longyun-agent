@@ -14,6 +14,7 @@ import json
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
+from app.auth import CurrentUser
 from app.breeding_intelligence import (
     DEFAULT_RECOMMENDATION_WEIGHTS,
     build_intelligence_pdf,
@@ -22,6 +23,12 @@ from app.breeding_intelligence import (
     run_parent_recommendation,
 )
 from app.institution_data import InstitutionDataSettings, InstitutionDatabaseManager
+from app.main import (
+    SessionLocal,
+    _set_active_project,
+    _set_knowledge_context,
+    build_knowledge_evidence_context,
+)
 from app.trial_statistics import run_controlled_trial_analysis
 
 
@@ -91,13 +98,32 @@ def main() -> None:
         assert knowledge["document_count"] >= 1 and knowledge["chunk_count"] >= 1, "AC7.1: no published indexed document"
         assert knowledge["unauthorized_count"] == 0, "AC7.5: published document lacks authorization metadata"
 
+    researcher = CurrentUser(
+        id="task4-7-acceptance-researcher",
+        username="wang.researcher",
+        display_name="任务4-7验收科研人员",
+        roles=frozenset({"researcher"}),
+    )
+    with SessionLocal() as retrieval_session:
+        _set_knowledge_context(retrieval_session, researcher)
+        _set_active_project(retrieval_session, args.project_id)
+        knowledge_context, knowledge_cards = build_knowledge_evidence_context(
+            retrieval_session,
+            researcher,
+            "public",
+            "HNNF-G001、HNNF-G002 的种质解析和亲本辅助推荐有哪些可引用证据？",
+        )
+        assert knowledge_cards, "AC7.2/AC7.3: semantic retrieval returned no cited evidence"
+        assert "来源：" in knowledge_context and "授权范围：" in knowledge_context, "AC7.3: evidence lacks source or license"
+        assert all(item.get("excerpt") and item.get("detail") for item in knowledge_cards), "AC7.3/AC7.4: citation cards are incomplete"
+
     print(json.dumps({
         "status": "passed",
         "project_id": args.project_id,
         "task4": {"material": material_result["material_key"], "sources": len(material_result["sources"]), "missing": material_result["missing_categories"]},
         "task5": {"combinations": len(recommendation["recommendations"]), "top_confidence": recommendation["recommendations"][0]["confidence"]},
         "task6": trial_results,
-        "task7": dict(knowledge),
+        "task7": {**dict(knowledge), "retrieval_evidence_count": len(knowledge_cards)},
     }, ensure_ascii=False, indent=2, default=str))
 
 
