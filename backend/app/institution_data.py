@@ -58,6 +58,7 @@ FIELD_ALIASES: dict[str, dict[str, tuple[str, ...]]] = {
     "germplasm": {
         "germplasm_id": ("germplasm_id", "material_id", "material_code", "accession_id", "种质编号", "材料编号", "材料编码", "资源编号"),
         "name": ("name", "material_name", "germplasm_name", "种质名称", "材料名称", "品种名称"),
+        "aliases": ("aliases", "alias", "other_names", "别名", "曾用名"),
         "species": ("species", "crop", "物种", "作物"),
         "origin": ("origin", "source", "原产地", "来源"),
     },

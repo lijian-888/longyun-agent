@@ -3,6 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   ArrowDown,
+  BarChart3,
   Bot,
   ChevronDown,
   Dna,
@@ -15,6 +16,7 @@ import {
   Pencil,
   Plus,
   Search,
+  Scale,
   SendHorizontal,
   ShieldCheck,
   Sparkles,
@@ -30,6 +32,8 @@ import ResultsLibrary from "./ResultsLibrary";
 import GwasWorkspace from "./GwasWorkspace";
 import GenotypeAssetsWorkspace from "./GenotypeAssetsWorkspace";
 import SkillLibrary from "./SkillLibrary";
+import BreedingIntelligenceWorkspace from "./BreedingIntelligenceWorkspace";
+import TrialAnalysisWorkspace from "./TrialAnalysisWorkspace";
 
 const AGENT_NAME = "隆耘 Agent 育种智能体";
 
@@ -801,6 +805,8 @@ export default function ResearchAssistant({ platformContext, onProjectChange }) 
         <section className="research-workspace-group" aria-label="管理">
           <small>管理</small>
           <button type="button" className={workspace === "structured" ? "active" : ""} onClick={() => setWorkspace("structured")}><Search size={16} />结构化查询</button>
+          <button type="button" className={workspace === "intelligence" ? "active" : ""} onClick={() => setWorkspace("intelligence")}><Scale size={16} />种质解析与亲本推荐</button>
+          <button type="button" className={workspace === "trial-analysis" ? "active" : ""} onClick={() => setWorkspace("trial-analysis")}><BarChart3 size={16} />田间试验自动分析</button>
           <button type="button" className={workspace === "genotype" ? "active" : ""} onClick={() => setWorkspace("genotype")}><Dna size={16} />基因型导入与质控</button>
           <button type="button" className={workspace === "skills" ? "active" : ""} onClick={() => setWorkspace("skills")}><Sparkles size={16} />技能库</button>
           <button type="button" className={workspace === "knowledge" ? "active" : ""} onClick={() => setWorkspace("knowledge")}><FileText size={16} />知识库</button>
@@ -819,8 +825,8 @@ export default function ResearchAssistant({ platformContext, onProjectChange }) 
       </div>
     </aside>
 
-    <main className={`research-main ${workspace === "knowledge" ? "knowledge-main" : workspace === "structured" ? "structured-main" : workspace === "gwas" ? "gwas-main" : workspace === "genotype" ? "genotype-main" : workspace === "skills" ? "skills-main" : workspace === "results" ? "results-main" : ""}`}>
-      {workspace !== "knowledge" && workspace !== "results" && workspace !== "skills" && <header className="research-topbar"><div><p>{platformContext?.institution?.name || "海南南繁"} · {platformContext?.projects?.find((project) => project.id === platformContext.active_project_id)?.project_name || "课题工作区"} · {workspace === "gwas" ? "固定生信工作流" : workspace === "genotype" ? "私有基因型数据" : "仅查询已发布标准数据"}</p><h1>{workspace === "assistant" ? activeSession?.title || AGENT_NAME : workspace === "gwas" ? "水稻连续性状 GWAS" : workspace === "genotype" ? "基因型导入与水稻专用质控" : "结构化查询"}</h1></div></header>}
+    <main className={`research-main ${workspace === "knowledge" ? "knowledge-main" : workspace === "structured" ? "structured-main" : workspace === "gwas" ? "gwas-main" : workspace === "genotype" ? "genotype-main" : workspace === "skills" ? "skills-main" : workspace === "results" ? "results-main" : workspace === "intelligence" || workspace === "trial-analysis" ? "intelligence-main" : ""}`}>
+      {workspace !== "knowledge" && workspace !== "results" && workspace !== "skills" && workspace !== "intelligence" && workspace !== "trial-analysis" && <header className="research-topbar"><div><p>{platformContext?.institution?.name || "海南南繁"} · {platformContext?.projects?.find((project) => project.id === platformContext.active_project_id)?.project_name || "课题工作区"} · {workspace === "gwas" ? "固定生信工作流" : workspace === "genotype" ? "私有基因型数据" : "仅查询已发布标准数据"}</p><h1>{workspace === "assistant" ? activeSession?.title || AGENT_NAME : workspace === "gwas" ? "水稻连续性状 GWAS" : workspace === "genotype" ? "基因型导入与水稻专用质控" : "结构化查询"}</h1></div></header>}
 
       {notice && <div className="assistant-notice"><span>{notice}</span><button title="关闭提示" onClick={() => setNotice("")}><X size={16} /></button></div>}
 
@@ -881,7 +887,7 @@ export default function ResearchAssistant({ platformContext, onProjectChange }) 
           </div>
         </form>
       </section>
-      </> : workspace === "structured" ? <StructuredQueryPanel onNotice={setNotice} /> : workspace === "gwas" ? <GwasWorkspace onNotice={setNotice} /> : workspace === "genotype" ? <GenotypeAssetsWorkspace onNotice={setNotice} /> : workspace === "skills" ? <SkillLibrary onNotice={setNotice} onOpenWorkspace={openResearchSkill} /> : workspace === "knowledge" ? <KnowledgeLibrary onNotice={setNotice} /> : <ResultsLibrary onNotice={setNotice} />}
+      </> : workspace === "structured" ? <StructuredQueryPanel onNotice={setNotice} /> : workspace === "intelligence" ? <BreedingIntelligenceWorkspace onNotice={setNotice} /> : workspace === "trial-analysis" ? <TrialAnalysisWorkspace onNotice={setNotice} /> : workspace === "gwas" ? <GwasWorkspace onNotice={setNotice} /> : workspace === "genotype" ? <GenotypeAssetsWorkspace onNotice={setNotice} /> : workspace === "skills" ? <SkillLibrary onNotice={setNotice} onOpenWorkspace={openResearchSkill} /> : workspace === "knowledge" ? <KnowledgeLibrary onNotice={setNotice} /> : <ResultsLibrary onNotice={setNotice} />}
     </main>
 
     {preview && <div className="attachment-preview-backdrop" onMouseDown={() => setPreview(null)}><section className={`attachment-preview ${preview.image_url ? "image-preview" : ""}`} onMouseDown={(event) => event.stopPropagation()}><header><div><p>{preview.image_url ? "当前会话私有原图" : "本地解析文字预览"}</p><h2>{preview.file_name}</h2></div><button className="icon-button" title="关闭预览" onClick={() => setPreview(null)}><X size={17} /></button></header>{preview.parser_warnings?.map((warning) => <div className="preview-warning" key={warning}>{warning}</div>)}{preview.image_url ? <div className="attachment-image-full"><img src={preview.image_url} alt={preview.file_name} /></div> : <pre>{preview.preview || "该附件未解析出可预览文本。"}</pre>}{preview.preview_truncated && <small>预览仅显示前 60,000 个字符；完整文本仍仅保存在当前会话的私有附件中。</small>}</section></div>}

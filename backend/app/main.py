@@ -54,7 +54,7 @@ from .auth import (
     require_published_data_reader,
     require_researcher,
 )
-from .document_parser import SUPPORTED_SUFFIXES, VISION_IMAGE_SUFFIXES, parse_local_document
+from .document_parser import SUPPORTED_SUFFIXES as DOCUMENT_SUPPORTED_SUFFIXES, VISION_IMAGE_SUFFIXES, parse_local_document
 from .conversation_title import DEFAULT_RESEARCH_SESSION_TITLE, auto_title_for_first_message
 from .genomics import (
     AttachGenotypeAssetRequest,
@@ -138,10 +138,26 @@ from .breeding_dossier import (
     is_breeding_report_request,
     seed_mock_breeding_dossiers,
 )
+from .breeding_intelligence import (
+    DEFAULT_RECOMMENDATION_WEIGHTS,
+    _json_safe as intelligence_json_safe,
+    build_intelligence_pdf,
+    build_material_analysis,
+    ensure_breeding_intelligence_schema,
+    get_material_analysis_run,
+    get_parent_recommendation_run,
+    get_recommendation_rule,
+    list_materials as list_intelligence_materials,
+    recommendation_csv,
+    run_parent_recommendation,
+    save_material_analysis,
+    save_parent_recommendation,
+    update_recommendation_rule,
+)
 from .institution_data import (
     DATASET_LABELS,
     FIELD_ALIASES,
-    SUPPORTED_SUFFIXES,
+    SUPPORTED_SUFFIXES as INSTITUTION_SUPPORTED_SUFFIXES,
     InstitutionDataError,
     InstitutionDataSettings,
     InstitutionDatabaseManager,
@@ -164,6 +180,7 @@ from .trial_package import (
     retire_legacy_seeded_trial_demo,
     upload_trial_package,
 )
+from .trial_statistics import TrialStatisticsError, run_controlled_trial_analysis
 
 
 # Keep background parser failures in the normal Uvicorn container log stream.
@@ -729,6 +746,9 @@ class KnowledgeDocument(Base):
     publication_year: Mapped[str | None] = mapped_column(String(20), nullable=True)
     source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     short_description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    authorization_basis: Mapped[str | None] = mapped_column(Text, nullable=True)
+    license_scope: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    topic_tags: Mapped[list] = mapped_column(JSON, default=list)
     parsing_status: Mapped[str] = mapped_column(String(30), default="processing")
     indexing_status: Mapped[str] = mapped_column(String(30), default="pending")
     parser_name: Mapped[str | None] = mapped_column(String(80), nullable=True)
@@ -2137,10 +2157,38 @@ class KnowledgeDocumentMetadataUpdate(BaseModel):
     publication_year: str = Field(default="", max_length=20)
     source_url: str = Field(default="", max_length=2000)
     short_description: str = Field(default="", max_length=2000)
+    authorization_basis: str = Field(default="", max_length=2000)
+    license_scope: str = Field(default="", max_length=100)
+    topic_tags: list[str] = Field(default_factory=list, max_length=30)
 
 
 class KnowledgeDocumentVersionCreate(KnowledgeDocumentMetadataUpdate):
     change_summary: str = Field(min_length=1, max_length=2000)
+
+
+class GermplasmAnalysisRequest(BaseModel):
+    material_key: str = Field(min_length=1, max_length=300)
+
+
+class ParentRecommendationRequest(BaseModel):
+    candidate_keys: list[str] = Field(min_length=2, max_length=30)
+    breeding_goal: str = Field(min_length=2, max_length=1000)
+    constraints: list[str] = Field(default_factory=list, max_length=30)
+    weights: dict[str, float] | None = None
+
+
+class ParentRecommendationRuleUpdate(BaseModel):
+    weights: dict[str, float] = Field(default_factory=lambda: dict(DEFAULT_RECOMMENDATION_WEIGHTS))
+    rule_note: str = Field(default="", max_length=2000)
+
+
+class ControlledTrialAnalysisRequest(BaseModel):
+    package_id: str = Field(min_length=1, max_length=36)
+    analysis_type: Literal["same_trial", "stability", "environment", "management", "tradeoff", "decline"]
+    year: int | None = Field(default=None, ge=1900, le=2200)
+    site_name: str = Field(default="", max_length=200)
+    material_code: str = Field(default="", max_length=200)
+    treatment_code: str = Field(default="", max_length=100)
 
 
 RESEARCH_SKILL_CATALOG: tuple[dict[str, Any], ...] = (
@@ -2517,6 +2565,9 @@ def serialize_knowledge_document(item: KnowledgeDocument, folder: KnowledgeFolde
         "publication_year": item.publication_year or "",
         "source_url": item.source_url or "",
         "short_description": item.short_description or "",
+        "authorization_basis": item.authorization_basis or "",
+        "license_scope": item.license_scope or "",
+        "topic_tags": item.topic_tags or [],
         "parsing_status": item.parsing_status,
         "indexing_status": item.indexing_status,
         "parser_name": item.parser_name,
@@ -2834,6 +2885,7 @@ def startup() -> None:
         # replicate, environment and raw-source location.
         ensure_trial_package_schema(session)
         ensure_breeding_dossier_schema(session)
+        ensure_breeding_intelligence_schema(session)
         ensure_genomics_schema(session)
         ensure_genotype_asset_schema(session)
         ensure_single_institution_schema(session)
@@ -2850,6 +2902,9 @@ def startup() -> None:
         session.execute(text("ALTER TABLE source_review ADD COLUMN IF NOT EXISTS template_version_id VARCHAR(36)"))
         session.execute(text("ALTER TABLE research_session ADD COLUMN IF NOT EXISTS memory_state JSONB NOT NULL DEFAULT '{}'::jsonb"))
         session.execute(text("ALTER TABLE knowledge_document ADD COLUMN IF NOT EXISTS version_change_summary TEXT"))
+        session.execute(text("ALTER TABLE knowledge_document ADD COLUMN IF NOT EXISTS authorization_basis TEXT"))
+        session.execute(text("ALTER TABLE knowledge_document ADD COLUMN IF NOT EXISTS license_scope VARCHAR(100)"))
+        session.execute(text("ALTER TABLE knowledge_document ADD COLUMN IF NOT EXISTS topic_tags JSONB NOT NULL DEFAULT '[]'::jsonb"))
         session.commit()
         backfill_image_ready_research_attachments(session)
         normalize_legacy_range_markers(session)
@@ -2902,7 +2957,7 @@ def institution_data_contracts(
             {
                 "id": dataset_type,
                 "label": label,
-                "formats": sorted({suffix.lstrip(".").upper() for suffix in SUPPORTED_SUFFIXES[dataset_type]}),
+                "formats": sorted({suffix.lstrip(".").upper() for suffix in INSTITUTION_SUPPORTED_SUFFIXES[dataset_type]}),
                 "standard_fields": sorted(FIELD_ALIASES.get(dataset_type, {})),
             }
             for dataset_type, label in DATASET_LABELS.items()
@@ -3062,6 +3117,295 @@ def get_institution_entity_trace(
         "project_id": active_project_id(session),
         **trace,
     }
+
+
+@app.get("/api/research/intelligence/materials")
+def get_intelligence_materials(
+    q: str = Query(default="", max_length=200),
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> list[dict[str, Any]]:
+    account, config = institution_data_config_for_user(session, user)
+    return list_intelligence_materials(
+        INSTITUTION_DATABASES.engine(config.business_database),
+        account.institution_id,
+        active_project_id(session),
+        q,
+    )
+
+
+@app.post("/api/research/intelligence/material-analysis")
+def create_material_analysis(
+    payload: GermplasmAnalysisRequest,
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> dict[str, Any]:
+    account, config = institution_data_config_for_user(session, user)
+    try:
+        result = build_material_analysis(
+            INSTITUTION_DATABASES.engine(config.business_database),
+            account.institution_id,
+            active_project_id(session),
+            payload.material_key.strip(),
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    run_id = save_material_analysis(session, user.id, result)
+    record_permission_audit(
+        session, user, "germplasm_analysis_created", "germplasm_analysis_run", run_id,
+        project_id=active_project_id(session),
+        after={"material_key": payload.material_key, "evidence_counts": result["evidence_counts"]},
+    )
+    session.commit()
+    return {"run_id": run_id, **result}
+
+
+@app.get("/api/research/intelligence/material-analysis/{run_id}/report.pdf")
+def material_analysis_report(
+    run_id: str,
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> Response:
+    result = get_material_analysis_run(session, run_id, user.id, active_project_id(session))
+    if not result:
+        raise HTTPException(404, "未找到当前账号在本课题创建的种质解析记录。")
+    return Response(
+        content=build_intelligence_pdf("种质资源综合解析报告", result),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="germplasm-analysis-{run_id}.pdf"'},
+    )
+
+
+@app.get("/api/research/intelligence/recommendation-rules")
+def get_parent_recommendation_rules(
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> dict[str, Any]:
+    return get_recommendation_rule(session, active_project_id(session))
+
+
+@app.put("/api/research/intelligence/recommendation-rules")
+def put_parent_recommendation_rules(
+    payload: ParentRecommendationRuleUpdate,
+    user: CurrentUser = Depends(require_field_admin),
+    session: Session = Depends(get_business_project_session),
+) -> dict[str, Any]:
+    try:
+        result = update_recommendation_rule(
+            session, active_project_id(session), payload.weights, payload.rule_note, user.id,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    record_permission_audit(
+        session, user, "parent_recommendation_rule_updated", "parent_recommendation_rule",
+        active_project_id(session), project_id=active_project_id(session), after=result,
+    )
+    session.commit()
+    return result
+
+
+@app.post("/api/research/intelligence/parent-recommendations")
+def create_parent_recommendations(
+    payload: ParentRecommendationRequest,
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> dict[str, Any]:
+    candidate_keys = list(dict.fromkeys(item.strip() for item in payload.candidate_keys if item.strip()))
+    if len(candidate_keys) < 2:
+        raise HTTPException(422, "至少选择 2 个不同的候选亲本。")
+    account, config = institution_data_config_for_user(session, user)
+    rule = get_recommendation_rule(session, active_project_id(session))
+    weights = dict(rule["weights"])
+    if payload.weights is not None:
+        unknown = sorted(set(payload.weights) - set(DEFAULT_RECOMMENDATION_WEIGHTS))
+        if unknown:
+            raise HTTPException(422, f"未知权重维度：{'、'.join(unknown)}。")
+        weights.update({key: float(value) for key, value in payload.weights.items()})
+    try:
+        result = run_parent_recommendation(
+            INSTITUTION_DATABASES.engine(config.business_database),
+            account.institution_id,
+            active_project_id(session),
+            candidate_keys,
+            weights,
+            payload.breeding_goal,
+            payload.constraints,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    request_json = payload.model_dump()
+    request_json["candidate_keys"] = candidate_keys
+    run_id = save_parent_recommendation(
+        session,
+        owner_id=user.id,
+        institution_id=account.institution_id,
+        project_id=active_project_id(session),
+        request_payload=request_json,
+        result=result,
+        rule_version=int(rule["version"]),
+    )
+    record_permission_audit(
+        session, user, "parent_auxiliary_recommendation_created", "parent_recommendation_run", run_id,
+        project_id=active_project_id(session),
+        after={"candidate_count": len(candidate_keys), "combination_count": len(result["recommendations"])},
+    )
+    session.commit()
+    return {"run_id": run_id, "rule_version": rule["version"], **result}
+
+
+def _parent_recommendation_for_current_user(session: Session, run_id: str, user: CurrentUser) -> dict[str, Any]:
+    result = get_parent_recommendation_run(session, run_id, user.id, active_project_id(session))
+    if not result:
+        raise HTTPException(404, "未找到当前账号在本课题创建的亲本辅助推荐记录。")
+    return result
+
+
+@app.get("/api/research/intelligence/parent-recommendations/{run_id}/report.pdf")
+def parent_recommendation_report(
+    run_id: str,
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> Response:
+    result = _parent_recommendation_for_current_user(session, run_id, user)
+    return Response(
+        content=build_intelligence_pdf("亲本组合辅助推荐报告", result),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="parent-recommendation-{run_id}.pdf"'},
+    )
+
+
+@app.get("/api/research/intelligence/parent-recommendations/{run_id}/result.csv")
+def parent_recommendation_csv(
+    run_id: str,
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> Response:
+    result = _parent_recommendation_for_current_user(session, run_id, user)
+    return Response(
+        content=recommendation_csv(result),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="parent-recommendation-{run_id}.csv"'},
+    )
+
+
+@app.get("/api/research/trial-analysis/packages")
+def get_trial_analysis_packages(
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> list[dict[str, Any]]:
+    rows = session.execute(text("""
+        SELECT package.id, package.package_code, package.package_name, package.created_at,
+               COUNT(DISTINCT trial.id) AS trial_count,
+               COUNT(DISTINCT entry.material_id) AS material_count,
+               COUNT(observation.id) AS observation_count
+        FROM trial_data_package package
+        LEFT JOIN field_trial trial ON trial.package_id=package.id AND trial.data_status='published'
+        LEFT JOIN trial_entry entry ON entry.trial_id=trial.id
+        LEFT JOIN trial_phenotype_observation observation ON observation.entry_id=entry.id AND observation.publish_status='published'
+        WHERE package.project_id=:project_id AND package.governance_status='published'
+        GROUP BY package.id, package.package_code, package.package_name, package.created_at
+        ORDER BY package.created_at DESC
+    """), {"project_id": active_project_id(session)}).mappings().all()
+    return [intelligence_json_safe(dict(row)) for row in rows]
+
+
+def _controlled_trial_question(payload: ControlledTrialAnalysisRequest) -> str:
+    context = " ".join(
+        str(value).strip() for value in (payload.year, payload.site_name, payload.material_code, payload.treatment_code)
+        if value not in (None, "")
+    )
+    prompts = {
+        "same_trial": f"同一试验 {context} 标准施氮全部材料方差分析和 Tukey 多重比较",
+        "stability": f"{context} 多年多点平均产量、相对增产、波动和有效环境稳定性分析",
+        "environment": f"{context} 土壤 pH、有效磷、降雨和环境影响关联分析",
+        "management": f"{context} 不同施氮管理措施与材料施氮交互效应分析",
+        "tradeoff": f"{context} 高产材料的产量、抗病、株高和米质权衡分析",
+        "decline": f"{context} 材料表现下降或异常的环境、病害和性状证据拆解",
+    }
+    return prompts[payload.analysis_type]
+
+
+@app.post("/api/research/trial-analysis/run")
+def create_controlled_trial_analysis(
+    payload: ControlledTrialAnalysisRequest,
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> dict[str, Any]:
+    package = session.execute(text("""
+        SELECT id, package_code, package_name, created_at FROM trial_data_package
+        WHERE id=:package_id AND project_id=:project_id AND governance_status='published'
+    """), {"package_id": payload.package_id, "project_id": active_project_id(session)}).mappings().first()
+    if not package:
+        raise HTTPException(404, "所选区域试验资料包不存在、未发布或不属于当前课题。")
+    if payload.analysis_type == "same_trial" and (not payload.year or not payload.site_name.strip()):
+        raise HTTPException(422, "同一试验材料比较必须选择年份和地点。")
+    if payload.analysis_type == "decline" and not payload.material_code.strip():
+        raise HTTPException(422, "表现异常证据拆解必须选择材料。")
+    question = _controlled_trial_question(payload)
+    try:
+        analysis = run_controlled_trial_analysis(session, dict(package), question, user.id)
+    except TrialStatisticsError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if not analysis:
+        raise HTTPException(422, "当前参数未匹配到受控分析方法。")
+    session.commit()
+    record_permission_audit(
+        session, user, "controlled_trial_analysis_created", "trial_analysis_run",
+        str(analysis["analysis_run_id"]), project_id=active_project_id(session),
+        after={"package_id": payload.package_id, "analysis_type": analysis.get("analysis_type")},
+    )
+    session.commit()
+    return {"question": question, "package": intelligence_json_safe(dict(package)), **intelligence_json_safe(analysis)}
+
+
+def _trial_run_for_current_user(session: Session, run_id: str, user: CurrentUser) -> dict[str, Any]:
+    row = session.execute(text("""
+        SELECT run.id, run.result_json, run.request_question, run.completed_at,
+               package.package_code, package.package_name
+        FROM trial_analysis_run run
+        JOIN trial_data_package package ON package.id=run.package_id
+        WHERE run.id=:run_id AND run.requested_by=:owner_id AND package.project_id=:project_id
+    """), {"run_id": run_id, "owner_id": user.id, "project_id": active_project_id(session)}).mappings().first()
+    if not row:
+        raise HTTPException(404, "未找到当前账号在本课题创建的试验分析记录。")
+    return intelligence_json_safe(dict(row))
+
+
+@app.get("/api/research/trial-analysis/runs/{run_id}/chart.png")
+def controlled_trial_chart(
+    run_id: str,
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> Response:
+    run = _trial_run_for_current_user(session, run_id, user)
+    content = build_analysis_chart_png(run["result_json"])
+    if not content:
+        raise HTTPException(422, "该分析结果没有可安全绘制的数值序列。")
+    return Response(content=content, media_type="image/png")
+
+
+@app.get("/api/research/trial-analysis/runs/{run_id}/report.pdf")
+def controlled_trial_report(
+    run_id: str,
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> Response:
+    run = _trial_run_for_current_user(session, run_id, user)
+    analysis = run["result_json"]
+    evidence = [{
+        "priority": "P0",
+        "title": f"已发布试验资料包 {run['package_name']}",
+        "detail": f"资料包编号 {run['package_code']}；分析运行 {run_id}；原始记录 {analysis.get('source_record_count', 0)} 条",
+    }]
+    answer = f"已按 {analysis.get('model_formula') or '受控统计方法'} 完成分析。{analysis.get('limitations') or ''}"
+    content = build_research_report_pdf(
+        question=run["request_question"], answer=answer, evidence=evidence, analysis=analysis,
+    )
+    return Response(
+        content=content,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="trial-analysis-{run_id}.pdf"'},
+    )
 
 
 @app.get("/api/context")
@@ -4253,7 +4597,7 @@ async def upload_research_attachment(
     research_session = get_owned_research_session(session, research_session_id)
     original_name = (file.filename or "附件").strip()
     suffix = Path(original_name).suffix.lower()
-    if suffix not in SUPPORTED_SUFFIXES and suffix not in VISION_IMAGE_SUFFIXES:
+    if suffix not in DOCUMENT_SUPPORTED_SUFFIXES and suffix not in VISION_IMAGE_SUFFIXES:
         raise HTTPException(415, "暂不支持该附件格式。请上传 PDF、Office 文档、表格、图片或文本文件。")
     content = await file.read(MAX_RESEARCH_ATTACHMENT_BYTES + 1)
     if len(content) > MAX_RESEARCH_ATTACHMENT_BYTES:
@@ -4740,6 +5084,7 @@ def list_knowledge_documents(
             | KnowledgeDocument.original_file_name.ilike(pattern)
             | func.coalesce(KnowledgeDocument.author, "").ilike(pattern)
             | func.coalesce(KnowledgeDocument.source_organization, "").ilike(pattern)
+            | KnowledgeDocument.topic_tags.cast(Text).ilike(pattern)
         )
     items = session.scalars(statement.order_by(KnowledgeDocument.updated_at.desc())).all()
     folders = {item.id: item for item in session.scalars(select(KnowledgeFolder).where(KnowledgeFolder.scope == scope, KnowledgeFolder.project_id == project_id)).all()}
@@ -4757,6 +5102,9 @@ async def upload_knowledge_documents(
     publication_year: str = Query(default="", max_length=20),
     source_url: str = Query(default="", max_length=2000),
     short_description: str = Query(default="", max_length=2000),
+    authorization_basis: str = Query(default="", max_length=2000),
+    license_scope: str = Query(default="", max_length=100),
+    topic_tags: str = Query(default="", max_length=1000),
     supersedes_document_id: str | None = Query(default=None),
     version_change_summary: str = Query(default="", max_length=2000),
     user: CurrentUser = Depends(require_knowledge_user),
@@ -4766,6 +5114,13 @@ async def upload_knowledge_documents(
         raise HTTPException(422, f"每次最多上传 {MAX_KNOWLEDGE_BATCH_FILES} 个知识库文件。")
     if scope == "public" and "field_admin" not in user.roles:
         raise HTTPException(403, "公共知识库仅允许字段管理员上传和维护。")
+    if scope == "public" and (not authorization_basis.strip() or not license_scope.strip()):
+        raise HTTPException(422, "公共资料必须填写授权依据和授权范围（公开资料或合法授权资料）。")
+    parsed_topic_tags = list(dict.fromkeys(
+        item.strip() for item in re.split(r"[,，;；]", topic_tags) if item.strip()
+    ))
+    if len(parsed_topic_tags) > 30:
+        raise HTTPException(422, "主题标签最多填写 30 个。")
     if supersedes_document_id and (scope != "public" or "field_admin" not in user.roles or len(files) != 1):
         raise HTTPException(422, "公共资料的新版本一次只能上传一个文件，并且只能由字段管理员操作。")
     folder = validate_knowledge_folder(session, folder_id=folder_id, scope=scope, user=user)
@@ -4782,7 +5137,7 @@ async def upload_knowledge_documents(
     for file in files:
         original_name = (file.filename or "knowledge-document").strip()
         suffix = Path(original_name).suffix.lower()
-        if suffix not in SUPPORTED_SUFFIXES:
+        if suffix not in DOCUMENT_SUPPORTED_SUFFIXES:
             raise HTTPException(415, f"{original_name} 不是第一版知识库支持的文档格式。")
         content = await file.read(MAX_KNOWLEDGE_FILE_BYTES + 1)
         if not content:
@@ -4826,6 +5181,9 @@ async def upload_knowledge_documents(
             publication_year=publication_year.strip() or None,
             source_url=source_url.strip() or None,
             short_description=short_description.strip() or None,
+            authorization_basis=authorization_basis.strip() or None,
+            license_scope=license_scope.strip() or None,
+            topic_tags=parsed_topic_tags,
             status="processing",
             version_number=(previous.version_number + 1) if previous else 1,
             supersedes_document_id=previous.id if previous else None,
@@ -4839,6 +5197,105 @@ async def upload_knowledge_documents(
     for item in created:
         background_tasks.add_task(process_knowledge_document, item.id)
     return response
+
+
+@app.post("/api/knowledge/sync-institution-literature")
+def sync_institution_literature(
+    background_tasks: BackgroundTasks,
+    user: CurrentUser = Depends(require_knowledge_admin),
+    session: Session = Depends(get_knowledge_session),
+) -> dict[str, Any]:
+    """Index authorized text extracted by the governed institution import.
+
+    The original PDF/DOCX/TXT remains in the institution MinIO bucket.  The
+    knowledge library stores only an extracted text derivative plus its batch,
+    object and authorization metadata, so every citation remains traceable.
+    """
+    account, config = institution_data_config_for_user(session, user)
+    project_id = active_project_id(session)
+    with INSTITUTION_DATABASES.engine(config.business_database).connect() as connection:
+        rows = [dict(row) for row in connection.execute(text("""
+            SELECT entity.entity_key, entity.payload, entity.source_batch_id,
+                   batch.source_file_name, batch.object_bucket, batch.object_key,
+                   batch.file_sha256
+            FROM data_entity entity
+            JOIN ingest_batch batch ON batch.id=entity.source_batch_id
+            WHERE entity.institution_id=:institution_id AND entity.project_id=:project_id
+              AND entity.entity_type='literature_document'
+            ORDER BY entity.updated_at
+        """), {"institution_id": account.institution_id, "project_id": project_id}).mappings()]
+    folder = session.scalar(select(KnowledgeFolder).where(
+        KnowledgeFolder.project_id == project_id,
+        KnowledgeFolder.scope == "public",
+        KnowledgeFolder.folder_name == "论文与综述",
+    ))
+    if not folder:
+        raise HTTPException(503, "公共知识库“论文与综述”分类尚未初始化。")
+    created: list[KnowledgeDocument] = []
+    skipped = 0
+    for row in rows:
+        payload = row.get("payload") or {}
+        extracted = str(payload.get("text") or "").strip()
+        if not extracted:
+            skipped += 1
+            continue
+        derivative_hash = hashlib.sha256(extracted.encode("utf-8")).hexdigest()
+        duplicate = session.scalar(select(KnowledgeDocument).where(
+            KnowledgeDocument.project_id == project_id,
+            KnowledgeDocument.scope == "public",
+            KnowledgeDocument.content_hash == derivative_hash,
+            KnowledgeDocument.status.not_in(("withdrawn", "superseded", "deleted")),
+        ))
+        if duplicate:
+            skipped += 1
+            continue
+        document_id = str(uuid.uuid4())
+        directory = KNOWLEDGE_STORAGE_DIR / project_id / "public" / "public" / document_id
+        directory.mkdir(parents=True, exist_ok=True)
+        original_name = str(payload.get("file_name") or row.get("source_file_name") or f"literature-{row['entity_key']}")
+        path = directory / f"institution-{row['entity_key']}.txt"
+        path.write_text(extracted, encoding="utf-8")
+        lower = f"{original_name} {extracted[:5000]}".lower()
+        tags = [label for label, markers in {
+            "品种": ("品种", "种质", "材料"),
+            "基因": ("基因", "qtl", "gwas"),
+            "性状": ("性状", "表型", "产量", "株高"),
+            "育种目标": ("育种", "亲本", "选育"),
+            "试验": ("试验", "区试", "田间"),
+        }.items() if any(marker in lower for marker in markers)]
+        item = KnowledgeDocument(
+            id=document_id,
+            project_id=project_id,
+            scope="public",
+            owner_id=user.id,
+            folder_id=folder.id,
+            original_file_name=original_name,
+            display_title=Path(original_name).stem or original_name,
+            content_type="text/plain; charset=utf-8",
+            size_bytes=len(extracted.encode("utf-8")),
+            content_hash=derivative_hash,
+            storage_path=str(path),
+            source_organization=INSTITUTION_NAME,
+            source_url=f"minio://{row['object_bucket']}/{row['object_key']}",
+            short_description=f"由机构导入批次 {row['source_batch_id']} 提取的可检索文本；原文件 SHA-256：{row['file_sha256']}",
+            authorization_basis="机构数据处理员按公开资料或合法授权资料导入，字段管理员复核后发布。",
+            license_scope="公开资料或合法授权资料",
+            topic_tags=tags,
+            status="processing",
+        )
+        session.add(item)
+        created.append(item)
+    session.flush()
+    created_ids = [item.id for item in created]
+    record_permission_audit(
+        session, user, "institution_literature_synced", "knowledge_document", project_id,
+        project_id=project_id,
+        after={"created_document_ids": created_ids, "skipped_count": skipped},
+    )
+    session.commit()
+    for item in created:
+        background_tasks.add_task(process_knowledge_document, item.id)
+    return {"created_count": len(created), "skipped_count": skipped, "document_ids": created_ids}
 
 
 @app.patch("/api/knowledge/documents/{document_id}")
@@ -4861,6 +5318,11 @@ def update_knowledge_document(
     document.publication_year = payload.publication_year.strip() or None
     document.source_url = payload.source_url.strip() or None
     document.short_description = payload.short_description.strip() or None
+    if document.scope == "public" and (not payload.authorization_basis.strip() or not payload.license_scope.strip()):
+        raise HTTPException(422, "公共资料必须保留授权依据和授权范围。")
+    document.authorization_basis = payload.authorization_basis.strip() or None
+    document.license_scope = payload.license_scope.strip() or None
+    document.topic_tags = list(dict.fromkeys(item.strip() for item in payload.topic_tags if item.strip()))
     session.flush()
     result = serialize_knowledge_document(document, folder)
     session.commit()
@@ -4937,6 +5399,8 @@ def publish_knowledge_document(
         raise HTTPException(422, "资料尚未通过本地解析和 bge-m3 索引检查，暂不能发布。")
     if not document.source_organization or not document.folder_id or not document.display_title:
         raise HTTPException(422, "请补全标题、资料分类和来源单位后再发布。")
+    if not document.authorization_basis or not document.license_scope:
+        raise HTTPException(422, "请补全授权依据和授权范围后再发布。")
     document.status = "published"
     document.published_at = datetime.now(timezone.utc)
     session.execute(
@@ -5376,14 +5840,17 @@ def build_knowledge_evidence_context(
         blocks.append(
             f"### {scope_label}：{document.display_title}\n"
             f"来源：{document.source_organization or document.author or '未填写'}；命中位置：{locators}\n"
+            f"授权范围：{document.license_scope or ('私人资料，仅当前账号' if document.scope == 'private' else '未填写')}；"
+            f"主题标签：{'、'.join(document.topic_tags or []) or '未填写'}\n"
             f"{selected_chunks}"
         )
         cards.append({
             "priority": 3,
             "type": "private_knowledge" if document.scope == "private" else "public_knowledge",
             "title": f"{scope_label}：{document.display_title}",
-            "detail": f"{folder.folder_name if folder else '未分类'} · {document.source_organization or document.author or '来源待补充'} · {locators}",
+            "detail": f"{folder.folder_name if folder else '未分类'} · {document.source_organization or document.author or '来源待补充'} · {document.license_scope or '私人资料'} · {locators}",
             "excerpt": "\n".join(excerpts),
+            "topic_tags": document.topic_tags or [],
         })
     return "\n\n".join(blocks), cards
 

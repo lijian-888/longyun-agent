@@ -166,6 +166,86 @@ def _environment_frame(session: Session, package_id: str) -> pd.DataFrame:
     return pd.DataFrame([dict(row) for row in rows])
 
 
+def quality_check_from_records(records: list[dict[str, Any]], trial_structures: list[dict[str, Any]]) -> dict[str, Any]:
+    """Identify missing values, IQR outliers and design-structure problems."""
+    missing: list[dict[str, Any]] = []
+    outliers: list[dict[str, Any]] = []
+    by_trait: dict[str, list[tuple[float, dict[str, Any]]]] = {}
+    for record in records:
+        value = record.get("value_numeric")
+        if value is None or (isinstance(value, float) and not math.isfinite(value)):
+            missing.append({
+                "trait_code": record.get("trait_code"),
+                "source_locator": record.get("source_locator"),
+                "message": "数值缺失，未用于统计计算",
+            })
+            continue
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            missing.append({
+                "trait_code": record.get("trait_code"),
+                "source_locator": record.get("source_locator"),
+                "message": "无法转换为数值，未用于统计计算",
+            })
+            continue
+        by_trait.setdefault(str(record.get("trait_code") or "unknown"), []).append((numeric, record))
+    for trait_code, values_and_records in by_trait.items():
+        if len(values_and_records) < 8:
+            continue
+        series = pd.Series([item[0] for item in values_and_records], dtype=float)
+        q1, q3 = float(series.quantile(0.25)), float(series.quantile(0.75))
+        iqr = q3 - q1
+        if iqr <= 0:
+            continue
+        lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+        for numeric, record in values_and_records:
+            if numeric < lower or numeric > upper:
+                outliers.append({
+                    "trait_code": trait_code,
+                    "value": numeric,
+                    "lower_fence": round(lower, 4),
+                    "upper_fence": round(upper, 4),
+                    "source_locator": record.get("source_locator"),
+                    "message": "IQR 规则识别的疑似异常值；保留原记录并提示复核，不自动删除",
+                })
+    structure_issues: list[str] = []
+    for trial in trial_structures:
+        status = str(trial.get("design_validation_status") or "unverified")
+        metadata = trial.get("design_metadata") or {}
+        if status not in {"passed", "verified"}:
+            structure_issues.append(f"{trial.get('trial_code') or trial.get('trial_id')} 试验设计校验状态为 {status}")
+        for item in metadata.get("issues", []) if isinstance(metadata, dict) else []:
+            structure_issues.append(f"{trial.get('trial_code') or trial.get('trial_id')}：{item}")
+    return {
+        "status": "passed" if not missing and not structure_issues else "passed_with_warnings",
+        "method": "空值检查 + 按性状 IQR(1.5×四分位距) 疑似异常值检查 + 试验设计校验状态复核",
+        "record_count": len(records),
+        "missing_value_count": len(missing),
+        "outlier_count": len(outliers),
+        "structure_issue_count": len(structure_issues),
+        "missing_values": missing[:100],
+        "outliers": outliers[:100],
+        "structure_issues": structure_issues[:100],
+        "note": "疑似异常值仅提示，不会被系统静默删除；分析结果应结合原始定位复核。",
+    }
+
+
+def _package_quality_check(session: Session, package_id: str) -> dict[str, Any]:
+    records = [dict(row) for row in session.execute(text("""
+        SELECT observation.trait_code, observation.value_numeric, observation.source_locator
+        FROM field_trial trial
+        JOIN trial_entry entry ON entry.trial_id=trial.id
+        JOIN trial_phenotype_observation observation ON observation.entry_id=entry.id
+        WHERE trial.package_id=:package_id AND observation.publish_status='published'
+    """), {"package_id": package_id}).mappings()]
+    trial_structures = [dict(row) for row in session.execute(text("""
+        SELECT id AS trial_id, trial_code, design_validation_status, design_metadata
+        FROM field_trial WHERE package_id=:package_id AND data_status='published'
+    """), {"package_id": package_id}).mappings()]
+    return quality_check_from_records(records, trial_structures)
+
+
 def _find_site(data: pd.DataFrame, question: str) -> str | None:
     normalized = _key(question)
     for site_name in data["site_name"].dropna().unique():
@@ -605,5 +685,6 @@ def run_controlled_trial_analysis(session: Session, package: dict[str, Any], que
             "本地统计引擎未能完成该分析。请确认已发布区域试验资料包完整，"
             "并检查试验设计、区组、材料、处理及观测值是否满足统计条件。"
         ) from exc
+    analysis["quality_check"] = _package_quality_check(session, str(package["id"]))
     run_id = _record_run(session, str(package["id"]), analysis, question, requested_by)
     return {**_native(analysis), "analysis_run_id": run_id, "engine": ANALYSIS_ENGINE_NAME, "analysis_version": ANALYSIS_VERSION}

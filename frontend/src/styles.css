@@ -408,3 +408,66 @@ body:has(.research-shell), body:has(.assistant-loading), body:has(.auth-error) {
 .institution-import-history .issue-count { color: #a35f30; font-weight: 700; }
 @media (max-width: 860px) { .institution-plane-grid, .institution-trace-result { grid-template-columns: repeat(2, minmax(0, 1fr)); }.institution-upload-form { grid-template-columns: 1fr; }.institution-mapping-field, .institution-contract-note { grid-column: auto; } }
 @media (max-width: 560px) { .institution-plane-grid, .institution-trace-result { grid-template-columns: 1fr; }.institution-trace-form { display: grid; } }
+
+/* Evidence-backed germplasm intelligence and controlled trial analysis. */
+.intelligence-main { overflow-y: auto; background: #f5f8f6; }
+.intelligence-workspace { width: min(1180px, calc(100% - 44px)); margin: 0 auto; padding: 24px 0 50px; color: #284e42; }
+.workspace-hero { display: flex; justify-content: space-between; align-items: center; gap: 20px; border: 1px solid #cae0d6; border-left: 5px solid #247c63; border-radius: 8px; padding: 20px 22px; background: linear-gradient(120deg, #f9fcfa, #e9f5f0); }
+.workspace-hero span { color: #288069; font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+.workspace-hero h2 { margin: 4px 0 5px; font-family: Georgia, "Noto Serif SC", serif; font-size: 25px; color: #174f40; }
+.workspace-hero p { margin: 0; color: #648076; font-size: 13px; line-height: 1.6; }
+.workspace-hero > svg { flex: 0 0 auto; color: #2b8069; }
+.workspace-tabs { display: flex; gap: 7px; margin: 15px 0; border-bottom: 1px solid #d8e4de; }
+.workspace-tabs button { display: flex; align-items: center; gap: 7px; border: 0; border-bottom: 3px solid transparent; padding: 10px 14px; color: #607a70; background: transparent; cursor: pointer; }
+.workspace-tabs button.active { border-bottom-color: #267b63; color: #206c57; font-weight: 700; }
+.workspace-card { margin-top: 13px; border: 1px solid #d7e4de; border-radius: 7px; padding: 16px 18px; background: #fff; box-shadow: 0 1px 2px rgb(26 73 58 / 4%); }
+.workspace-card h3 { margin: 0 0 8px; color: #275c4b; font-size: 16px; }
+.workspace-card p { color: #617b71; line-height: 1.6; }
+.control-card { display: flex; align-items: end; gap: 12px; }
+.control-card label, .recommendation-form > label, .trial-analysis-form label { display: grid; flex: 1; gap: 6px; color: #526f64; font-size: 12px; }
+.control-card select, .recommendation-form input, .recommendation-form textarea, .trial-analysis-form input, .trial-analysis-form select { min-width: 0; border: 1px solid #cbdcd4; border-radius: 5px; padding: 9px 10px; color: #294f42; background: #fff; }
+.recommendation-form textarea { min-height: 65px; resize: vertical; }
+.workspace-card .primary-button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; }
+.workspace-error, .workspace-warning { display: flex; align-items: flex-start; gap: 9px; margin-top: 13px; border: 1px solid #e8c79c; border-radius: 6px; padding: 12px 14px; color: #85591f; background: #fff9ef; font-size: 13px; }
+.workspace-warning div { display: grid; gap: 3px; }
+.workspace-warning span { line-height: 1.55; }
+.workspace-empty, .workspace-loading { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 170px; color: #70887e; }
+.analysis-summary { display: flex; justify-content: space-between; align-items: center; gap: 20px; }
+.analysis-summary small { color: #82978f; font-family: Consolas, monospace; }
+.analysis-summary button, .download-actions button { display: inline-flex; align-items: center; gap: 6px; border: 1px solid #bcd5ca; border-radius: 5px; padding: 8px 10px; color: #276b58; background: #f4faf7; cursor: pointer; white-space: nowrap; }
+.evidence-section > header, .recommendation-results > header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+.status-ready, .status-missing, .auxiliary-label { border-radius: 999px; padding: 3px 8px; font-size: 10px; font-weight: 700; }
+.status-ready { color: #216c55; background: #e7f4ee; }
+.status-missing { color: #996128; background: #fff1dc; }
+.intelligence-table-wrap { overflow: auto; max-height: 420px; margin-top: 9px; }
+.intelligence-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.intelligence-table th, .intelligence-table td { border-bottom: 1px solid #e2ebe6; padding: 8px; text-align: left; vertical-align: top; white-space: nowrap; }
+.intelligence-table th { position: sticky; top: 0; color: #577267; background: #f3f8f5; }
+.intelligence-empty { margin: 7px 0 0 !important; color: #84978f !important; }
+.evidence-list { margin: 8px 0; padding-left: 20px; color: #5d766c; font-size: 12px; line-height: 1.7; }
+.workspace-card details { margin-top: 10px; color: #567267; font-size: 12px; }
+.workspace-card summary { cursor: pointer; font-weight: 600; }
+.workspace-card pre { overflow: auto; max-height: 440px; border-radius: 5px; padding: 12px; color: #31594c; background: #f4f8f6; font-size: 10px; }
+.recommendation-form { display: grid; gap: 14px; }
+.material-check-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.material-check-grid label { display: flex; align-items: center; gap: 8px; border: 1px solid #d9e5df; border-radius: 5px; padding: 9px; cursor: pointer; }
+.material-check-grid span { display: grid; gap: 2px; }
+.material-check-grid small { color: #82978f; font-family: Consolas, monospace; }
+.weight-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 7px; margin-top: 9px; }
+.weight-grid span { display: flex; justify-content: space-between; border: 1px solid #dce8e2; border-radius: 4px; padding: 7px; }
+.auxiliary-label { display: inline-block; color: #8a561c; background: #fff0d8; }
+.download-actions { display: flex; gap: 7px; }
+.recommendation-item { display: grid; grid-template-columns: 44px 1fr; gap: 10px; border-top: 1px solid #e0e9e5; padding: 16px 0; }
+.recommendation-rank { display: grid; place-items: center; width: 34px; height: 34px; border-radius: 50%; color: #fff; background: #27765f; font-weight: 700; }
+.recommendation-item h4 { margin: 2px 0 6px; font-size: 16px; }
+.recommendation-item p { display: flex; gap: 12px; margin: 0 0 10px; }
+.confidence { border-radius: 999px; padding: 1px 7px; font-size: 11px; }
+.confidence-高 { color: #176748; background: #e2f3eb; }.confidence-中 { color: #82591f; background: #fff1d8; }.confidence-低 { color: #9a4035; background: #fdeae7; }
+.recommendation-item dl, .run-metadata { display: grid; grid-template-columns: 76px 1fr; gap: 6px 10px; margin: 0; font-size: 12px; line-height: 1.6; }
+.recommendation-item dt, .run-metadata dt { color: #71877f; }.recommendation-item dd, .run-metadata dd { margin: 0; color: #405e54; }
+.trial-analysis-form { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.parameter-grid { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 9px; }
+.trial-analysis-form .primary-button { justify-self: start; }
+.analysis-chart img { display: block; width: min(100%, 900px); max-height: 500px; object-fit: contain; margin: 0 auto; }
+@media (max-width: 800px) { .material-check-grid, .weight-grid, .parameter-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }.trial-analysis-form { grid-template-columns: 1fr; }.parameter-grid { grid-column: auto; }.analysis-summary { align-items: flex-start; }.intelligence-workspace { width: calc(100% - 24px); } }
+@media (max-width: 520px) { .material-check-grid, .weight-grid, .parameter-grid { grid-template-columns: 1fr; }.control-card, .analysis-summary, .recommendation-results > header { display: grid; }.workspace-hero > svg { display: none; } }

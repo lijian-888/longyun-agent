@@ -1,5 +1,9 @@
 germplasm_id,name,species,origin
 HNNF-G001,隆耘稻1号,Oryza sativa,海南三亚
 HNNF-G002,隆耘稻2号,Oryza sativa,海南乐东
+HNNF-G003,隆耘稻3号,Oryza sativa,海南陵水
+HNNF-G004,隆耘稻4号,Oryza sativa,海南三亚
 HNNF-P001,隆耘母本1号,Oryza sativa,海南陵水
 HNNF-P002,隆耘父本1号,Oryza sativa,海南三亚
+HNNF-P003,隆耘母本2号,Oryza sativa,海南乐东
+HNNF-P004,隆耘父本2号,Oryza sativa,海南陵水

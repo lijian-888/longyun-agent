@@ -28,6 +28,9 @@ const EMPTY_METADATA = {
   publicationYear: "",
   sourceUrl: "",
   description: "",
+  authorizationBasis: "",
+  licenseScope: "公开资料",
+  topicTags: "",
   versionChangeSummary: "",
 };
 
@@ -284,6 +287,9 @@ export default function KnowledgeLibrary({ adminMode = false, onNotice = () => {
       publicationYear: nextVersionTarget.publication_year || "",
       sourceUrl: nextVersionTarget.source_url || "",
       description: nextVersionTarget.short_description || "",
+      authorizationBasis: nextVersionTarget.authorization_basis || "",
+      licenseScope: nextVersionTarget.license_scope || "公开资料",
+      topicTags: (nextVersionTarget.topic_tags || []).join("，"),
       versionChangeSummary: "",
     } : EMPTY_METADATA);
     setUploadDialogOpen(true);
@@ -316,6 +322,10 @@ export default function KnowledgeLibrary({ adminMode = false, onNotice = () => {
       onNotice("公共资料发布前需要填写来源单位，便于科研引用溯源。");
       return;
     }
+    if (isPublic && (!metadata.authorizationBasis.trim() || !metadata.licenseScope.trim())) {
+      onNotice("公共资料必须填写授权依据和授权范围，未核验授权的资料不能发布。");
+      return;
+    }
     if (versionTarget && !metadata.versionChangeSummary.trim()) {
       onNotice("上传公共资料新版本时，请说明本次新增或修改的内容。");
       return;
@@ -332,6 +342,9 @@ export default function KnowledgeLibrary({ adminMode = false, onNotice = () => {
         ...(metadata.publicationYear.trim() ? { publication_year: metadata.publicationYear.trim() } : {}),
         ...(metadata.sourceUrl.trim() ? { source_url: metadata.sourceUrl.trim() } : {}),
         ...(metadata.description.trim() ? { short_description: metadata.description.trim() } : {}),
+        ...(metadata.authorizationBasis.trim() ? { authorization_basis: metadata.authorizationBasis.trim() } : {}),
+        ...(metadata.licenseScope.trim() ? { license_scope: metadata.licenseScope.trim() } : {}),
+        ...(metadata.topicTags.trim() ? { topic_tags: metadata.topicTags.trim() } : {}),
         ...(versionTarget ? { supersedes_document_id: versionTarget.id } : {}),
         ...(versionTarget ? { version_change_summary: metadata.versionChangeSummary.trim() } : {}),
       });
@@ -362,6 +375,9 @@ export default function KnowledgeLibrary({ adminMode = false, onNotice = () => {
           publication_year: editing.publication_year || "",
           source_url: editing.source_url || "",
           short_description: editing.short_description || "",
+          authorization_basis: editing.authorization_basis || "",
+          license_scope: editing.license_scope || "",
+          topic_tags: editing.topic_tags || [],
         }),
       });
       setEditing(null);
@@ -409,6 +425,16 @@ export default function KnowledgeLibrary({ adminMode = false, onNotice = () => {
       onNotice("公共资料已撤回。");
     } catch (error) {
       onNotice(error.message || "资料撤回失败。");
+    }
+  }
+
+  async function syncInstitutionLiterature() {
+    try {
+      const result = await request("/api/knowledge/sync-institution-literature", { method: "POST" });
+      await load(scope, true);
+      onNotice(`已从机构数据导入层新增 ${result.created_count} 份待核验资料，跳过 ${result.skipped_count} 份空内容或重复资料。`);
+    } catch (error) {
+      onNotice(error.message || "无法同步机构导入的文献资料。");
     }
   }
 
@@ -478,6 +504,7 @@ export default function KnowledgeLibrary({ adminMode = false, onNotice = () => {
           <div>
             <span className="knowledge-content-count">{isPublic ? `公共资料 ${summary?.public_published_count ?? 0} 份` : `我的资料 ${summary?.private_document_count ?? 0} 份 · ${formatSize(summary?.private_size_bytes || 0)}`}</span>
             <button className="icon-button" type="button" title="刷新资料目录" onClick={() => load(scope, true)}><RefreshCw size={17} /></button>
+            {showAdministration && <button className="secondary-button" type="button" onClick={syncInstitutionLiterature}><RefreshCw size={15} />同步机构文献</button>}
             {(!isPublic || showAdministration) && <button className="primary-button" type="button" onClick={() => openUploadDialog()}><Upload size={16} />上传资料</button>}
           </div>
         </header>
@@ -526,7 +553,7 @@ export default function KnowledgeLibrary({ adminMode = false, onNotice = () => {
       <label className="knowledge-upload-dropzone"><input ref={fileInputRef} hidden type="file" multiple={!versionTarget} accept={ACCEPTED_FILES} onChange={selectUploadFiles} /><Upload size={22} /><strong>{pendingUploadFiles.length ? `已选择 ${pendingUploadFiles.length} 个文件` : "拖放文件至此处，或点击选择"}</strong><span>支持 PDF、Excel、Word、PPT 和文本资料，单文件不超过 100 MB</span></label>
       {pendingUploadFiles.length > 0 && <div className="knowledge-selected-files">{pendingUploadFiles.map((file) => <span key={`${file.name}-${file.lastModified}`}><FileText size={14} />{file.name}<small>{formatSize(file.size)}</small></span>)}</div>}
       <label>存入分类<select value={versionTarget?.folder_id || selectedFolderId} disabled={Boolean(versionTarget)} onChange={(event) => setSelectedFolderId(event.target.value)} required={isPublic}><option value="">{isPublic ? "请选择公共资料分类" : "未分类"}</option>{folders.map((folder) => <option key={folder.id} value={folder.id}>{folder.folder_name}</option>)}</select></label>
-      <details className="knowledge-optional-metadata"><summary>补充资料信息{isPublic ? "（来源单位必填）" : "（可选）"}</summary><div><label>来源单位{isPublic && <b> *</b>}<input value={metadata.sourceOrganization} onChange={(event) => setMetadata({ ...metadata, sourceOrganization: event.target.value })} /></label><label>作者<input value={metadata.author} onChange={(event) => setMetadata({ ...metadata, author: event.target.value })} /></label><label>发表年份<input value={metadata.publicationYear} onChange={(event) => setMetadata({ ...metadata, publicationYear: event.target.value })} /></label><label>来源链接<input value={metadata.sourceUrl} onChange={(event) => setMetadata({ ...metadata, sourceUrl: event.target.value })} /></label><label className="knowledge-metadata-wide">解析摘要或备注<textarea value={metadata.description} onChange={(event) => setMetadata({ ...metadata, description: event.target.value })} /></label>{versionTarget && <label className="knowledge-metadata-wide">本次版本新增或修改内容<b> *</b><textarea value={metadata.versionChangeSummary} required onChange={(event) => setMetadata({ ...metadata, versionChangeSummary: event.target.value })} /></label>}</div></details>
+      <details className="knowledge-optional-metadata" open={isPublic}><summary>补充资料信息{isPublic ? "（来源与授权必填）" : "（可选）"}</summary><div><label>来源单位{isPublic && <b> *</b>}<input value={metadata.sourceOrganization} onChange={(event) => setMetadata({ ...metadata, sourceOrganization: event.target.value })} /></label><label>作者<input value={metadata.author} onChange={(event) => setMetadata({ ...metadata, author: event.target.value })} /></label><label>发表年份<input value={metadata.publicationYear} onChange={(event) => setMetadata({ ...metadata, publicationYear: event.target.value })} /></label><label>来源链接<input value={metadata.sourceUrl} onChange={(event) => setMetadata({ ...metadata, sourceUrl: event.target.value })} /></label>{isPublic && <><label>授权范围<b> *</b><select value={metadata.licenseScope} onChange={(event) => setMetadata({ ...metadata, licenseScope: event.target.value })}><option value="公开资料">公开资料</option><option value="合法授权资料">合法授权资料</option><option value="限本课题授权资料">限本课题授权资料</option></select></label><label className="knowledge-metadata-wide">授权依据<b> *</b><textarea value={metadata.authorizationBasis} onChange={(event) => setMetadata({ ...metadata, authorizationBasis: event.target.value })} placeholder="例如：政府官网公开发布；或授权单位、授权日期和使用范围" /></label><label className="knowledge-metadata-wide">主题标签<input value={metadata.topicTags} onChange={(event) => setMetadata({ ...metadata, topicTags: event.target.value })} placeholder="品种，基因，性状，育种目标" /></label></>}<label className="knowledge-metadata-wide">解析摘要或备注<textarea value={metadata.description} onChange={(event) => setMetadata({ ...metadata, description: event.target.value })} /></label>{versionTarget && <label className="knowledge-metadata-wide">本次版本新增或修改内容<b> *</b><textarea value={metadata.versionChangeSummary} required onChange={(event) => setMetadata({ ...metadata, versionChangeSummary: event.target.value })} /></label>}</div></details>
       <footer><span>上传后系统将自动启动本地解析，通常需要 1 至 3 分钟。</span><div><button type="button" className="secondary-button" onClick={closeUploadDialog}>取消</button><button type="submit" className="primary-button" disabled={uploading}>{uploading ? "正在保存" : "确认上传"}</button></div></footer>
     </form></div>}
 
@@ -535,13 +562,14 @@ export default function KnowledgeLibrary({ adminMode = false, onNotice = () => {
       <div className="knowledge-detail-file"><span className="knowledge-file-icon"><FileText size={22} /></span><div><strong>{detailDocument.display_title}</strong><small>{detailDocument.original_file_name}</small></div></div>
       <dl className="knowledge-detail-metadata"><div><dt>所属分类</dt><dd>{detailDocument.folder_name || "未分类"}</dd></div><div><dt>来源单位</dt><dd>{detailDocument.source_organization || "未填写"}</dd></div><div><dt>作者</dt><dd>{detailDocument.author || "未填写"}</dd></div><div><dt>发表年份</dt><dd>{detailDocument.publication_year || "未填写"}</dd></div><div><dt>最近更新</dt><dd>{formatDateTime(detailDocument.updated_at)}</dd></div><div><dt>解析状态</dt><dd><span className={`knowledge-status ${documentTone(detailDocument)}`}>{statusLabel(detailDocument)}</span></dd></div></dl>
       {detailDocument.short_description && <section className="knowledge-detail-summary"><strong>解析摘要</strong><p>{detailDocument.short_description}</p></section>}
+      {detailDocument.scope === "public" && <section className="knowledge-detail-summary"><strong>授权与引用边界</strong><p>{detailDocument.license_scope || "未填写授权范围"} · {detailDocument.authorization_basis || "未填写授权依据"}</p>{detailDocument.topic_tags?.length > 0 && <p>主题标签：{detailDocument.topic_tags.join("、")}</p>}</section>}
       {detailDocument.version_change_summary && <section className="knowledge-detail-summary"><strong>版本说明</strong><p>{detailDocument.version_change_summary}</p></section>}
       <section className="knowledge-detail-reference"><CheckCircle2 size={16} /><span>助手仅在回答中展示命中的证据片段和资料来源，不开放原文阅读或下载。</span></section>
       {showAdministration && <div className="knowledge-detail-admin"><button type="button" className="secondary-button" onClick={() => openPreview(detailDocument)}><FileSearch size={15} />核验本地解析</button></div>}
       <footer>不提供原文下载</footer>
     </aside></div>}
 
-    {editing && <div className="knowledge-modal-backdrop" onMouseDown={() => setEditing(null)}><form className="knowledge-modal" onSubmit={saveMetadata} onMouseDown={(event) => event.stopPropagation()}><header><div><p>只维护资料目录信息，不改变原始文件。</p><h3>编辑资料</h3></div><button className="icon-button" type="button" onClick={() => setEditing(null)}><X size={17} /></button></header><label>显示标题<input value={editing.display_title} required onChange={(event) => setEditing({ ...editing, display_title: event.target.value })} /></label><label>资料分类<select value={editing.folder_id || ""} onChange={(event) => setEditing({ ...editing, folder_id: event.target.value || null })} required={editing.scope === "public"}><option value="">{editing.scope === "public" ? "请选择资料分类" : "未分类"}</option>{folders.map((folder) => <option key={folder.id} value={folder.id}>{folder.folder_name}</option>)}</select></label><label>来源单位<input value={editing.source_organization || ""} onChange={(event) => setEditing({ ...editing, source_organization: event.target.value })} /></label><label>作者<input value={editing.author || ""} onChange={(event) => setEditing({ ...editing, author: event.target.value })} /></label><label>年份<input value={editing.publication_year || ""} onChange={(event) => setEditing({ ...editing, publication_year: event.target.value })} /></label><label>来源链接<input value={editing.source_url || ""} onChange={(event) => setEditing({ ...editing, source_url: event.target.value })} /></label><label>摘要说明<textarea value={editing.short_description || ""} onChange={(event) => setEditing({ ...editing, short_description: event.target.value })} /></label><footer><button type="button" className="secondary-button" onClick={() => setEditing(null)}>取消</button><button type="submit" className="primary-button">保存资料目录</button></footer></form></div>}
+    {editing && <div className="knowledge-modal-backdrop" onMouseDown={() => setEditing(null)}><form className="knowledge-modal" onSubmit={saveMetadata} onMouseDown={(event) => event.stopPropagation()}><header><div><p>只维护资料目录信息，不改变原始文件。</p><h3>编辑资料</h3></div><button className="icon-button" type="button" onClick={() => setEditing(null)}><X size={17} /></button></header><label>显示标题<input value={editing.display_title} required onChange={(event) => setEditing({ ...editing, display_title: event.target.value })} /></label><label>资料分类<select value={editing.folder_id || ""} onChange={(event) => setEditing({ ...editing, folder_id: event.target.value || null })} required={editing.scope === "public"}><option value="">{editing.scope === "public" ? "请选择资料分类" : "未分类"}</option>{folders.map((folder) => <option key={folder.id} value={folder.id}>{folder.folder_name}</option>)}</select></label><label>来源单位<input value={editing.source_organization || ""} onChange={(event) => setEditing({ ...editing, source_organization: event.target.value })} /></label><label>作者<input value={editing.author || ""} onChange={(event) => setEditing({ ...editing, author: event.target.value })} /></label><label>年份<input value={editing.publication_year || ""} onChange={(event) => setEditing({ ...editing, publication_year: event.target.value })} /></label><label>来源链接<input value={editing.source_url || ""} onChange={(event) => setEditing({ ...editing, source_url: event.target.value })} /></label>{editing.scope === "public" && <><label>授权范围<input value={editing.license_scope || ""} required onChange={(event) => setEditing({ ...editing, license_scope: event.target.value })} /></label><label>授权依据<textarea value={editing.authorization_basis || ""} required onChange={(event) => setEditing({ ...editing, authorization_basis: event.target.value })} /></label><label>主题标签<input value={(editing.topic_tags || []).join("，")} onChange={(event) => setEditing({ ...editing, topic_tags: event.target.value.split(/[，,；;]/).map((item) => item.trim()).filter(Boolean) })} /></label></>}<label>摘要说明<textarea value={editing.short_description || ""} onChange={(event) => setEditing({ ...editing, short_description: event.target.value })} /></label><footer><button type="button" className="secondary-button" onClick={() => setEditing(null)}>取消</button><button type="submit" className="primary-button">保存资料目录</button></footer></form></div>}
 
     {editingFolder && <div className="knowledge-modal-backdrop" onMouseDown={() => setEditingFolder(null)}><form className="knowledge-modal" onSubmit={saveFolder} onMouseDown={(event) => event.stopPropagation()}><header><div><p>不改变资料原文，只维护目录结构。</p><h3>编辑资料分类</h3></div><button className="icon-button" type="button" onClick={() => setEditingFolder(null)}><X size={17} /></button></header><label>分类名称<input value={editingFolder.folder_name} required onChange={(event) => setEditingFolder({ ...editingFolder, folder_name: event.target.value })} /></label><label>上级分类<select value={editingFolder.parent_id || ""} onChange={(event) => setEditingFolder({ ...editingFolder, parent_id: event.target.value || null })}><option value="">顶级分类</option>{folders.filter((folder) => folder.id !== editingFolder.id).map((folder) => <option key={folder.id} value={folder.id}>{folder.folder_name}</option>)}</select></label><label>说明<textarea value={editingFolder.description || ""} onChange={(event) => setEditingFolder({ ...editingFolder, description: event.target.value })} /></label><footer><button type="button" className="secondary-button" onClick={() => setEditingFolder(null)}>取消</button><button type="submit" className="primary-button">保存分类</button></footer></form></div>}
 
