@@ -25,7 +25,7 @@ from statsmodels.stats.multicomp import pairwise_tukeyhsd
 
 
 ANALYSIS_ENGINE_NAME = "本地统计引擎（statsmodels）"
-ANALYSIS_VERSION = "rcbd-v1.0"
+ANALYSIS_VERSION = "rcbd-v1.1"
 STANDARD_TREATMENT = "M1"
 HIGH_NITROGEN_TREATMENT = "M2"
 
@@ -218,7 +218,7 @@ def quality_check_from_records(records: list[dict[str, Any]], trial_structures: 
         for item in metadata.get("issues", []) if isinstance(metadata, dict) else []:
             structure_issues.append(f"{trial.get('trial_code') or trial.get('trial_id')}：{item}")
     return {
-        "status": "passed" if not missing and not structure_issues else "passed_with_warnings",
+        "status": "passed" if not missing and not outliers and not structure_issues else "passed_with_warnings",
         "method": "空值检查 + 按性状 IQR(1.5×四分位距) 疑似异常值检查 + 试验设计校验状态复核",
         "record_count": len(records),
         "missing_value_count": len(missing),
@@ -231,9 +231,13 @@ def quality_check_from_records(records: list[dict[str, Any]], trial_structures: 
     }
 
 
-def _package_quality_check(session: Session, package_id: str) -> dict[str, Any]:
+def _package_quality_check(
+    session: Session,
+    package_id: str,
+    source_trial_ids: list[str] | None = None,
+) -> dict[str, Any]:
     records = [dict(row) for row in session.execute(text("""
-        SELECT observation.trait_code, observation.value_numeric, observation.source_locator
+        SELECT trial.id AS trial_id, observation.trait_code, observation.value_numeric, observation.source_locator
         FROM field_trial trial
         JOIN trial_entry entry ON entry.trial_id=trial.id
         JOIN trial_phenotype_observation observation ON observation.entry_id=entry.id
@@ -243,7 +247,17 @@ def _package_quality_check(session: Session, package_id: str) -> dict[str, Any]:
         SELECT id AS trial_id, trial_code, design_validation_status, design_metadata
         FROM field_trial WHERE package_id=:package_id AND data_status='published'
     """), {"package_id": package_id}).mappings()]
-    return quality_check_from_records(records, trial_structures)
+    selected_ids = {str(item) for item in (source_trial_ids or []) if item}
+    if selected_ids:
+        records = [item for item in records if str(item.get("trial_id")) in selected_ids]
+        trial_structures = [item for item in trial_structures if str(item.get("trial_id")) in selected_ids]
+    result = quality_check_from_records(records, trial_structures)
+    result["scope"] = {
+        "package_id": package_id,
+        "source_trial_ids": sorted(selected_ids) if selected_ids else [str(item.get("trial_id")) for item in trial_structures],
+        "description": "质量检查范围与本次分析使用的已发布试验一致；疑似异常值保留并提供原始定位。",
+    }
+    return result
 
 
 def _find_site(data: pd.DataFrame, question: str) -> str | None:
@@ -685,6 +699,8 @@ def run_controlled_trial_analysis(session: Session, package: dict[str, Any], que
             "本地统计引擎未能完成该分析。请确认已发布区域试验资料包完整，"
             "并检查试验设计、区组、材料、处理及观测值是否满足统计条件。"
         ) from exc
-    analysis["quality_check"] = _package_quality_check(session, str(package["id"]))
+    analysis["quality_check"] = _package_quality_check(
+        session, str(package["id"]), analysis.get("source_trial_ids") or [],
+    )
     run_id = _record_run(session, str(package["id"]), analysis, question, requested_by)
     return {**_native(analysis), "analysis_run_id": run_id, "engine": ANALYSIS_ENGINE_NAME, "analysis_version": ANALYSIS_VERSION}

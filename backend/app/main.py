@@ -139,6 +139,7 @@ from .breeding_dossier import (
     seed_mock_breeding_dossiers,
 )
 from .breeding_intelligence import (
+    DEFAULT_RECOMMENDATION_FILTERS,
     DEFAULT_RECOMMENDATION_WEIGHTS,
     _json_safe as intelligence_json_safe,
     build_intelligence_pdf,
@@ -2170,15 +2171,30 @@ class GermplasmAnalysisRequest(BaseModel):
     material_key: str = Field(min_length=1, max_length=300)
 
 
+class ParentRecommendationFilterSettings(BaseModel):
+    exclude_common_parent: bool = False
+    minimum_evidence_coverage: float = Field(default=0.0, ge=0, le=1)
+    minimum_confidence: Literal["低", "中", "高"] = "低"
+    required_dimensions: list[Literal[
+        "yield", "stability", "lodging", "disease", "complementarity", "quality", "pedigree", "genotype",
+    ]] = Field(default_factory=list, max_length=8)
+
+
 class ParentRecommendationRequest(BaseModel):
     candidate_keys: list[str] = Field(min_length=2, max_length=30)
     breeding_goal: str = Field(min_length=2, max_length=1000)
     constraints: list[str] = Field(default_factory=list, max_length=30)
     weights: dict[str, float] | None = None
+    filter_settings: ParentRecommendationFilterSettings | None = None
+    sort_mode: Literal["score", "evidence_coverage", "confidence"] | None = None
 
 
 class ParentRecommendationRuleUpdate(BaseModel):
     weights: dict[str, float] = Field(default_factory=lambda: dict(DEFAULT_RECOMMENDATION_WEIGHTS))
+    filter_settings: ParentRecommendationFilterSettings = Field(
+        default_factory=lambda: ParentRecommendationFilterSettings(**DEFAULT_RECOMMENDATION_FILTERS)
+    )
+    sort_mode: Literal["score", "evidence_coverage", "confidence"] = "score"
     rule_note: str = Field(default="", max_length=2000)
 
 
@@ -3193,6 +3209,7 @@ def put_parent_recommendation_rules(
     try:
         result = update_recommendation_rule(
             session, active_project_id(session), payload.weights, payload.rule_note, user.id,
+            filter_settings=payload.filter_settings.model_dump(), sort_mode=payload.sort_mode,
         )
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
@@ -3221,6 +3238,12 @@ def create_parent_recommendations(
         if unknown:
             raise HTTPException(422, f"未知权重维度：{'、'.join(unknown)}。")
         weights.update({key: float(value) for key, value in payload.weights.items()})
+    filter_settings = (
+        payload.filter_settings.model_dump()
+        if payload.filter_settings is not None
+        else dict(rule.get("filter_settings") or DEFAULT_RECOMMENDATION_FILTERS)
+    )
+    sort_mode = payload.sort_mode or str(rule.get("sort_mode") or "score")
     try:
         result = run_parent_recommendation(
             INSTITUTION_DATABASES.engine(config.business_database),
@@ -3230,6 +3253,8 @@ def create_parent_recommendations(
             weights,
             payload.breeding_goal,
             payload.constraints,
+            filter_settings,
+            sort_mode,
         )
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
@@ -3307,6 +3332,46 @@ def get_trial_analysis_packages(
         ORDER BY package.created_at DESC
     """), {"project_id": active_project_id(session)}).mappings().all()
     return [intelligence_json_safe(dict(row)) for row in rows]
+
+
+@app.get("/api/research/trial-analysis/packages/{package_id}/options")
+def get_trial_analysis_package_options(
+    package_id: str,
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> dict[str, Any]:
+    package_exists = session.execute(text("""
+        SELECT 1 FROM trial_data_package
+        WHERE id=:package_id AND project_id=:project_id AND governance_status='published'
+    """), {"package_id": package_id, "project_id": active_project_id(session)}).scalar_one_or_none()
+    if not package_exists:
+        raise HTTPException(404, "所选区域试验资料包不存在、未发布或不属于当前课题。")
+    trials = session.execute(text("""
+        SELECT DISTINCT trial.trial_year, site.site_code, site.site_name
+        FROM field_trial trial JOIN trial_site site ON site.id=trial.site_id
+        WHERE trial.package_id=:package_id AND trial.data_status='published'
+        ORDER BY trial.trial_year, site.site_name
+    """), {"package_id": package_id}).mappings().all()
+    materials = session.execute(text("""
+        SELECT DISTINCT material.material_code, material.material_name, material.is_check
+        FROM field_trial trial
+        JOIN trial_entry entry ON entry.trial_id=trial.id
+        JOIN breeding_material material ON material.id=entry.material_id
+        WHERE trial.package_id=:package_id AND trial.data_status='published'
+        ORDER BY material.material_code
+    """), {"package_id": package_id}).mappings().all()
+    treatments = session.execute(text("""
+        SELECT DISTINCT treatment.treatment_code, treatment.treatment_name
+        FROM field_trial trial JOIN trial_treatment treatment ON treatment.trial_id=trial.id
+        WHERE trial.package_id=:package_id AND trial.data_status='published'
+        ORDER BY treatment.treatment_code
+    """), {"package_id": package_id}).mappings().all()
+    return intelligence_json_safe({
+        "years": sorted({int(item["trial_year"]) for item in trials}),
+        "sites": [dict(item) for item in trials],
+        "materials": [dict(item) for item in materials],
+        "treatments": [dict(item) for item in treatments],
+    })
 
 
 def _controlled_trial_question(payload: ControlledTrialAnalysisRequest) -> str:

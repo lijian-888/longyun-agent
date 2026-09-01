@@ -425,7 +425,13 @@ body:has(.research-shell), body:has(.assistant-loading), body:has(.auth-error) {
 .workspace-card p { color: #617b71; line-height: 1.6; }
 .control-card { display: flex; align-items: end; gap: 12px; }
 .control-card label, .recommendation-form > label, .trial-analysis-form label { display: grid; flex: 1; gap: 6px; color: #526f64; font-size: 12px; }
-.control-card select, .recommendation-form input, .recommendation-form textarea, .trial-analysis-form input, .trial-analysis-form select { min-width: 0; border: 1px solid #cbdcd4; border-radius: 5px; padding: 9px 10px; color: #294f42; background: #fff; }
+.control-card select, .recommendation-form input, .recommendation-form textarea, .recommendation-form select, .trial-analysis-form input, .trial-analysis-form select { min-width: 0; border: 1px solid #cbdcd4; border-radius: 5px; padding: 9px 10px; color: #294f42; background: #fff; }
+.recommendation-settings { display: grid; gap: 8px; padding: 12px; border: 1px solid #d7e5df; border-radius: 7px; background: #f8fbf9; }
+.recommendation-settings h3, .recommendation-settings p { margin: 0; }
+.dimension-check-grid, .weight-input-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.dimension-check-grid label, .inline-check { display: flex !important; align-items: center; gap: 7px; color: #35584d; font-size: 12px; }
+.dimension-check-grid input, .inline-check input { min-width: auto; padding: 0; }
+.weight-input-grid label { display: grid; gap: 4px; color: #526f64; font-size: 12px; }
 .recommendation-form textarea { min-height: 65px; resize: vertical; }
 .workspace-card .primary-button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; }
 .workspace-error, .workspace-warning { display: flex; align-items: flex-start; gap: 9px; margin-top: 13px; border: 1px solid #e8c79c; border-radius: 6px; padding: 12px 14px; color: #85591f; background: #fff9ef; font-size: 13px; }
@@ -469,5 +475,5 @@ body:has(.research-shell), body:has(.assistant-loading), body:has(.auth-error) {
 .parameter-grid { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 9px; }
 .trial-analysis-form .primary-button { justify-self: start; }
 .analysis-chart img { display: block; width: min(100%, 900px); max-height: 500px; object-fit: contain; margin: 0 auto; }
-@media (max-width: 800px) { .material-check-grid, .weight-grid, .parameter-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }.trial-analysis-form { grid-template-columns: 1fr; }.parameter-grid { grid-column: auto; }.analysis-summary { align-items: flex-start; }.intelligence-workspace { width: calc(100% - 24px); } }
+@media (max-width: 800px) { .material-check-grid, .weight-grid, .parameter-grid, .dimension-check-grid, .weight-input-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }.trial-analysis-form { grid-template-columns: 1fr; }.parameter-grid { grid-column: auto; }.analysis-summary { align-items: flex-start; }.intelligence-workspace { width: calc(100% - 24px); } }
 @media (max-width: 520px) { .material-check-grid, .weight-grid, .parameter-grid { grid-template-columns: 1fr; }.control-card, .analysis-summary, .recommendation-results > header { display: grid; }.workspace-hero > svg { display: none; } }

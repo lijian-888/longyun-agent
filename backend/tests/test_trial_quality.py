@@ -16,6 +16,7 @@ class TrialQualityCheckTests(unittest.TestCase):
         }])
         self.assertEqual(result["missing_value_count"], 1)
         self.assertEqual(result["outlier_count"], 1)
+        self.assertEqual(result["status"], "passed_with_warnings")
         self.assertGreaterEqual(result["structure_issue_count"], 2)
         self.assertIn("不自动删除", result["outliers"][0]["message"])
 

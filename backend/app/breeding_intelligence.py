@@ -12,6 +12,7 @@ import csv
 import io
 import json
 import math
+import re
 import statistics
 import uuid
 from collections import defaultdict
@@ -33,7 +34,7 @@ from sqlalchemy.orm import Session
 
 
 ANALYSIS_VERSION = "longyun-germplasm-evidence-v1.0"
-RECOMMENDATION_VERSION = "longyun-parent-auxiliary-v1.0"
+RECOMMENDATION_VERSION = "longyun-parent-auxiliary-v1.1"
 DEFAULT_RECOMMENDATION_WEIGHTS: dict[str, float] = {
     "yield": 25.0,
     "stability": 20.0,
@@ -44,6 +45,24 @@ DEFAULT_RECOMMENDATION_WEIGHTS: dict[str, float] = {
     "pedigree": 10.0,
     "genotype": 5.0,
 }
+DEFAULT_RECOMMENDATION_FILTERS: dict[str, Any] = {
+    "exclude_common_parent": False,
+    "minimum_evidence_coverage": 0.0,
+    "minimum_confidence": "低",
+    "required_dimensions": [],
+}
+RECOMMENDATION_SORT_MODES = frozenset({"score", "evidence_coverage", "confidence"})
+RECOMMENDATION_DIMENSION_LABELS = {
+    "yield": "产量",
+    "stability": "稳定性",
+    "lodging": "抗倒伏",
+    "disease": "抗病",
+    "complementarity": "株高/生育期互补",
+    "quality": "品质",
+    "pedigree": "系谱",
+    "genotype": "基因型遗传距离",
+}
+CONFIDENCE_RANK = {"低": 0, "中": 1, "高": 2}
 
 
 def _json_safe(value: Any) -> Any:
@@ -86,12 +105,16 @@ def ensure_breeding_intelligence_schema(session: Session) -> None:
         CREATE TABLE IF NOT EXISTS parent_recommendation_rule (
           project_id VARCHAR(36) PRIMARY KEY,
           weights JSONB NOT NULL,
+          filter_settings JSONB NOT NULL DEFAULT '{}'::jsonb,
+          sort_mode VARCHAR(40) NOT NULL DEFAULT 'score',
           rule_note TEXT NOT NULL DEFAULT '',
           version INTEGER NOT NULL DEFAULT 1,
           updated_by VARCHAR(120) NOT NULL,
           updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
     """))
+    session.execute(text("ALTER TABLE parent_recommendation_rule ADD COLUMN IF NOT EXISTS filter_settings JSONB NOT NULL DEFAULT '{}'::jsonb"))
+    session.execute(text("ALTER TABLE parent_recommendation_rule ADD COLUMN IF NOT EXISTS sort_mode VARCHAR(40) NOT NULL DEFAULT 'score'"))
     session.execute(text("""
         CREATE TABLE IF NOT EXISTS parent_recommendation_run (
           id VARCHAR(36) PRIMARY KEY,
@@ -405,19 +428,55 @@ def get_material_analysis_run(session: Session, run_id: str, owner_id: str, proj
 
 def get_recommendation_rule(session: Session, project_id: str) -> dict[str, Any]:
     row = session.execute(text("""
-        SELECT weights, rule_note, version, updated_by, updated_at
+        SELECT weights, filter_settings, sort_mode, rule_note, version, updated_by, updated_at
         FROM parent_recommendation_rule WHERE project_id=:project_id
     """), {"project_id": project_id}).mappings().first()
     if not row:
         return {
             "project_id": project_id,
             "weights": DEFAULT_RECOMMENDATION_WEIGHTS,
+            "filter_settings": DEFAULT_RECOMMENDATION_FILTERS,
+            "sort_mode": "score",
             "rule_note": "默认辅助推荐权重；缺失的证据维度不参与得分并降低可信程度。",
             "version": 1,
             "updated_by": "system-default",
             "updated_at": None,
         }
-    return {"project_id": project_id, **_json_safe(dict(row))}
+    result = {"project_id": project_id, **_json_safe(dict(row))}
+    result["filter_settings"] = _normalize_filter_settings(result.get("filter_settings"))
+    if result.get("sort_mode") not in RECOMMENDATION_SORT_MODES:
+        result["sort_mode"] = "score"
+    return result
+
+
+def _validate_weights(weights: dict[str, float]) -> dict[str, float]:
+    unknown = sorted(set(weights) - set(DEFAULT_RECOMMENDATION_WEIGHTS))
+    if unknown:
+        raise ValueError(f"未知权重维度：{'、'.join(unknown)}。")
+    merged = {**DEFAULT_RECOMMENDATION_WEIGHTS, **{key: float(value) for key, value in weights.items()}}
+    if any(not math.isfinite(value) or value < 0 or value > 100 for value in merged.values()) or sum(merged.values()) <= 0:
+        raise ValueError("各项权重必须是 0–100 之间的有限数值，且总和必须大于 0。")
+    return merged
+
+
+def _normalize_filter_settings(settings: dict[str, Any] | None) -> dict[str, Any]:
+    raw = {**DEFAULT_RECOMMENDATION_FILTERS, **(settings or {})}
+    coverage = _number(raw.get("minimum_evidence_coverage"))
+    if coverage is None or coverage < 0 or coverage > 1:
+        raise ValueError("最低证据覆盖率必须在 0–1 之间。")
+    confidence = str(raw.get("minimum_confidence") or "低")
+    if confidence not in CONFIDENCE_RANK:
+        raise ValueError("最低可信程度只能是低、中或高。")
+    dimensions = list(dict.fromkeys(str(item).strip() for item in (raw.get("required_dimensions") or []) if str(item).strip()))
+    unknown = sorted(set(dimensions) - set(DEFAULT_RECOMMENDATION_WEIGHTS))
+    if unknown:
+        raise ValueError(f"未知必需证据维度：{'、'.join(unknown)}。")
+    return {
+        "exclude_common_parent": bool(raw.get("exclude_common_parent")),
+        "minimum_evidence_coverage": float(coverage),
+        "minimum_confidence": confidence,
+        "required_dimensions": dimensions,
+    }
 
 
 def update_recommendation_rule(
@@ -426,23 +485,26 @@ def update_recommendation_rule(
     weights: dict[str, float],
     rule_note: str,
     updated_by: str,
+    filter_settings: dict[str, Any] | None = None,
+    sort_mode: str = "score",
 ) -> dict[str, Any]:
-    unknown = sorted(set(weights) - set(DEFAULT_RECOMMENDATION_WEIGHTS))
-    if unknown:
-        raise ValueError(f"未知权重维度：{'、'.join(unknown)}。")
-    merged = {**DEFAULT_RECOMMENDATION_WEIGHTS, **{key: float(value) for key, value in weights.items()}}
-    if any(value < 0 or value > 100 for value in merged.values()) or sum(merged.values()) <= 0:
-        raise ValueError("各项权重必须在 0–100 之间，且总和必须大于 0。")
+    merged = _validate_weights(weights)
+    normalized_filters = _normalize_filter_settings(filter_settings)
+    if sort_mode not in RECOMMENDATION_SORT_MODES:
+        raise ValueError("排序方式只能是综合评分、证据覆盖率或可信程度。")
     session.execute(text("""
-        INSERT INTO parent_recommendation_rule(project_id, weights, rule_note, version, updated_by)
-        VALUES (:project_id, CAST(:weights AS jsonb), :rule_note, 1, :updated_by)
+        INSERT INTO parent_recommendation_rule(project_id, weights, filter_settings, sort_mode, rule_note, version, updated_by)
+        VALUES (:project_id, CAST(:weights AS jsonb), CAST(:filter_settings AS jsonb), :sort_mode, :rule_note, 1, :updated_by)
         ON CONFLICT (project_id) DO UPDATE SET
-          weights=EXCLUDED.weights, rule_note=EXCLUDED.rule_note,
+          weights=EXCLUDED.weights, filter_settings=EXCLUDED.filter_settings,
+          sort_mode=EXCLUDED.sort_mode, rule_note=EXCLUDED.rule_note,
           version=parent_recommendation_rule.version + 1,
           updated_by=EXCLUDED.updated_by, updated_at=now()
     """), {
         "project_id": project_id,
         "weights": json.dumps(merged, ensure_ascii=False),
+        "filter_settings": json.dumps(normalized_filters, ensure_ascii=False),
+        "sort_mode": sort_mode,
         "rule_note": rule_note.strip(),
         "updated_by": updated_by,
     })
@@ -537,24 +599,103 @@ def _normalize(value: float, low: float, high: float, inverse: bool = False) -> 
     return max(0.0, min(1.0, 1.0 - result if inverse else result))
 
 
+def _apply_text_constraints(
+    constraints: list[str],
+    weights: dict[str, float],
+    filter_settings: dict[str, Any],
+) -> tuple[dict[str, float], dict[str, Any], list[str], list[str], dict[str, float]]:
+    """Translate a small, explicit constraint vocabulary into deterministic rules.
+
+    Anything outside this vocabulary is returned for manual review instead of
+    being silently claimed as applied.
+    """
+    applied: list[str] = []
+    manual_review: list[str] = []
+    adjusted_weights = dict(weights)
+    settings = dict(filter_settings)
+    required = list(settings.get("required_dimensions") or [])
+    weight_adjustments: dict[str, float] = {}
+    dimension_terms = {
+        "yield": ("产量", "高产"),
+        "stability": ("稳定", "稳产"),
+        "lodging": ("抗倒伏", "倒伏"),
+        "disease": ("抗病", "病害", "稻瘟"),
+        "complementarity": ("互补", "株高", "生育期"),
+        "quality": ("品质", "米质"),
+        "pedigree": ("系谱",),
+        "genotype": ("基因型", "遗传距离"),
+    }
+    for constraint in constraints:
+        compact = constraint.replace(" ", "")
+        recognized = False
+        if any(term in compact for term in ("避免共同亲本", "排除共同亲本", "无共同亲本", "避免近缘", "排除近缘")):
+            settings["exclude_common_parent"] = True
+            applied.append(f"已自动执行：{constraint}（排除现有系谱显示共同亲本的组合）")
+            recognized = True
+        coverage_match = re.search(r"(?:证据覆盖|覆盖率)(?:至少|不低于|>=?)?\s*(\d{1,3})\s*%", constraint)
+        if coverage_match:
+            coverage = int(coverage_match.group(1)) / 100
+            if coverage > 1:
+                raise ValueError("限制条件中的证据覆盖率不能超过 100%。")
+            settings["minimum_evidence_coverage"] = max(float(settings["minimum_evidence_coverage"]), coverage)
+            applied.append(f"已自动执行：证据覆盖率至少 {coverage:.0%}")
+            recognized = True
+        if any(term in compact for term in ("至少中可信", "可信程度至少中", "不接受低可信")):
+            settings["minimum_confidence"] = "中"
+            applied.append("已自动执行：可信程度至少为中")
+            recognized = True
+        if any(term in compact for term in ("仅高可信", "必须高可信", "可信程度为高")):
+            settings["minimum_confidence"] = "高"
+            applied.append("已自动执行：可信程度必须为高")
+            recognized = True
+        for key, terms in dimension_terms.items():
+            if any(f"必须有{term}" in compact or f"需要{term}证据" in compact for term in terms):
+                if key not in required:
+                    required.append(key)
+                applied.append(f"已自动执行：必须具备{RECOMMENDATION_DIMENSION_LABELS[key]}证据")
+                recognized = True
+            if any(f"优先{term}" in compact for term in terms):
+                adjusted_weights[key] = min(100.0, float(adjusted_weights.get(key, 0)) * 1.5)
+                weight_adjustments[key] = adjusted_weights[key]
+                applied.append(f"已自动执行：提高{RECOMMENDATION_DIMENSION_LABELS[key]}权重至 {adjusted_weights[key]:g}")
+                recognized = True
+        if not recognized:
+            manual_review.append(constraint)
+    settings["required_dimensions"] = required
+    return adjusted_weights, _normalize_filter_settings(settings), applied, manual_review, weight_adjustments
+
+
 def rank_parent_combinations(
     profiles: dict[str, dict[str, Any]],
     weights: dict[str, float],
     breeding_goal: str,
     constraints: list[str] | None = None,
+    filter_settings: dict[str, Any] | None = None,
+    sort_mode: str = "score",
 ) -> dict[str, Any]:
     if len(profiles) < 2:
         raise ValueError("至少选择 2 个候选亲本。")
+    weights = _validate_weights(weights)
+    if sort_mode not in RECOMMENDATION_SORT_MODES:
+        raise ValueError("排序方式只能是综合评分、证据覆盖率或可信程度。")
     norms = _candidate_norms(profiles)
     constraints = [item.strip() for item in (constraints or []) if item.strip()]
+    configured_filters = _normalize_filter_settings(filter_settings)
+    weights, configured_filters, applied_constraints, manual_constraints, weight_adjustments = _apply_text_constraints(
+        constraints, weights, configured_filters,
+    )
     ranked: list[dict[str, Any]] = []
+    excluded: list[dict[str, Any]] = []
     for left_key, right_key in combinations(profiles, 2):
         left, right = profiles[left_key], profiles[right_key]
         dimension_scores: dict[str, float] = {}
         reasons: list[str] = []
         risks: list[str] = []
         gaps: list[str] = []
-        evidence: list[dict[str, Any]] = []
+        evidence: list[dict[str, Any]] = [
+            {"evidence_type": "governed_source_record", "material_key": profile["material_key"], "source": source}
+            for profile in (left, right) for source in profile.get("sources", [])
+        ]
         for bucket in ("yield", "lodging", "disease", "quality"):
             left_values, right_values = left["traits"].get(bucket, []), right["traits"].get(bucket, [])
             if not left_values or not right_values or bucket not in norms:
@@ -616,7 +757,9 @@ def rank_parent_combinations(
             confidence = "低"
         if confidence != "高":
             risks.append(f"证据权重覆盖率为 {evidence_coverage:.0%}，推荐可信程度为{confidence}")
-        ranked.append({
+        if manual_constraints:
+            risks.append(f"以下自由文本限制无法由现有结构化数据自动判定，需人工复核：{'、'.join(manual_constraints)}")
+        item = {
             "female_parent": {"material_key": left_key, "name": left["name"]},
             "male_parent": {"material_key": right_key, "name": right["name"]},
             "score": round(score, 2),
@@ -627,15 +770,66 @@ def rank_parent_combinations(
             "risks": risks or ["未从当前规则识别显式冲突；仍需育种专家复核"],
             "data_gaps": gaps,
             "evidence": evidence[:50],
-        })
-    ranked.sort(key=lambda item: (-item["score"], -item["evidence_coverage"], item["female_parent"]["material_key"], item["male_parent"]["material_key"]))
+        }
+        exclusion_reasons = []
+        if configured_filters["exclude_common_parent"] and common_parents:
+            exclusion_reasons.append(f"存在共同亲本：{'、'.join(common_parents)}")
+        if evidence_coverage < configured_filters["minimum_evidence_coverage"]:
+            exclusion_reasons.append(
+                f"证据覆盖率 {evidence_coverage:.0%} 低于最低要求 {configured_filters['minimum_evidence_coverage']:.0%}"
+            )
+        if CONFIDENCE_RANK[confidence] < CONFIDENCE_RANK[configured_filters["minimum_confidence"]]:
+            exclusion_reasons.append(f"可信程度 {confidence} 低于最低要求 {configured_filters['minimum_confidence']}")
+        missing_required = [
+            key for key in configured_filters["required_dimensions"] if key not in dimension_scores
+        ]
+        if missing_required:
+            exclusion_reasons.append(
+                "缺少必需证据维度：" + "、".join(RECOMMENDATION_DIMENSION_LABELS[key] for key in missing_required)
+            )
+        if exclusion_reasons:
+            excluded.append({
+                "female_parent": item["female_parent"],
+                "male_parent": item["male_parent"],
+                "reasons": exclusion_reasons,
+            })
+        else:
+            ranked.append(item)
+    common_tail = lambda item: (item["female_parent"]["material_key"], item["male_parent"]["material_key"])
+    if sort_mode == "evidence_coverage":
+        ranked.sort(key=lambda item: (-item["evidence_coverage"], -item["score"], *common_tail(item)))
+    elif sort_mode == "confidence":
+        ranked.sort(key=lambda item: (-CONFIDENCE_RANK[item["confidence"]], -item["score"], *common_tail(item)))
+    else:
+        ranked.sort(key=lambda item: (-item["score"], -item["evidence_coverage"], *common_tail(item)))
+    selection_warning = ""
+    if not ranked:
+        selection_warning = "所有候选组合均被当前筛选条件排除；系统未生成不符合约束的推荐，请放宽条件或补充证据。"
+    all_sources: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for profile in profiles.values():
+        for source in profile.get("sources", []):
+            identity = (
+                str(source.get("batch_id") or ""),
+                str(source.get("entity_type") or ""),
+                str(source.get("entity_key") or ""),
+            )
+            all_sources[identity] = source
     return {
         "title": "亲本组合辅助推荐",
         "disclaimer": "本结果为辅助推荐，不是确定性预测结论；必须结合育种专家判断和后续试验验证。",
         "breeding_goal": breeding_goal.strip(),
         "constraints": constraints,
+        "applied_constraints": applied_constraints,
+        "manual_review_constraints": manual_constraints,
+        "filter_settings": configured_filters,
+        "sort_mode": sort_mode,
+        "sort_mode_label": {"score": "综合评分", "evidence_coverage": "证据覆盖率", "confidence": "可信程度"}[sort_mode],
+        "excluded_combinations": excluded,
+        "selection_warning": selection_warning,
+        "constraint_weight_adjustments": weight_adjustments,
         "weights": weights,
-        "method": "按当前课题配置权重，对实际存在的证据维度归一化后加权排序；缺失维度不虚构、不计分并降低可信程度。",
+        "sources": list(all_sources.values()),
+        "method": "按当前课题及本次请求配置的筛选条件、权重和排序方式，对实际存在的证据维度归一化后排序；缺失维度不虚构、不计分并降低可信程度。",
         "engine_version": RECOMMENDATION_VERSION,
         "recommendations": ranked,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -650,13 +844,18 @@ def run_parent_recommendation(
     weights: dict[str, float],
     breeding_goal: str,
     constraints: list[str] | None = None,
+    filter_settings: dict[str, Any] | None = None,
+    sort_mode: str = "score",
 ) -> dict[str, Any]:
     entities, _, _ = _read_entities(engine, institution_id, project_id)
     profiles = _candidate_profiles(entities, candidate_keys)
     missing = [key for key, profile in profiles.items() if not profile["sources"]]
     if missing:
         raise ValueError(f"候选亲本不存在于当前课题：{'、'.join(missing)}。")
-    return rank_parent_combinations(profiles, weights, breeding_goal, constraints)
+    return rank_parent_combinations(
+        profiles, weights, breeding_goal, constraints,
+        filter_settings=filter_settings, sort_mode=sort_mode,
+    )
 
 
 def save_parent_recommendation(
@@ -713,6 +912,13 @@ def recommendation_csv(result: dict[str, Any]) -> bytes:
     buffer = io.StringIO()
     writer = csv.writer(buffer)
     writer.writerow(["声明", result.get("disclaimer", "辅助推荐")])
+    writer.writerow(["育种目标", result.get("breeding_goal", "")])
+    writer.writerow(["筛选条件", json.dumps(result.get("filter_settings") or {}, ensure_ascii=False)])
+    writer.writerow(["排序方式", result.get("sort_mode_label") or result.get("sort_mode") or "综合评分"])
+    writer.writerow(["评分权重", json.dumps(result.get("weights") or {}, ensure_ascii=False)])
+    writer.writerow(["已执行自由文本条件", "；".join(result.get("applied_constraints") or [])])
+    writer.writerow(["需人工复核条件", "；".join(result.get("manual_review_constraints") or [])])
+    writer.writerow(["排除组合数", len(result.get("excluded_combinations") or [])])
     writer.writerow(["排序", "母本编号", "母本名称", "父本编号", "父本名称", "评分", "可信程度", "证据覆盖率", "推荐理由", "风险", "数据缺口"])
     for index, item in enumerate(result.get("recommendations", []), start=1):
         writer.writerow([
@@ -750,7 +956,20 @@ def build_intelligence_pdf(title: str, result: dict[str, Any]) -> bytes:
     if result.get("summary"):
         story.extend([Paragraph("综合结论", styles["Heading1"]), Paragraph(str(result["summary"]), styles["BodyText"])])
     if result.get("recommendations") is not None:
-        story.extend([Paragraph("育种目标与方法", styles["Heading1"]), Paragraph(str(result.get("breeding_goal") or "未填写"), styles["BodyText"]), Paragraph(str(result.get("method") or ""), styles["BodyText"])])
+        story.extend([
+            Paragraph("育种目标与方法", styles["Heading1"]),
+            Paragraph(str(result.get("breeding_goal") or "未填写"), styles["BodyText"]),
+            Paragraph(str(result.get("method") or ""), styles["BodyText"]),
+            Paragraph(f"筛选条件：{json.dumps(result.get('filter_settings') or {}, ensure_ascii=False)}", styles["BodyText"]),
+            Paragraph(f"排序方式：{result.get('sort_mode_label') or result.get('sort_mode') or '综合评分'}", styles["BodyText"]),
+            Paragraph(f"评分权重：{json.dumps(result.get('weights') or {}, ensure_ascii=False)}", styles["BodyText"]),
+        ])
+        if result.get("applied_constraints"):
+            story.append(Paragraph(f"已自动执行的自由文本条件：{'；'.join(result['applied_constraints'])}", styles["BodyText"]))
+        if result.get("manual_review_constraints"):
+            story.append(Paragraph(f"需人工复核、未声称自动执行：{'；'.join(result['manual_review_constraints'])}", styles["BodyText"]))
+        if result.get("selection_warning"):
+            story.append(Paragraph(str(result["selection_warning"]), styles["BodyText"]))
         for index, item in enumerate(result.get("recommendations", []), start=1):
             story.append(Paragraph(f"{index}. {item['female_parent']['name']} × {item['male_parent']['name']}（{item['score']} 分，可信程度 {item['confidence']}）", styles["Heading2"]))
             for heading, values in (("推荐理由", item.get("recommendation_reasons", [])), ("风险", item.get("risks", [])), ("数据缺口", item.get("data_gaps", []))):

@@ -92,6 +92,44 @@ class ParentRecommendationTests(unittest.TestCase):
         pair = next(item for item in result["recommendations"] if {item["female_parent"]["material_key"], item["male_parent"]["material_key"]} == {"M001", "M003"})
         self.assertTrue(any("共同亲本" in risk for risk in pair["risks"]))
 
+    def test_structured_constraint_really_excludes_common_parent(self):
+        result = rank_parent_combinations(
+            self.profiles(), DEFAULT_RECOMMENDATION_WEIGHTS, "高产",
+            filter_settings={"exclude_common_parent": True},
+        )
+        included = [
+            {item["female_parent"]["material_key"], item["male_parent"]["material_key"]}
+            for item in result["recommendations"]
+        ]
+        self.assertNotIn({"M001", "M003"}, included)
+        excluded = next(
+            item for item in result["excluded_combinations"]
+            if {item["female_parent"]["material_key"], item["male_parent"]["material_key"]} == {"M001", "M003"}
+        )
+        self.assertTrue(any("共同亲本" in reason for reason in excluded["reasons"]))
+
+    def test_text_constraint_is_applied_and_unknown_constraint_is_not_silently_claimed(self):
+        result = rank_parent_combinations(
+            self.profiles(), DEFAULT_RECOMMENDATION_WEIGHTS, "高产",
+            constraints=["优先抗倒伏", "花期必须在五月"],
+        )
+        self.assertEqual(result["constraint_weight_adjustments"]["lodging"], 15.0)
+        self.assertIn("花期必须在五月", result["manual_review_constraints"])
+        self.assertTrue(any("人工复核" in risk for risk in result["recommendations"][0]["risks"]))
+
+    def test_required_unavailable_dimension_returns_no_false_recommendation(self):
+        result = rank_parent_combinations(
+            self.profiles(), DEFAULT_RECOMMENDATION_WEIGHTS, "高产",
+            filter_settings={"required_dimensions": ["genotype"]},
+        )
+        self.assertEqual(result["recommendations"], [])
+        self.assertEqual(len(result["excluded_combinations"]), 3)
+        self.assertIn("未生成", result["selection_warning"])
+
+    def test_invalid_request_weights_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "0–100"):
+            rank_parent_combinations(self.profiles(), {**DEFAULT_RECOMMENDATION_WEIGHTS, "yield": -1}, "高产")
+
     def test_reports_are_exportable(self):
         result = rank_parent_combinations(self.profiles(), DEFAULT_RECOMMENDATION_WEIGHTS, "高产")
         self.assertTrue(recommendation_csv(result).startswith(b"\xef\xbb\xbf"))
