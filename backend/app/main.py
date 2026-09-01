@@ -3406,6 +3406,21 @@ def create_controlled_trial_analysis(
         raise HTTPException(422, "同一试验材料比较必须选择年份和地点。")
     if payload.analysis_type == "decline" and not payload.material_code.strip():
         raise HTTPException(422, "表现异常证据拆解必须选择材料。")
+    unsupported_parameters: list[str] = []
+    if payload.analysis_type != "same_trial":
+        if payload.year is not None:
+            unsupported_parameters.append("年份")
+        if payload.site_name.strip():
+            unsupported_parameters.append("地点")
+    if payload.analysis_type != "decline" and payload.material_code.strip():
+        unsupported_parameters.append("材料")
+    if payload.analysis_type not in {"same_trial", "stability"} and payload.treatment_code.strip():
+        unsupported_parameters.append("处理")
+    if unsupported_parameters:
+        raise HTTPException(
+            422,
+            f"当前分析方法不使用以下参数：{'、'.join(unsupported_parameters)}。请清空后重试；系统不会静默忽略用户选择。",
+        )
     question = _controlled_trial_question(payload)
     try:
         analysis = run_controlled_trial_analysis(session, dict(package), question, user.id)
