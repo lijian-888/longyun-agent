@@ -87,6 +87,13 @@ class EmptyReactTests(unittest.IsolatedAsyncioTestCase):
         events = await self.run_reply(build_public_web_context([], "Tavily 额度受限"))
         self.assertIn("Tavily 额度受限", events[-1]["content"])
 
+    async def test_failed_page_is_not_hallucinated_by_model(self):
+        context = build_public_web_context([], "网页访问受限", question="https://www.ricedata.cn/variety/varis/601324.htm 这里有什么信息")
+        events = await self.run_reply(context, "该网页可能包含许多未知的数据")
+        self.assertEqual(events[-1]["response_mode"], "public_page_unavailable")
+        self.assertIn("不会根据网址猜测", events[-1]["content"])
+        self.assertNotIn("可能包含", events[-1]["content"])
+
     async def test_non_web_empty_answers_still_fail(self):
         with self.assertRaises(agent.EmptyResearchAnswerError):
             await self.run_reply("")

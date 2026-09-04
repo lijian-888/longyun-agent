@@ -135,7 +135,7 @@ from .research_agent import (
     stream_research_reply,
 )
 from .research_report import build_analysis_chart_png, build_research_report_pdf, is_report_request
-from .research_search import build_public_web_context, search_public_references
+from .research_search import build_public_web_context, requested_public_pages, resolve_public_request, search_public_references
 from .breeding_dossier import (
     BreedingDossierError,
     build_breeding_report_context,
@@ -6363,9 +6363,11 @@ async def research_chat_stream(
             public_web_context = ""
             if vision_blocks:
                 yield sse_event("status", {"label": f"正在准备 {len(vision_attachments)} 张本地图片供当前模型进行视觉分析"})
-            yield sse_event("status", {"label": "正在判断是否需要检索近期可信公开资料"})
-            web_results, search_note = await search_public_references(payload.content)
-            public_web_context = build_public_web_context(web_results, search_note)
+            public_request = resolve_public_request(payload.content, conversation_history)
+            page_read = bool(requested_public_pages(public_request))
+            yield sse_event("status", {"label": "正在通过 Tavily 读取指定网页正文" if page_read else "正在判断是否需要检索近期可信公开资料"})
+            web_results, search_note = await search_public_references(public_request)
+            public_web_context = build_public_web_context(web_results, search_note, question=public_request)
             if web_results:
                 evidence.extend({
                     "priority": 4,
@@ -6373,9 +6375,13 @@ async def research_chat_stream(
                     "title": f"公开参考：{item.title}",
                     "detail": f"Tavily {item.retrieval_method}；仅限公开摘要/页面摘录，不代表付费全文，未写入平台知识库。",
                     "url": item.url,
+                    "requested_url": item.requested_url,
+                    "content_characters": item.content_characters,
+                    "content_truncated": item.content_truncated,
+                    "unreadable_images": item.unreadable_images,
                 } for item in web_results)
-                yield sse_event("status", {"label": f"已检索到 {len(web_results)} 条可信公开参考来源"})
-            elif search_note:
+                yield sse_event("status", {"label": f"已读取 {len(web_results)} 个指定页面，正在依据正文总结" if page_read else f"已检索到 {len(web_results)} 条可信公开参考来源"})
+            if search_note:
                 yield sse_event("status", {"label": search_note})
 
             if len(f"{evidence_context}\n\n{public_web_context}") > MAX_RESEARCH_CONTEXT_CHARS:
@@ -6433,7 +6439,7 @@ async def research_chat_stream(
                         content=result["content"],
                         evidence=evidence,
                         operation_state=[
-                            {"state": "completed", "label": "已返回公开检索来源（模型未完成综合分析）" if result.get("response_mode") == "public_search_evidence" else "已完成大模型分析"},
+                            {"state": "completed", "label": {"public_search_evidence": "已返回公开检索来源（模型未完成综合分析）", "public_page_unavailable": "指定网页未读取成功，已返回原因"}.get(result.get("response_mode"), "已完成大模型分析")},
                             *([{ "state": "web_search", "label": f"已补充 {len(web_results)} 条可信公开来源" }] if web_results else []),
                             {"state": "evidence", "label": f"已附带 {len(evidence)} 项证据"},
                             *([{
