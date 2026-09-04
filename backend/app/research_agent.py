@@ -602,10 +602,11 @@ async def stream_research_reply(
     final_memory: Any = None
     response_mode = "model"
     public_evidence_required = bool(public_web_context.strip())
+    page_read_mode = '"intent": "read_pages"' in public_web_context
     try:
         streamed_any_text = False
         empty_answer_rejected = False
-        for attempt in range(2):
+        for attempt in range(1 if page_read_mode else 2):
             agent, memory, tool_trace = build_agent()
             retry_notice = "" if attempt == 0 else (
                 "\n\n[System correction: The previous output was not a usable final research answer. "
@@ -617,7 +618,7 @@ async def stream_research_reply(
                 "当前成功读取的正文优先于历史‘无法读取’的回答。图片未识别标记所在数值不可补全、拼接或猜测；"
                 "只总结有完整证据的信息，整项省略数值不完整的指标，不要罗列‘未识别’占位符或残缺字段；"
                 "在结尾统一说明图片数字无法读取，引用原始页面URL。]"
-                if '"intent": "read_pages"' in public_web_context else ""
+                if page_read_mode else ""
             )
             await memory.add(Msg("researcher", user_prompt + page_instruction + retry_notice, "user"))
             await _execute_controlled_react_action(
@@ -638,10 +639,16 @@ async def stream_research_reply(
             # a new browser action in text.
             stream_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=128)
             agent.set_msg_queue_enabled(True, stream_queue)
-            reasoning_task = asyncio.create_task(agent._reasoning("none"))
+            reasoning = agent._reasoning("none")
+            # A URL already has its evidence. Do not let a provider's tool
+            # protocol hang this simple summarization for its default minutes.
+            reasoning_task = asyncio.create_task(
+                asyncio.wait_for(reasoning, timeout=60) if page_read_mode else reasoning,
+            )
             previous_text = ""
             output_guard = _StreamingOutputGuard()
             attempt_failed_before_render = False
+            attempt_failure_reason = "protocol"
             try:
                 while not reasoning_task.done() or not stream_queue.empty():
                     try:
@@ -669,6 +676,13 @@ async def stream_research_reply(
                         streamed_any_text = True
                         yield {"type": "token", "text": chunk}
                 final_message = await reasoning_task
+            except TimeoutError as exc:
+                await asyncio.gather(reasoning_task, return_exceptions=True)
+                if streamed_any_text:
+                    raise ResearchAgentError("网页正文已取得，但模型总结超时。本轮不保存不完整回答，请重试。") from exc
+                attempt_failed_before_render = True
+                attempt_failure_reason = "timeout"
+                final_message = None
             except _StreamProtocolLeakError:
                 if not reasoning_task.done():
                     reasoning_task.cancel()
@@ -688,9 +702,10 @@ async def stream_research_reply(
 
             if attempt_failed_before_render:
                 logger.warning(
-                    "Rejected malformed ReAct stream before rendering: attempt=%s model=%s",
+                    "Rejected ReAct stream before rendering: attempt=%s model=%s reason=%s",
                     attempt + 1,
                     model_name,
+                    attempt_failure_reason,
                 )
                 continue
 

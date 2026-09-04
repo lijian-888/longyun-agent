@@ -36,7 +36,7 @@ class NativeRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class EmptyReactTests(unittest.IsolatedAsyncioTestCase):
-    async def run_reply(self, context, native_answer=None):
+    async def run_reply(self, context, native_answer=None, reasoning_timeout=False):
         class Msg:
             def __init__(self, name, content, role):
                 self.name, self.content, self.role = name, content, role
@@ -53,7 +53,10 @@ class EmptyReactTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self, **kwargs): pass
             def set_console_output_enabled(self, value): pass
             def set_msg_queue_enabled(self, value, queue): pass
-            async def _reasoning(self, choice): return Msg("assistant", "", "assistant")
+            async def _reasoning(self, choice):
+                if reasoning_timeout:
+                    raise TimeoutError("simulated provider timeout")
+                return Msg("assistant", "", "assistant")
         def toolkit(**kwargs):
             kwargs["tool_trace"].update(verified_evidence_read=True, public_references_read=True)
         modules = {}
@@ -93,6 +96,14 @@ class EmptyReactTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1]["response_mode"], "public_page_unavailable")
         self.assertIn("不会根据网址猜测", events[-1]["content"])
         self.assertNotIn("可能包含", events[-1]["content"])
+
+    async def test_page_model_timeout_recovers_without_losing_evidence(self):
+        data = json.loads(CONTEXT)
+        data["intent"] = "read_pages"
+        context = json.dumps(data, ensure_ascii=False)
+        events = await self.run_reply(context, "已取得品种的公开正文，并可根据来源进行总结。", reasoning_timeout=True)
+        self.assertEqual(events[-1]["response_mode"], "public_search_native")
+        self.assertIn("公开正文", events[-1]["content"])
 
     async def test_non_web_empty_answers_still_fail(self):
         with self.assertRaises(agent.EmptyResearchAnswerError):
