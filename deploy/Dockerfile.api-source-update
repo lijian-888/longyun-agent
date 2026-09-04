@@ -1,0 +1,9 @@
+# Source-only update of an already deployed, verified API image.
+# Requirements must be unchanged from that image. No registry/package access.
+# docker build --pull=false --network=none --build-arg BASE_IMAGE=... \
+#   --build-arg SOURCE_REVISION=... -f deploy/Dockerfile.api-source-update .
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+ARG SOURCE_REVISION
+LABEL org.opencontainers.image.revision=${SOURCE_REVISION}
+COPY backend/app /app/app

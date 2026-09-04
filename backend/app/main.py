@@ -36,10 +36,17 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, rela
 from pgvector.sqlalchemy import Vector
 
 from .acps_adapter import (
+    AcpsDirectLeaderRuntime,
     AcpsExecutionResult,
+    AcpsGroupCreateRequest,
+    AcpsGroupLeaderRuntime,
+    AcpsGroupMemberCommandRequest,
+    AcpsGroupPartnerRequest,
+    AcpsGroupTaskCommandRequest,
+    AcpsGroupTaskRequest,
     AcpsLeaderDispatchRequest,
+    AcpsLeaderTaskCommandRequest,
     AcpsSettings,
-    dispatch_partner_task,
     mount_acps_routes,
 )
 from .auth import (
@@ -128,7 +135,7 @@ from .research_agent import (
     stream_research_reply,
 )
 from .research_report import build_analysis_chart_png, build_research_report_pdf, is_report_request
-from .research_search import search_public_references
+from .research_search import build_public_web_context, search_public_references
 from .breeding_dossier import (
     BreedingDossierError,
     build_breeding_report_context,
@@ -2656,6 +2663,8 @@ def serialize_public_query_execution(execution: Any) -> dict[str, Any]:
 
 app = FastAPI(title="隆耘 Agent 育种智能体", version="1.5.0")
 ACPS_SETTINGS = AcpsSettings.from_env()
+ACPS_DIRECT_LEADER = AcpsDirectLeaderRuntime(ACPS_SETTINGS)
+ACPS_GROUP_LEADER = AcpsGroupLeaderRuntime(ACPS_SETTINGS)
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
 app.add_middleware(
     CORSMiddleware,
@@ -6356,17 +6365,13 @@ async def research_chat_stream(
                 yield sse_event("status", {"label": f"正在准备 {len(vision_attachments)} 张本地图片供当前模型进行视觉分析"})
             yield sse_event("status", {"label": "正在判断是否需要检索近期可信公开资料"})
             web_results, search_note = await search_public_references(payload.content)
+            public_web_context = build_public_web_context(web_results, search_note)
             if web_results:
-                web_context = "\n\n".join(
-                    f"### 可信公开来源：{item.title}\n链接：{item.url}\n摘要：{item.snippet}"
-                    for item in web_results
-                )
-                public_web_context = web_context
                 evidence.extend({
                     "priority": 4,
                     "type": "trusted_public_web",
                     "title": f"公开参考：{item.title}",
-                    "detail": "Tavily 公开检索；仅作为补充证据，未写入平台知识库。",
+                    "detail": f"Tavily {item.retrieval_method}；仅限公开摘要/页面摘录，不代表付费全文，未写入平台知识库。",
                     "url": item.url,
                 } for item in web_results)
                 yield sse_event("status", {"label": f"已检索到 {len(web_results)} 条可信公开参考来源"})
@@ -6428,7 +6433,7 @@ async def research_chat_stream(
                         content=result["content"],
                         evidence=evidence,
                         operation_state=[
-                            {"state": "completed", "label": "已完成大模型分析"},
+                            {"state": "completed", "label": "已返回公开检索来源（模型未完成综合分析）" if result.get("response_mode") == "public_search_evidence" else "已完成大模型分析"},
                             *([{ "state": "web_search", "label": f"已补充 {len(web_results)} 条可信公开来源" }] if web_results else []),
                             {"state": "evidence", "label": f"已附带 {len(evidence)} 项证据"},
                             *([{
@@ -6450,6 +6455,7 @@ async def research_chat_stream(
                             "evidence_count": len(evidence),
                             "knowledge_evidence_count": len(knowledge_cards),
                             "public_web_source_count": len(web_results),
+                            "response_mode": result.get("response_mode", "model"),
                             "report_requested": report_requested,
                             "report_kind": "breeding_dossier" if breeding_report_requested else None,
                         },
@@ -7399,23 +7405,80 @@ async def execute_longyun_acps_partner(question: str, caller_aic: str) -> AcpsEx
     )
 
 
+def _raise_acps_leader_error(exc: Exception, action: str) -> None:
+    if isinstance(exc, LookupError):
+        raise HTTPException(404, str(exc)) from exc
+    if isinstance(exc, TimeoutError):
+        raise HTTPException(504, str(exc)) from exc
+    if isinstance(exc, ValueError):
+        raise HTTPException(422, str(exc)) from exc
+    if isinstance(exc, RuntimeError):
+        configuration_markers = (
+            "尚未就绪",
+            "未启用",
+            "尚未配置",
+            "必须配置",
+            "格式不符合",
+        )
+        status = 503 if any(item in str(exc) for item in configuration_markers) else 502
+        raise HTTPException(status, str(exc)) from exc
+    if isinstance(exc, httpx.HTTPError):
+        raise HTTPException(502, "ACPs 对端 HTTP 请求失败。") from exc
+    logger.exception("ACPs Leader %s failed", action)
+    raise HTTPException(502, f"ACPs Leader {action}失败，请检查对端、消息队列和证书配置。") from exc
+
+
+def _record_acps_audit(
+    session: Session,
+    user: CurrentUser,
+    action: str,
+    target_type: str,
+    target_id: str,
+    after: dict[str, Any],
+) -> None:
+    record_permission_audit(
+        session,
+        user,
+        action,
+        target_type,
+        target_id,
+        project_id=active_project_id(session),
+        after=after,
+    )
+    session.commit()
+
+
 @app.post("/api/acps/leader/dispatch", tags=["ACPs"])
 async def acps_leader_dispatch(
     payload: AcpsLeaderDispatchRequest,
     user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
 ) -> dict[str, Any]:
-    """Let an authenticated researcher use Longyun as an ACPs Leader."""
+    """Start and optionally finish a Direct AIP task as an authenticated Leader."""
+    project_id = active_project_id(session)
     try:
-        project = resolve_project_access(session, user, x_project_id)
-        _set_active_project(session, project.id)
-        result = await dispatch_partner_task(payload, ACPS_SETTINGS)
-    except TimeoutError as exc:
-        raise HTTPException(504, str(exc)) from exc
-    except (httpx.HTTPError, RuntimeError, ValueError) as exc:
-        raise HTTPException(502, str(exc)) from exc
+        result = await ACPS_DIRECT_LEADER.dispatch(
+            payload,
+            owner_id=user.id,
+            project_id=project_id,
+        )
+        task = result.get("task") or {}
+        selected = result.get("selectedPartner") or {}
+        _record_acps_audit(
+            session,
+            user,
+            "acps_direct_task_started",
+            "acps_direct_task",
+            str(task.get("taskId") or payload.task_id or "unknown"),
+            {
+                "session_id": result.get("sessionId"),
+                "partner_aic": selected.get("aic"),
+                "state": (task.get("status") or {}).get("state"),
+            },
+        )
     except Exception as exc:
-        logger.exception("ACPs Leader dispatch failed")
-        raise HTTPException(502, "ACPs Leader 调度失败，请检查 Partner、Discovery 和证书配置。") from exc
+        _raise_acps_leader_error(exc, "Direct 任务调度")
+        raise
     return {
         **result,
         "requestedBy": audit_actor(user),
@@ -7423,4 +7486,235 @@ async def acps_leader_dispatch(
     }
 
 
-mount_acps_routes(app, ACPS_SETTINGS, execute_longyun_acps_partner)
+@app.post("/api/acps/leader/tasks/{task_id}/commands", tags=["ACPs"])
+async def acps_leader_task_command(
+    task_id: str,
+    payload: AcpsLeaderTaskCommandRequest,
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> dict[str, Any]:
+    """Get, continue, complete, or cancel an owned Direct AIP task."""
+    try:
+        result = await ACPS_DIRECT_LEADER.command(
+            task_id,
+            payload,
+            owner_id=user.id,
+            project_id=active_project_id(session),
+        )
+        task = result.get("task") or {}
+        _record_acps_audit(
+            session,
+            user,
+            f"acps_direct_task_{payload.command}",
+            "acps_direct_task",
+            task_id,
+            {"state": (task.get("status") or {}).get("state")},
+        )
+    except Exception as exc:
+        _raise_acps_leader_error(exc, f"Direct {payload.command}")
+        raise
+    return {**result, "requestedBy": audit_actor(user)}
+
+
+@app.post("/api/acps/leader/groups", tags=["ACPs"])
+async def acps_leader_create_group(
+    payload: AcpsGroupCreateRequest,
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> dict[str, Any]:
+    """Create an owner-scoped ACPs Group session through the official SDK."""
+    try:
+        result = await ACPS_GROUP_LEADER.create_group(
+            payload, owner_id=user.id, project_id=active_project_id(session)
+        )
+        _record_acps_audit(
+            session,
+            user,
+            "acps_group_created",
+            "acps_group",
+            str(result.get("session_id")),
+            {"group_id": result.get("group_id")},
+        )
+    except Exception as exc:
+        _raise_acps_leader_error(exc, "建组")
+        raise
+    return result
+
+
+@app.get("/api/acps/leader/groups/{session_id}", tags=["ACPs"])
+async def acps_leader_get_group(
+    session_id: str,
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> dict[str, Any]:
+    try:
+        return await ACPS_GROUP_LEADER.get_group(
+            session_id, owner_id=user.id, project_id=active_project_id(session)
+        )
+    except Exception as exc:
+        _raise_acps_leader_error(exc, "查询小组")
+        raise
+
+
+@app.post("/api/acps/leader/groups/{session_id}/partners", tags=["ACPs"])
+async def acps_leader_invite_partner(
+    session_id: str,
+    payload: AcpsGroupPartnerRequest,
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> dict[str, Any]:
+    try:
+        result = await ACPS_GROUP_LEADER.invite_partner(
+            session_id,
+            payload,
+            owner_id=user.id,
+            project_id=active_project_id(session),
+        )
+        _record_acps_audit(
+            session,
+            user,
+            "acps_group_partner_invited",
+            "acps_group",
+            session_id,
+            {"partner_aic": payload.partner_aic},
+        )
+        return result
+    except Exception as exc:
+        _raise_acps_leader_error(exc, "邀请 Partner")
+        raise
+
+
+@app.post("/api/acps/leader/groups/{session_id}/tasks", tags=["ACPs"])
+async def acps_leader_group_start_task(
+    session_id: str,
+    payload: AcpsGroupTaskRequest,
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> dict[str, Any]:
+    """Publish a group task to all members or selected Partner AICs."""
+    try:
+        result = await ACPS_GROUP_LEADER.start_task(
+            session_id,
+            payload,
+            owner_id=user.id,
+            project_id=active_project_id(session),
+        )
+        _record_acps_audit(
+            session,
+            user,
+            "acps_group_task_started",
+            "acps_group_task",
+            str(result.get("taskId")),
+            {
+                "session_id": session_id,
+                "target_partners": payload.target_partners or ["all"],
+            },
+        )
+        return result
+    except Exception as exc:
+        _raise_acps_leader_error(exc, "群组消息发送")
+        raise
+
+
+@app.post(
+    "/api/acps/leader/groups/{session_id}/tasks/{task_id}/commands",
+    tags=["ACPs"],
+)
+async def acps_leader_group_task_command(
+    session_id: str,
+    task_id: str,
+    payload: AcpsGroupTaskCommandRequest,
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> dict[str, Any]:
+    try:
+        result = await ACPS_GROUP_LEADER.task_command(
+            session_id,
+            task_id,
+            payload,
+            owner_id=user.id,
+            project_id=active_project_id(session),
+        )
+        _record_acps_audit(
+            session,
+            user,
+            f"acps_group_task_{payload.command}",
+            "acps_group_task",
+            task_id,
+            {"session_id": session_id, "target_partner": payload.target_partner},
+        )
+        return result
+    except Exception as exc:
+        _raise_acps_leader_error(exc, f"群组任务 {payload.command}")
+        raise
+
+
+@app.post(
+    "/api/acps/leader/groups/{session_id}/partners/{partner_aic}/commands",
+    tags=["ACPs"],
+)
+async def acps_leader_group_member_command(
+    session_id: str,
+    partner_aic: str,
+    payload: AcpsGroupMemberCommandRequest,
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> dict[str, Any]:
+    try:
+        result = await ACPS_GROUP_LEADER.member_command(
+            session_id,
+            partner_aic,
+            payload,
+            owner_id=user.id,
+            project_id=active_project_id(session),
+        )
+        _record_acps_audit(
+            session,
+            user,
+            f"acps_group_member_{payload.command}",
+            "acps_group",
+            session_id,
+            {"partner_aic": partner_aic},
+        )
+        return result
+    except Exception as exc:
+        _raise_acps_leader_error(exc, f"成员 {payload.command}")
+        raise
+
+
+@app.delete("/api/acps/leader/groups/{session_id}", tags=["ACPs"])
+async def acps_leader_dissolve_group(
+    session_id: str,
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> dict[str, Any]:
+    """Dissolve the group and clean up queues, permissions, and connections."""
+    try:
+        result = await ACPS_GROUP_LEADER.dissolve_group(
+            session_id, owner_id=user.id, project_id=active_project_id(session)
+        )
+        _record_acps_audit(
+            session,
+            user,
+            "acps_group_dissolved",
+            "acps_group",
+            session_id,
+            {"group_id": result.get("groupId")},
+        )
+        return result
+    except Exception as exc:
+        _raise_acps_leader_error(exc, "解散小组")
+        raise
+
+
+@app.on_event("shutdown")
+async def shutdown_acps_group_leader() -> None:
+    await ACPS_GROUP_LEADER.close()
+
+
+mount_acps_routes(
+    app,
+    ACPS_SETTINGS,
+    execute_longyun_acps_partner,
+    group_runtime=ACPS_GROUP_LEADER,
+)

@@ -35,3 +35,8 @@ data/results/
 data/processed/
 deploy/logs/
 release-packages/
+
+# Generated review screenshots and local acceptance artifacts, not app assets.
+.codex-doc-review/
+outputs/
+tmp/
