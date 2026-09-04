@@ -228,6 +228,14 @@ def _page_excerpt(body: str, *, limit: int = MAX_PUBLIC_PAGE_CHARS) -> tuple[str
     # Text extraction silently joins digits around inline image glyphs. Keep
     # Markdown tables and explicitly mark every unrecognised image instead.
     cleaned, count = re.subn(r"!\[[^\]]*\]\([^\n]*?\)|!\[[^\]]*\]\[[^\]]*\]|<img\b[^>]*>", IMAGE_PLACEHOLDER, body, flags=re.I)
+    if count:
+        # Remove the ENTIRE incomplete numeric token, not just its image glyph.
+        # Otherwise a model can turn '[missing]20.3' into either 20.3 or 120.3,
+        # or infer a year from '2[missing]02-20[missing]3'. Neither is evidence.
+        numeric = r"[0-9０-９.,．+\-–—−×xX~/～ \t]*"
+        gap = re.escape(IMAGE_PLACEHOLDER)
+        cleaned = re.sub(numeric + gap + "(?:" + numeric + gap + ")*" + numeric,
+                         IMAGE_PLACEHOLDER, cleaned)
     return cleaned[:limit], len(cleaned) > limit, bool(count)
 
 

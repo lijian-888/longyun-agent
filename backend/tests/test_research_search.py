@@ -73,12 +73,21 @@ class QueryTests(unittest.TestCase):
     def test_markdown_structure_image_gaps_and_truncation(self):
         excerpt, truncated, images = search._page_excerpt(PAGE_BODY)
         self.assertIn("|亲本来源|", excerpt)
-        self.assertIn(search.IMAGE_PLACEHOLDER + "20.3", excerpt)
+        self.assertIn(search.IMAGE_PLACEHOLDER + "天", excerpt)
+        self.assertNotIn("20.3", excerpt)
+        self.assertNotIn("09.1", excerpt)
         self.assertNotIn("![", excerpt)
         self.assertNotIn("120.3", excerpt)
         self.assertTrue(images)
         self.assertFalse(truncated)
         self.assertTrue(search._page_excerpt("a" * (search.MAX_PUBLIC_PAGE_CHARS + 1))[1])
+
+    def test_incomplete_years_and_ranges_are_removed_as_whole_tokens(self):
+        body = "产量：2![a](https://example.com/a.gif)02-20![b](https://example.com/b.gif)3年。完整值：亩施纯氮11-13公斤。"
+        excerpt, _, _ = search._page_excerpt(body)
+        self.assertIn("产量：" + search.IMAGE_PLACEHOLDER + "年", excerpt)
+        self.assertIn("亩施纯氮11-13公斤", excerpt)
+        self.assertNotIn("02-20", excerpt)
 
 
 class TavilyTests(unittest.IsolatedAsyncioTestCase):
