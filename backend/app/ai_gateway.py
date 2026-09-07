@@ -184,8 +184,20 @@ class SecretRedactionFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
-            record.msg = redact_secrets(record.getMessage())
-            record.args = ()
+            # Uvicorn's AccessFormatter requires its five positional values.
+            # Preserve the argument shape and redact individual string values
+            # instead of replacing the fully rendered message and clearing args.
+            record.msg = redact_secrets(record.msg)
+            if isinstance(record.args, tuple):
+                record.args = tuple(
+                    redact_secrets(value) if isinstance(value, str) else value
+                    for value in record.args
+                )
+            elif isinstance(record.args, dict):
+                record.args = {
+                    key: redact_secrets(value) if isinstance(value, str) else value
+                    for key, value in record.args.items()
+                }
         except Exception:
             record.msg = "日志内容已因安全过滤异常而隐藏"
             record.args = ()
