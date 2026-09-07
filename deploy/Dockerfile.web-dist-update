@@ -1,0 +1,7 @@
+# Reuse the deployed Nginx image and replace only locally verified Vite output.
+# No Node.js, registry or package-manager access is required on the server.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+ARG SOURCE_REVISION
+LABEL org.opencontainers.image.revision=${SOURCE_REVISION}
+COPY frontend-prebuilt/dist /usr/share/nginx/html
