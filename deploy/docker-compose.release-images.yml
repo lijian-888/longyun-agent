@@ -1,0 +1,5 @@
+services:
+  api:
+    image: longyun-agent-api:${API_RELEASE_TAG:?Set API_RELEASE_TAG to the built API image tag}
+  web:
+    image: longyun-agent-web:${WEB_RELEASE_TAG:?Set WEB_RELEASE_TAG to the built web image tag}
