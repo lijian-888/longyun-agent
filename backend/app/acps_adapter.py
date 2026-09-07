@@ -8,6 +8,7 @@ plain text and returns a text product plus non-sensitive structured metadata.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import ssl
@@ -49,7 +50,7 @@ AcpsRole = Literal["leader", "partner", "hybrid"]
 AcpsDirectCommand = Literal["get", "continue", "complete", "cancel"]
 AcpsGroupTaskCommand = Literal["continue", "complete", "cancel"]
 AcpsGroupMemberCommand = Literal["status", "leave", "force-remove", "mute", "unmute"]
-PartnerExecutor = Callable[[str, str], Awaitable["AcpsExecutionResult"]]
+PartnerExecutor = Callable[..., Awaitable["AcpsExecutionResult"]]
 logger = logging.getLogger("uvicorn.error")
 
 try:
@@ -484,7 +485,10 @@ def build_partner_handlers(
             return
         TaskManager.update_task_status(task_id, TaskState.Working)
         try:
-            result = await executor(prompt, caller_aic)
+            if len(inspect.signature(executor).parameters) >= 3:
+                result = await executor(prompt, caller_aic, task_id)
+            else:  # Backward-compatible for embedders using the pre-gateway callback.
+                result = await executor(prompt, caller_aic)
             current = TaskManager.get_task(task_id)
             if not current or current.status.state == TaskState.Canceled:
                 return

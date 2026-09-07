@@ -17,6 +17,7 @@ import uuid
 from collections.abc import AsyncGenerator
 from typing import Any
 
+from .ai_gateway import AIGatewayConfigurationError, provider_settings
 from .research_search import build_public_page_failure_answer, build_public_search_fallback
 
 
@@ -79,16 +80,20 @@ async def infer_controlled_query_request(
     This is only a fallback when deterministic name/field rules cannot build a
     plan. The caller validates every returned value against the local catalog.
     """
-    api_key = os.getenv("SHENNONG_API_KEY", "").strip()
-    if not api_key:
+    try:
+        provider = provider_settings(require_key=False)
+    except AIGatewayConfigurationError:
+        return None
+    api_key = provider.api_key
+    if provider.external and not provider.api_key:
         return None
     try:
         import httpx
     except Exception:
         return None
 
-    base_url = os.getenv("SHENNONG_API_BASE_URL", "https://api.agent-tech.cc/api/v1").rstrip("/")
-    model_name = os.getenv("SHENNONG_MODEL", "sn").strip() or "sn"
+    base_url = provider.base_url
+    model_name = provider.model
     # This provider does not reliably apply `system` messages. Keep the full
     # contract in the user message so the request is executed consistently.
     planner_prompt = """你是水稻科研平台的结构化数据查询参数解析器。
@@ -111,7 +116,10 @@ JSON 格式严格如下：
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(
                 f"{base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                headers={
+                    **({"Authorization": f"Bearer {api_key}"} if api_key else {}),
+                    "Content-Type": "application/json",
+                },
                 json=request_payload,
             )
             response.raise_for_status()
@@ -463,9 +471,11 @@ async def stream_research_reply(
     has_current_vision_images: bool = False,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Yield guarded provider tokens plus a final persisted memory state."""
-    api_key = os.getenv("SHENNONG_API_KEY", "").strip()
-    if not api_key:
-        raise ResearchAgentError("尚未配置神农 API Key。请在部署服务器的 .env 中设置 SHENNONG_API_KEY 后重启服务。")
+    try:
+        provider = provider_settings()
+    except AIGatewayConfigurationError as exc:
+        raise ResearchAgentError(str(exc)) from exc
+    api_key = provider.api_key
 
     # AgentScope 1.0's generic OpenAI formatter does not reliably preserve
     # image_url blocks for this provider. Native image turns therefore use the
@@ -529,8 +539,8 @@ async def stream_research_reply(
     except Exception as exc:  # pragma: no cover - depends on image build
         raise ResearchAgentError("AgentScope 运行环境不可用，请检查后端依赖安装。") from exc
 
-    base_url = os.getenv("SHENNONG_API_BASE_URL", "https://api.agent-tech.cc/api/v1").rstrip("/")
-    model_name = os.getenv("SHENNONG_MODEL", "sn").strip() or "sn"
+    base_url = provider.base_url
+    model_name = provider.model
     prepared_memory_state = _sanitize_memory_for_react(_compact_memory_state(memory_state))
     page_failure = build_public_page_failure_answer(public_web_context)
     if page_failure:
@@ -564,7 +574,7 @@ async def stream_research_reply(
                 memory = InMemoryMemory()
         model = OpenAIChatModel(
             model_name=model_name,
-            api_key=api_key,
+            api_key=api_key or "not-required",
             stream=True,
             client_kwargs={"base_url": base_url},
             generate_kwargs={"temperature": 0.2},
@@ -849,7 +859,7 @@ async def _native_public_evidence_answer(
         async with httpx.AsyncClient(timeout=httpx.Timeout(60, connect=10)) as client:
             response = await client.post(
                 f"{base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}"},
+                headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
                 json={"model": model_name, "stream": False, "temperature": 0.2,
                       "messages": [{"role": "user", "content": (
                           contract + "\n\n用户问题：\n" + user_prompt
@@ -900,8 +910,9 @@ async def _stream_native_vision_reply(
     except Exception as exc:  # pragma: no cover - installed in deployment image
         raise ResearchAgentError("神农多模态运行环境不可用，请检查后端依赖安装。") from exc
 
-    base_url = os.getenv("SHENNONG_API_BASE_URL", "https://api.agent-tech.cc/api/v1").rstrip("/")
-    model_name = os.getenv("SHENNONG_MODEL", "sn").strip() or "sn"
+    provider = provider_settings()
+    base_url = provider.base_url
+    model_name = provider.model
     history: list[dict[str, str]] = []
     for item in conversation_history[-8:]:
         role = item.get("role")
@@ -944,7 +955,10 @@ async def _stream_native_vision_reply(
             async with client.stream(
                 "POST",
                 f"{base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                headers={
+                    **({"Authorization": f"Bearer {api_key}"} if api_key else {}),
+                    "Content-Type": "application/json",
+                },
                 json=request_payload,
             ) as response:
                 response.raise_for_status()

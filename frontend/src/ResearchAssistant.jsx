@@ -20,6 +20,7 @@ import {
   SendHorizontal,
   ShieldCheck,
   Sparkles,
+  Square,
   Trash2,
   Upload,
   UserRound,
@@ -398,6 +399,9 @@ export default function ResearchAssistant({ platformContext, onProjectChange }) 
   const chatLogRef = useRef(null);
   const followLatestRef = useRef(true);
   const imagePreviewUrlsRef = useRef({});
+  const activeAiTaskIdRef = useRef("");
+  const activeAiAbortRef = useRef(null);
+  const retryRequestRef = useRef(null);
 
   const activeSession = sessions.find((item) => item.id === activeSessionId);
   const attachmentById = new Map(attachments.map((item) => [item.id, item]));
@@ -703,6 +707,13 @@ export default function ResearchAssistant({ platformContext, onProjectChange }) 
     followLatestRef.current = true;
     setShowLatestButton(false);
     const currentTurnAttachmentIds = composerAttachmentIds.filter((id) => attachmentById.has(id));
+    const requestFingerprint = JSON.stringify({ content, knowledgeScope, attachmentIds: [...currentTurnAttachmentIds].sort() });
+    const idempotencyKey = retryRequestRef.current?.fingerprint === requestFingerprint
+      ? retryRequestRef.current.key
+      : crypto.randomUUID();
+    const abortController = new AbortController();
+    activeAiAbortRef.current = abortController;
+    activeAiTaskIdRef.current = "";
     const currentTurnAttachments = currentTurnAttachmentIds.map((id) => attachmentById.get(id));
     const userEntry = {
       ...localMessage("user", content),
@@ -722,7 +733,13 @@ export default function ResearchAssistant({ platformContext, onProjectChange }) 
       const response = await authorizedFetch(`/api/research/sessions/${activeSessionId}/chat/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content, knowledge_scope: knowledgeScope, attachment_ids: currentTurnAttachmentIds }),
+        body: JSON.stringify({
+          content,
+          knowledge_scope: knowledgeScope,
+          attachment_ids: currentTurnAttachmentIds,
+          idempotency_key: idempotencyKey,
+        }),
+        signal: abortController.signal,
       });
       if (!response.ok || !response.body) {
         const body = await response.json().catch(() => ({}));
@@ -745,6 +762,7 @@ export default function ResearchAssistant({ platformContext, onProjectChange }) 
               ? { ...item, title: parsed.data.title }
               : item));
           } else if (parsed.event === "status") {
+            if (parsed.data.task_id) activeAiTaskIdRef.current = parsed.data.task_id;
             setProgress(parsed.data.label || "正在处理");
           } else if (parsed.event === "token") {
             setMessages((items) => items.map((item) => item.id === assistantEntry.id
@@ -752,6 +770,7 @@ export default function ResearchAssistant({ platformContext, onProjectChange }) 
               : item));
           } else if (parsed.event === "complete") {
             completed = true;
+            retryRequestRef.current = null;
             setMessages((items) => items.map((item) => item.id === assistantEntry.id ? parsed.data.message : item));
             if (parsed.data.message?.report_available) {
               // The user already explicitly asked for a report in this turn.
@@ -777,11 +796,24 @@ export default function ResearchAssistant({ platformContext, onProjectChange }) 
         ? { ...item, streaming: false, content: `分析未完成：${detail}`, error: true }
         : item));
       setComposerAttachmentIds((items) => [...new Set([...currentTurnAttachmentIds, ...items])]);
+      setDraft(content);
+      retryRequestRef.current = { fingerprint: requestFingerprint, key: idempotencyKey };
       setNotice(detail);
     } finally {
+      activeAiTaskIdRef.current = "";
+      activeAiAbortRef.current = null;
       setSending(false);
       setProgress("");
     }
+  }
+
+  async function cancelGeneration() {
+    const taskId = activeAiTaskIdRef.current;
+    if (taskId) {
+      await authorizedFetch(`/api/ai/tasks/${taskId}/cancel`, { method: "POST" }).catch(() => null);
+    }
+    activeAiAbortRef.current?.abort();
+    setNotice("已请求取消当前 AI 任务；未完成内容不会保存为最终结果。");
   }
 
   function sendOnEnter(event) {
@@ -882,8 +914,10 @@ export default function ResearchAssistant({ platformContext, onProjectChange }) 
             <input ref={fileInputRef} hidden type="file" multiple accept=".pdf,.docx,.xlsx,.xls,.pptx,.txt,.md,.markdown,.html,.htm,.csv,.json,.xml,.png,.jpg,.jpeg,.webp" onChange={uploadFileInput} />
             <button className="icon-button" type="button" title="上传、粘贴或拖入当前会话附件（单个不超过 10 MB）" onClick={() => fileInputRef.current?.click()} disabled={uploading}><Paperclip size={18} /></button>
             <label className="knowledge-scope-select">知识库<select value={knowledgeScope} onChange={(event) => setKnowledgeScope(event.target.value)}><option value="both">我的 + 公共</option><option value="private">仅我的</option><option value="public">仅公共</option></select></label>
-            <span>{uploading ? "正在保存附件" : sending ? "模型正在生成，可继续编辑下一条问题或添加图片；当前问题完成后再发送" : "图片原图直接送入多模态视觉分析；PDF、Office、表格和文本在本地解析；按 Enter 发送，Shift + Enter 换行"}</span>
-            <button className="primary-button send-button" type="submit" disabled={!draft.trim() || sending || uploading}><SendHorizontal size={17} />发送</button>
+            <span>{uploading ? "正在保存附件" : sending ? "模型正在生成，可继续编辑下一条问题或添加图片；当前问题完成后再发送" : "外部模型仅接收公开或脱敏文本；私人附件需切换本地 vLLM；按 Enter 发送，Shift + Enter 换行"}</span>
+            {sending
+              ? <button className="secondary-button send-button" type="button" onClick={cancelGeneration}><Square size={15} />停止</button>
+              : <button className="primary-button send-button" type="submit" disabled={!draft.trim() || uploading}><SendHorizontal size={17} />发送</button>}
           </div>
         </form>
       </section>

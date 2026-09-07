@@ -56,9 +56,16 @@ services:
       KEYCLOAK_ISSUER: https://localhost:8443/realms/rice-research
       KEYCLOAK_JWKS_URL: http://keycloak:8080/realms/rice-research/protocol/openid-connect/certs
       KEYCLOAK_AUDIENCE: rice-research-web
+      AI_PROVIDER: ${AI_PROVIDER:-shennong}
+      AI_TASK_TIMEOUT_SECONDS: ${AI_TASK_TIMEOUT_SECONDS:-180}
+      AI_TASK_QUEUE_WAIT_SECONDS: ${AI_TASK_QUEUE_WAIT_SECONDS:-300}
+      AI_TASK_MAX_ATTEMPTS: ${AI_TASK_MAX_ATTEMPTS:-2}
       SHENNONG_API_BASE_URL: ${SHENNONG_API_BASE_URL:-https://api.agent-tech.cc/api/v1}
       SHENNONG_MODEL: ${SHENNONG_MODEL:-sn}
       SHENNONG_API_KEY: ${SHENNONG_API_KEY:-}
+      VLLM_API_BASE_URL: ${VLLM_API_BASE_URL:-http://vllm:8000/v1}
+      VLLM_MODEL: ${VLLM_MODEL:-local-model}
+      VLLM_API_KEY: ${VLLM_API_KEY:-}
       # ACPs v2.1 adapter. Local development defaults to a dual-role Direct
       # JSON-RPC endpoint; production registration supplies the real AIC/URLs.
       ACPS_ENABLED: ${ACPS_ENABLED:-true}

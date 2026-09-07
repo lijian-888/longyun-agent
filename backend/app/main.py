@@ -12,7 +12,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Generator, Literal
+from typing import Any, AsyncGenerator, Callable, Generator, Literal
 from urllib.parse import quote, urljoin
 
 import fitz
@@ -32,6 +32,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, create_engine, event, func, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker, with_loader_criteria
 from pgvector.sqlalchemy import Vector
 
@@ -121,7 +122,6 @@ from .published_data_query import (
     NumericFilter,
     StructuredQueryRequest,
     execute_published_data_query,
-    field_catalog_for_planner,
     is_likely_data_query,
     plan_query_from_question,
     plan_query_from_structured_request,
@@ -130,9 +130,17 @@ from .published_data_query import (
 from .research_agent import (
     EmptyResearchAnswerError,
     ResearchAgentError,
-    infer_controlled_query_request,
     prepare_working_memory_state,
     stream_research_reply,
+)
+from .ai_gateway import (
+    AIEgressBlockedError,
+    AIGatewayConcurrencyGate,
+    AIGatewayConfigurationError,
+    install_secret_log_filter,
+    prepare_egress,
+    provider_settings,
+    redact_secrets,
 )
 from .research_report import build_analysis_chart_png, build_research_report_pdf, is_report_request
 from .research_search import build_public_web_context, requested_public_pages, resolve_public_request, search_public_references
@@ -193,12 +201,20 @@ from .trial_statistics import TrialStatisticsError, run_controlled_trial_analysi
 
 # Keep background parser failures in the normal Uvicorn container log stream.
 logger = logging.getLogger("uvicorn.error")
+install_secret_log_filter()
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://rice:rice_demo_password@localhost:54329/rice_demo")
 MIGRATION_DATABASE_URL = os.getenv("MIGRATION_DATABASE_URL", DATABASE_URL)
 APP_DATABASE_ROLE = os.getenv("APP_DATABASE_ROLE", "rice_app")
 APP_DATABASE_PASSWORD = os.getenv("APP_DATABASE_PASSWORD", "rice_app_demo_password")
 DEPLOYMENT_ENV = os.getenv("DEPLOYMENT_ENV", "development").strip().lower()
+AI_GATEWAY_CONCURRENCY = 4
+AI_TASK_TIMEOUT_SECONDS = max(30, int(os.getenv("AI_TASK_TIMEOUT_SECONDS", "180")))
+AI_TASK_QUEUE_WAIT_SECONDS = max(30, int(os.getenv("AI_TASK_QUEUE_WAIT_SECONDS", "300")))
+AI_TASK_MAX_ATTEMPTS = min(3, max(1, int(os.getenv("AI_TASK_MAX_ATTEMPTS", "2"))))
+AI_TASK_GATE = AIGatewayConcurrencyGate(AI_GATEWAY_CONCURRENCY)
+AI_TASK_CANCEL_EVENTS: dict[str, asyncio.Event] = {}
+AI_TASK_RUNNING_COROUTINES: dict[str, asyncio.Task[Any]] = {}
 CORS_ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:5183").split(",")
@@ -686,6 +702,74 @@ class ResearchAudit(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
+class AIGatewayTask(Base):
+    """Durable admission record for every model call.
+
+    Prompts are deliberately not persisted here.  The existing private
+    conversation tables remain the source of content while this table stores
+    only routing, lifecycle, hashes and final-result references.
+    """
+
+    __tablename__ = "ai_gateway_task"
+    __table_args__ = (
+        UniqueConstraint(
+            "institution_id", "owner_id", "idempotency_key",
+            name="uq_ai_gateway_task_idempotency",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    institution_id: Mapped[str] = mapped_column(String(80), index=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("research_project.id"), index=True)
+    owner_id: Mapped[str] = mapped_column(String(120), index=True)
+    session_id: Mapped[str] = mapped_column(String(36), index=True)
+    task_type: Mapped[str] = mapped_column(String(60), default="research_chat", index=True)
+    provider: Mapped[str] = mapped_column(String(40), index=True)
+    model: Mapped[str] = mapped_column(String(200), index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(120))
+    request_hash: Mapped[str] = mapped_column(String(64))
+    egress_classification: Mapped[str] = mapped_column(String(40), default="pending")
+    redaction_count: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(30), default="queued", index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=AI_TASK_MAX_ATTEMPTS)
+    timeout_seconds: Mapped[int] = mapped_column(Integer, default=AI_TASK_TIMEOUT_SECONDS)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False)
+    request_message_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    result_message_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    result_payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    queued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
+class AIGatewayAudit(Base):
+    """Searchable, content-free AI lifecycle audit trail."""
+
+    __tablename__ = "ai_gateway_audit"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    institution_id: Mapped[str] = mapped_column(String(80), index=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("research_project.id"), index=True)
+    owner_id: Mapped[str] = mapped_column(String(120), index=True)
+    session_id: Mapped[str] = mapped_column(String(36), index=True)
+    task_id: Mapped[str] = mapped_column(ForeignKey("ai_gateway_task.id", ondelete="CASCADE"), index=True)
+    provider: Mapped[str] = mapped_column(String(40), index=True)
+    model: Mapped[str] = mapped_column(String(200), index=True)
+    action: Mapped[str] = mapped_column(String(80), index=True)
+    status: Mapped[str] = mapped_column(String(30), index=True)
+    audit_metadata: Mapped[dict] = mapped_column("metadata", JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True,
+    )
+
+
 class ResearchResult(Base):
     """A durable, private research product generated by the assistant.
 
@@ -795,6 +879,217 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 migration_engine = create_engine(MIGRATION_DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
 MigrationSessionLocal = sessionmaker(bind=migration_engine, autoflush=False, autocommit=False, expire_on_commit=False)
+
+
+class AITaskCancelledError(RuntimeError):
+    """Internal cooperative cancellation signal for an admitted AI task."""
+
+
+def _ai_request_hash(session_id: str, payload: "ResearchChatRequest") -> str:
+    canonical = json.dumps({
+        "session_id": session_id,
+        "content": payload.content.strip(),
+        "knowledge_scope": payload.knowledge_scope,
+        "attachment_ids": sorted(set(payload.attachment_ids)),
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _record_ai_audit(
+    db: Session,
+    task: AIGatewayTask,
+    action: str,
+    status: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    db.add(AIGatewayAudit(
+        institution_id=task.institution_id,
+        project_id=task.project_id,
+        owner_id=task.owner_id,
+        session_id=task.session_id,
+        task_id=task.id,
+        provider=task.provider,
+        model=task.model,
+        action=action,
+        status=status or task.status,
+        audit_metadata=metadata or {},
+    ))
+
+
+def _fail_interrupted_ai_tasks(db: Session) -> int:
+    """Make pre-restart outcomes explicit instead of leaving phantom work."""
+    interrupted = db.scalars(select(AIGatewayTask).where(
+        AIGatewayTask.status.in_(("queued", "running")),
+    )).all()
+    now = datetime.now(timezone.utc)
+    for task in interrupted:
+        previous_status = task.status
+        task.status = "failed"
+        task.error_code = "worker_interrupted"
+        task.error_message = "服务进程在任务完成前中断；可使用原幂等键安全重试。"
+        task.completed_at = now
+        task.updated_at = now
+        _record_ai_audit(
+            db, task, "worker_interrupted", "failed",
+            {"previous_status": previous_status, "retryable": True},
+        )
+    if interrupted:
+        db.commit()
+    return len(interrupted)
+
+
+def _load_ai_task(task_id: str) -> AIGatewayTask | None:
+    with SessionLocal() as db:
+        return db.get(AIGatewayTask, task_id)
+
+
+def _update_ai_task(
+    task_id: str,
+    *,
+    status: str | None = None,
+    action: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    error_code: str | None = None,
+    error_message: str | None = None,
+    result_message_id: str | None = None,
+    result_payload: dict[str, Any] | None = None,
+) -> None:
+    with SessionLocal() as db:
+        task = db.get(AIGatewayTask, task_id)
+        if not task:
+            return
+        now = datetime.now(timezone.utc)
+        if status:
+            task.status = status
+            if status == "running" and task.started_at is None:
+                task.started_at = now
+            if status in {"completed", "failed", "cancelled"}:
+                task.completed_at = now
+        if error_code is not None:
+            task.error_code = error_code
+        if error_message is not None:
+            task.error_message = redact_secrets(error_message)[:1000]
+        if result_message_id is not None:
+            task.result_message_id = result_message_id
+        if result_payload is not None:
+            task.result_payload = result_payload
+        task.updated_at = now
+        if action:
+            _record_ai_audit(db, task, action, status, metadata)
+        db.commit()
+
+
+async def _admit_ai_task(task_id: str) -> None:
+    """Wait in the institution-tagged durable queue for one of four slots."""
+    try:
+        task_snapshot = _load_ai_task(task_id)
+        namespace = task_snapshot.institution_id if task_snapshot else "unknown"
+        await AI_TASK_GATE.acquire(task_id, namespace, AI_TASK_QUEUE_WAIT_SECONDS)
+    except TimeoutError as exc:
+        _update_ai_task(
+            task_id,
+            status="failed",
+            action="queue_timeout",
+            error_code="queue_timeout",
+            error_message="等待 AI 执行槽超时。",
+        )
+        raise ResearchAgentError("当前 AI 队列等待超时，本任务已明确标记失败，可使用原幂等键重试。") from exc
+    try:
+        with SessionLocal() as db:
+            task = db.get(AIGatewayTask, task_id)
+            if not task or task.cancel_requested or task.status == "cancelled":
+                if task and task.status != "cancelled":
+                    task.status = "cancelled"
+                    task.completed_at = datetime.now(timezone.utc)
+                    _record_ai_audit(db, task, "cancelled_before_start", "cancelled")
+                    db.commit()
+                raise AITaskCancelledError("AI 任务已取消。")
+            task.status = "running"
+            task.started_at = datetime.now(timezone.utc)
+            task.updated_at = task.started_at
+            task.attempt_count += 1
+            _record_ai_audit(db, task, "started", "running", {
+                "attempt": task.attempt_count,
+                "max_concurrency": AI_GATEWAY_CONCURRENCY,
+            })
+            db.commit()
+    except Exception:
+        AI_TASK_GATE.release(task_id)
+        raise
+    AI_TASK_CANCEL_EVENTS[task_id] = asyncio.Event()
+    current = asyncio.current_task()
+    if current:
+        AI_TASK_RUNNING_COROUTINES[task_id] = current
+
+
+def _release_ai_task(task_id: str) -> None:
+    AI_TASK_CANCEL_EVENTS.pop(task_id, None)
+    AI_TASK_RUNNING_COROUTINES.pop(task_id, None)
+    AI_TASK_GATE.release(task_id)
+
+
+def _raise_if_ai_task_cancelled(task_id: str) -> None:
+    event = AI_TASK_CANCEL_EVENTS.get(task_id)
+    if event and event.is_set():
+        raise AITaskCancelledError("AI 任务已取消。")
+    with SessionLocal() as db:
+        task = db.get(AIGatewayTask, task_id)
+        if task and task.cancel_requested:
+            raise AITaskCancelledError("AI 任务已取消。")
+
+
+def _record_ai_retry(task_id: str, reason: str) -> int:
+    with SessionLocal() as db:
+        task = db.get(AIGatewayTask, task_id)
+        if not task:
+            return AI_TASK_MAX_ATTEMPTS
+        task.attempt_count += 1
+        task.updated_at = datetime.now(timezone.utc)
+        _record_ai_audit(db, task, "retry_started", "running", {
+            "attempt": task.attempt_count,
+            "reason": redact_secrets(reason)[:300],
+        })
+        attempt = task.attempt_count
+        db.commit()
+        return attempt
+
+
+async def _stream_ai_with_resilience(
+    task_id: str,
+    stream_factory: Callable[[], AsyncGenerator[dict[str, Any], None]],
+) -> AsyncGenerator[dict[str, Any], None]:
+    """Apply task timeout and bounded pre-render retries to a model stream."""
+    task = _load_ai_task(task_id)
+    max_attempts = task.max_attempts if task else AI_TASK_MAX_ATTEMPTS
+    timeout_seconds = task.timeout_seconds if task else AI_TASK_TIMEOUT_SECONDS
+    attempt = task.attempt_count if task else 1
+    while True:
+        rendered_token = False
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                async for result in stream_factory():
+                    _raise_if_ai_task_cancelled(task_id)
+                    if result.get("type") == "token" and result.get("text"):
+                        rendered_token = True
+                    yield result
+            return
+        except asyncio.CancelledError:
+            raise
+        except AITaskCancelledError:
+            raise
+        except (TimeoutError, ResearchAgentError) as exc:
+            if rendered_token or attempt >= max_attempts:
+                if isinstance(exc, TimeoutError):
+                    raise ResearchAgentError(
+                        f"AI 任务超过 {timeout_seconds} 秒执行时限，已明确标记失败。"
+                    ) from exc
+                raise
+            attempt = _record_ai_retry(task_id, str(exc))
+            yield {
+                "type": "gateway_retry",
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+            }
 
 
 def get_session() -> Generator[Session, None, None]:
@@ -1023,6 +1318,8 @@ PROJECT_SCOPED_MODELS = (
     ResearchMessage,
     ResearchAttachment,
     ResearchAudit,
+    AIGatewayTask,
+    AIGatewayAudit,
     ResearchResult,
     KnowledgeFolder,
     KnowledgeDocument,
@@ -2133,6 +2430,7 @@ class ResearchChatRequest(BaseModel):
     content: str = Field(min_length=1, max_length=12000)
     knowledge_scope: Literal["private", "public", "both"] = "both"
     attachment_ids: list[str] = Field(default_factory=list, max_length=20)
+    idempotency_key: str | None = Field(default=None, min_length=8, max_length=120, pattern=r"^[A-Za-z0-9._:-]+$")
 
 
 class ResearchStructuredQueryRequest(BaseModel):
@@ -2810,6 +3108,8 @@ def ensure_single_institution_schema(session: Session) -> None:
         "research_message",
         "research_attachment",
         "research_audit",
+        "ai_gateway_task",
+        "ai_gateway_audit",
         "research_result",
         "knowledge_folder",
         "knowledge_document",
@@ -2905,6 +3205,12 @@ def startup() -> None:
             raise RuntimeError("PostgreSQL pgvector 扩展不可用，请使用包含 pgvector 的数据库镜像。") from exc
     Base.metadata.create_all(migration_engine)
     with MigrationSessionLocal() as session:
+        interrupted_ai_tasks = _fail_interrupted_ai_tasks(session)
+        if interrupted_ai_tasks:
+            logger.warning(
+                "Marked %s interrupted AI gateway tasks as explicitly failed during startup",
+                interrupted_ai_tasks,
+            )
         # Trial data remains separate from legacy variety-level records.  A
         # measurement is meaningful only together with trial, treatment,
         # replicate, environment and raw-source location.
@@ -2953,8 +3259,23 @@ def startup() -> None:
 
 
 @app.get("/api/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+def health() -> dict[str, Any]:
+    try:
+        selected_provider = provider_settings(require_key=False)
+        provider_name = selected_provider.provider
+        model_name = selected_provider.model
+    except AIGatewayConfigurationError:
+        provider_name = "invalid"
+        model_name = ""
+    return {
+        "status": "ok",
+        "ai_gateway": {
+            "provider": provider_name,
+            "model": model_name,
+            "max_concurrency": AI_GATEWAY_CONCURRENCY,
+            "active_tasks": len(AI_TASK_GATE.active_namespaces()),
+        },
+    }
 
 
 INSTITUTION_TEMPLATE_DATASETS = {
@@ -5693,29 +6014,9 @@ async def build_published_evidence_context(
     clarification: str | None = None
     unresolved_variety_names: list[str] = []
 
-    # The model only fills a request form when deterministic matching cannot
-    # understand a likely data query. It never receives table data or SQL.
-    if not query_plan and likely_data_query:
-        planner_result = await infer_controlled_query_request(
-            question=question,
-            field_catalog=field_catalog_for_planner(TRAITS, ROOT_TRAITS),
-        )
-        if planner_result:
-            try:
-                structured_request = StructuredQueryRequest.model_validate(planner_result)
-                clarification = structured_request.clarification
-                query_plan, unresolved_variety_names = plan_query_from_structured_request(
-                    session,
-                    structured_request,
-                    TRAITS,
-                    ROOT_TRAITS,
-                    project_id,
-                )
-                query_planner = "神农受控参数解析"
-            except ValueError:
-                # Invalid model output is deliberately ignored; no free-form
-                # fallback can ever reach the database.
-                pass
+    # AI-backed query planning is intentionally not invoked here: every model
+    # call must first enter the authenticated AI gateway queue.  Ambiguous
+    # structured-data questions use the deterministic clarification path below.
 
     if not query_plan:
         if not likely_data_query:
@@ -6220,6 +6521,137 @@ def _report_fallback_content(
     return "已依据本轮受控证据生成可下载 PDF 报告。请通过下方结果卡下载并复核来源。"
 
 
+def _serialize_ai_task(item: AIGatewayTask) -> dict[str, Any]:
+    return {
+        "id": item.id,
+        "institution_id": item.institution_id,
+        "project_id": item.project_id,
+        "user_id": item.owner_id,
+        "session_id": item.session_id,
+        "task_type": item.task_type,
+        "provider": item.provider,
+        "model": item.model,
+        "status": item.status,
+        "attempt_count": item.attempt_count,
+        "max_attempts": item.max_attempts,
+        "timeout_seconds": item.timeout_seconds,
+        "egress_classification": item.egress_classification,
+        "redaction_count": item.redaction_count,
+        "cancel_requested": item.cancel_requested,
+        "error_code": item.error_code,
+        "error_message": item.error_message,
+        "queued_at": item.queued_at.isoformat(),
+        "started_at": item.started_at.isoformat() if item.started_at else None,
+        "completed_at": item.completed_at.isoformat() if item.completed_at else None,
+    }
+
+
+@app.get("/api/ai/audit")
+def search_ai_audit(
+    task_id: str | None = Query(default=None),
+    user_id: str | None = Query(default=None),
+    model: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    started_from: datetime | None = Query(default=None),
+    started_to: datetime | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    user: CurrentUser = Depends(require_business_user),
+    session: Session = Depends(get_business_project_session),
+) -> dict[str, Any]:
+    """Search content-free AI audit records within the caller's institution."""
+    account = sync_platform_account(session, user)
+    conditions = [
+        AIGatewayAudit.institution_id == account.institution_id,
+        AIGatewayAudit.project_id == active_project_id(session),
+    ]
+    if "field_admin" not in user.roles:
+        conditions.append(AIGatewayAudit.owner_id == user.id)
+    elif user_id:
+        conditions.append(AIGatewayAudit.owner_id == user_id)
+    if task_id:
+        conditions.append(AIGatewayAudit.task_id == task_id)
+    if model:
+        conditions.append(AIGatewayAudit.model == model)
+    if status:
+        conditions.append(AIGatewayAudit.status == status)
+    if started_from:
+        conditions.append(AIGatewayAudit.created_at >= started_from)
+    if started_to:
+        conditions.append(AIGatewayAudit.created_at <= started_to)
+    rows = session.scalars(
+        select(AIGatewayAudit)
+        .where(*conditions)
+        .order_by(AIGatewayAudit.created_at.desc())
+        .limit(limit)
+    ).all()
+    return {
+        "institution_id": account.institution_id,
+        "items": [{
+            "id": item.id,
+            "task_id": item.task_id,
+            "institution_id": item.institution_id,
+            "project_id": item.project_id,
+            "user_id": item.owner_id,
+            "session_id": item.session_id,
+            "provider": item.provider,
+            "model": item.model,
+            "action": item.action,
+            "status": item.status,
+            "metadata": item.audit_metadata or {},
+            "created_at": item.created_at.isoformat(),
+        } for item in rows],
+    }
+
+
+@app.get("/api/ai/tasks/{task_id}")
+def get_ai_task_status(
+    task_id: str,
+    user: CurrentUser = Depends(require_business_user),
+    session: Session = Depends(get_business_project_session),
+) -> dict[str, Any]:
+    account = sync_platform_account(session, user)
+    task = session.get(AIGatewayTask, task_id)
+    if (
+        not task
+        or task.institution_id != account.institution_id
+        or ("field_admin" not in user.roles and task.owner_id != user.id)
+    ):
+        raise HTTPException(404, "未找到该 AI 任务。")
+    return _serialize_ai_task(task)
+
+
+@app.post("/api/ai/tasks/{task_id}/cancel")
+def cancel_ai_task(
+    task_id: str,
+    user: CurrentUser = Depends(require_business_user),
+    session: Session = Depends(get_business_project_session),
+) -> dict[str, Any]:
+    account = sync_platform_account(session, user)
+    task = session.get(AIGatewayTask, task_id)
+    if (
+        not task
+        or task.institution_id != account.institution_id
+        or ("field_admin" not in user.roles and task.owner_id != user.id)
+    ):
+        raise HTTPException(404, "未找到该 AI 任务。")
+    if task.status in {"completed", "failed", "cancelled"}:
+        raise HTTPException(409, f"AI 任务已处于终态 {task.status}，不能再次取消。")
+    task.cancel_requested = True
+    if task.status == "queued":
+        task.status = "cancelled"
+        task.completed_at = datetime.now(timezone.utc)
+    task.updated_at = datetime.now(timezone.utc)
+    _record_ai_audit(session, task, "cancel_requested", task.status, {"requested_by": user.id})
+    session.commit()
+    cancel_event = AI_TASK_CANCEL_EVENTS.get(task_id)
+    if cancel_event:
+        cancel_event.set()
+    running = AI_TASK_RUNNING_COROUTINES.get(task_id)
+    if running and not running.done():
+        running.cancel()
+    return _serialize_ai_task(task)
+
+
 @app.post("/api/research/sessions/{research_session_id}/chat/stream")
 async def research_chat_stream(
     research_session_id: str,
@@ -6228,6 +6660,42 @@ async def research_chat_stream(
     session: Session = Depends(get_research_session),
 ) -> StreamingResponse:
     research_session = get_owned_research_session(session, research_session_id)
+    account = sync_platform_account(session, user)
+    try:
+        selected_provider = provider_settings()
+    except AIGatewayConfigurationError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    idempotency_key = payload.idempotency_key or str(uuid.uuid4())
+    request_hash = _ai_request_hash(research_session_id, payload)
+    existing_task = session.scalar(select(AIGatewayTask).where(
+        AIGatewayTask.institution_id == account.institution_id,
+        AIGatewayTask.owner_id == user.id,
+        AIGatewayTask.idempotency_key == idempotency_key,
+    ))
+    if existing_task and existing_task.request_hash != request_hash:
+        raise HTTPException(409, "同一幂等键已用于不同请求，请为新问题生成新的幂等键。")
+    if existing_task and existing_task.status == "completed" and existing_task.result_message_id:
+        completed_message = session.get(ResearchMessage, existing_task.result_message_id)
+        if completed_message and completed_message.session_id == research_session_id:
+            response_message = serialize_research_message(completed_message)
+            _record_ai_audit(session, existing_task, "idempotent_result_replayed", "completed")
+            session.commit()
+
+            async def replay_completed_result() -> Any:
+                yield sse_event("status", {
+                    "label": "相同请求已完成，正在复用既有结果",
+                    "task_id": existing_task.id,
+                    "queue_namespace": existing_task.institution_id,
+                })
+                yield sse_event("complete", {"message": response_message, "idempotent_replay": True})
+
+            return StreamingResponse(
+                replay_completed_result(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+    if existing_task and existing_task.status in {"queued", "running"}:
+        raise HTTPException(409, f"相同幂等键对应的 AI 任务仍为 {existing_task.status}，不会重复创建任务。")
     breeding_report_requested = is_breeding_report_request(payload.content)
     report_requested = is_report_request(payload.content) or breeding_report_requested
     breeding_report_context: dict[str, Any] | None = None
@@ -6291,6 +6759,7 @@ async def research_chat_stream(
         {"role": item.role, "content": item.content}
         for item in reversed(history_items)
         if item.role in {"user", "assistant"}
+        and (not existing_task or item.id != existing_task.request_message_id)
     ]
     static_evidence_context = f"{published_context}\n\n{breeding_context}\n\n{attachment_context}\n\n{knowledge_context}"
     if len(static_evidence_context) > MAX_RESEARCH_CONTEXT_CHARS:
@@ -6299,25 +6768,136 @@ async def research_chat_stream(
             "当前会话附件与证据材料过长，未向模型截断。请移除部分附件或拆分后再分析。",
         )
     static_evidence = [*published_cards, *breeding_cards, *attachment_cards, *knowledge_cards, *vision_cards]
-    user_message = ResearchMessage(
-        session_id=research_session_id,
-        project_id=research_session.project_id,
-        owner_id=user.id,
-        role="user",
-        content=payload.content.strip(),
-        evidence=message_attachment_evidence(current_turn_attachments),
-        operation_state=[
-            {"state": "accepted", "label": "已接收问题"},
-            *([{ "state": "attachments", "label": f"已随本轮提交 {len(current_turn_attachments)} 个附件" }] if current_turn_attachments else []),
-            *([{
-                "state": "report_requested",
-                "label": "已识别品种选育报告请求" if breeding_report_requested else "已识别生成 PDF 报告请求",
-            }] if report_requested else []),
-        ],
+    memory_state = research_session.memory_state or {}
+    private_evidence_selected = bool(attachment_cards or vision_blocks) or any(
+        card.get("type") == "private_knowledge" for card in knowledge_cards
     )
+    raw_egress_texts = [
+        payload.content.strip(),
+        static_evidence_context,
+        json.dumps(memory_state, ensure_ascii=False),
+        *(item["content"] for item in conversation_history),
+    ]
+    try:
+        egress = prepare_egress(
+            raw_egress_texts,
+            provider=selected_provider,
+            contains_private_material=private_evidence_selected,
+        )
+    except AIEgressBlockedError as exc:
+        blocked_task = existing_task or AIGatewayTask(
+            institution_id=account.institution_id,
+            project_id=research_session.project_id,
+            owner_id=user.id,
+            session_id=research_session_id,
+            provider=selected_provider.provider,
+            model=selected_provider.model,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            egress_classification="blocked_sensitive",
+            status="failed",
+            error_code="egress_policy_blocked",
+            error_message=str(exc),
+            completed_at=datetime.now(timezone.utc),
+        )
+        if not existing_task:
+            session.add(blocked_task)
+            try:
+                session.flush()
+            except IntegrityError as conflict:
+                session.rollback()
+                raise HTTPException(409, "相同幂等键的请求已被网关接收。") from conflict
+        else:
+            blocked_task.status = "failed"
+            blocked_task.egress_classification = "blocked_sensitive"
+            blocked_task.error_code = "egress_policy_blocked"
+            blocked_task.error_message = str(exc)
+            blocked_task.completed_at = datetime.now(timezone.utc)
+        _record_ai_audit(session, blocked_task, "egress_blocked", "failed", {
+            "contains_private_material": private_evidence_selected,
+        })
+        session.commit()
+        raise HTTPException(422, str(exc)) from exc
+    safe_user_prompt, safe_static_evidence_context, safe_memory_json, *safe_history_texts = egress.texts
+    try:
+        safe_memory_state = json.loads(safe_memory_json) if safe_memory_json else {}
+    except ValueError:
+        safe_memory_state = {}
+    safe_conversation_history = [
+        {"role": item["role"], "content": safe_content}
+        for item, safe_content in zip(conversation_history, safe_history_texts, strict=True)
+    ]
+
+    ai_task = existing_task
+    new_request_message = not (ai_task and ai_task.request_message_id)
+    user_message = session.get(ResearchMessage, ai_task.request_message_id) if ai_task and ai_task.request_message_id else None
+    if not user_message:
+        new_request_message = True
+        user_message = ResearchMessage(
+            session_id=research_session_id,
+            project_id=research_session.project_id,
+            owner_id=user.id,
+            role="user",
+            content=payload.content.strip(),
+            evidence=message_attachment_evidence(current_turn_attachments),
+            operation_state=[
+                {"state": "accepted", "label": "已接收问题"},
+                *([{ "state": "attachments", "label": f"已随本轮提交 {len(current_turn_attachments)} 个附件" }] if current_turn_attachments else []),
+                *([{
+                    "state": "report_requested",
+                    "label": "已识别品种选育报告请求" if breeding_report_requested else "已识别生成 PDF 报告请求",
+                }] if report_requested else []),
+            ],
+        )
+        session.add(user_message)
+        session.flush()
+    if ai_task:
+        ai_task.status = "queued"
+        ai_task.cancel_requested = False
+        ai_task.completed_at = None
+        ai_task.started_at = None
+        ai_task.error_code = None
+        ai_task.error_message = None
+        ai_task.egress_classification = egress.classification
+        ai_task.redaction_count = egress.redactions
+        ai_task.request_message_id = user_message.id
+        ai_task.queued_at = datetime.now(timezone.utc)
+        _record_ai_audit(session, ai_task, "retry_queued", "queued", {
+            "previous_attempts": ai_task.attempt_count,
+            "egress_classification": egress.classification,
+            "redaction_count": egress.redactions,
+        })
+    else:
+        ai_task = AIGatewayTask(
+            institution_id=account.institution_id,
+            project_id=research_session.project_id,
+            owner_id=user.id,
+            session_id=research_session_id,
+            provider=selected_provider.provider,
+            model=selected_provider.model,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            egress_classification=egress.classification,
+            redaction_count=egress.redactions,
+            status="queued",
+            max_attempts=AI_TASK_MAX_ATTEMPTS,
+            timeout_seconds=AI_TASK_TIMEOUT_SECONDS,
+            request_message_id=user_message.id,
+        )
+        session.add(ai_task)
+        try:
+            session.flush()
+        except IntegrityError as exc:
+            session.rollback()
+            raise HTTPException(409, "相同幂等键的请求已被网关接收，不会重复创建 AI 任务。") from exc
+        _record_ai_audit(session, ai_task, "queued", "queued", {
+            "queue_namespace": account.institution_id,
+            "egress_classification": egress.classification,
+            "redaction_count": egress.redactions,
+            "max_concurrency": AI_GATEWAY_CONCURRENCY,
+        })
     research_session.updated_at = datetime.now(timezone.utc)
-    session.add(user_message)
-    if automatic_session_title:
+    if automatic_session_title and new_request_message:
         session.add(ResearchAudit(
             owner_id=user.id,
             project_id=research_session.project_id,
@@ -6329,24 +6909,26 @@ async def research_chat_stream(
                 "source": "first_user_message",
             },
         ))
-    session.add(ResearchAudit(
-        owner_id=user.id,
-        project_id=research_session.project_id,
-        session_id=research_session_id,
-        action="assistant_question_submitted",
-        audit_metadata={
-            "current_turn_attachment_count": len(current_turn_attachments),
-            "context_attachment_count": len(context_attachments),
-            "vision_attachment_count": len(vision_attachments),
-            "vision_attachment_source": "current_turn" if has_current_vision_images else ("latest_history_turn" if vision_attachments else "none"),
-            "published_evidence_count": len(published_cards),
-            "breeding_dossier_evidence_count": len(breeding_cards),
-            "knowledge_evidence_count": len(knowledge_cards),
-            "knowledge_scope": payload.knowledge_scope,
-        },
-    ))
-    memory_state = research_session.memory_state or {}
+    if new_request_message:
+        session.add(ResearchAudit(
+            owner_id=user.id,
+            project_id=research_session.project_id,
+            session_id=research_session_id,
+            action="assistant_question_submitted",
+            audit_metadata={
+                "ai_task_id": ai_task.id,
+                "current_turn_attachment_count": len(current_turn_attachments),
+                "context_attachment_count": len(context_attachments),
+                "vision_attachment_count": len(vision_attachments),
+                "vision_attachment_source": "current_turn" if has_current_vision_images else ("latest_history_turn" if vision_attachments else "none"),
+                "published_evidence_count": len(published_cards),
+                "breeding_dossier_evidence_count": len(breeding_cards),
+                "knowledge_evidence_count": len(knowledge_cards),
+                "knowledge_scope": payload.knowledge_scope,
+            },
+        ))
     session.commit()
+    ai_task_id = ai_task.id
 
     async def event_stream() -> Any:
         if automatic_session_title:
@@ -6357,17 +6939,36 @@ async def research_chat_stream(
         yield sse_event("status", {"label": "正在读取已发布标准数据、当前会话附件和本地知识库证据"})
         full_text = ""
         model_answer_started = False
+        slot_acquired = False
         try:
+            yield sse_event("status", {
+                "label": "AI 任务已进入机构队列",
+                "task_id": ai_task_id,
+                "queue_namespace": account.institution_id,
+                "max_concurrency": AI_GATEWAY_CONCURRENCY,
+            })
+            await _admit_ai_task(ai_task_id)
+            slot_acquired = True
+            yield sse_event("status", {
+                "label": "AI 任务已取得执行槽",
+                "task_id": ai_task_id,
+                "queue_namespace": account.institution_id,
+            })
             evidence = list(static_evidence)
-            evidence_context = static_evidence_context
+            evidence_context = safe_static_evidence_context
             public_web_context = ""
             if vision_blocks:
                 yield sse_event("status", {"label": f"正在准备 {len(vision_attachments)} 张本地图片供当前模型进行视觉分析"})
-            public_request = resolve_public_request(payload.content, conversation_history)
+            public_request = resolve_public_request(safe_user_prompt, safe_conversation_history)
             page_read = bool(requested_public_pages(public_request))
             yield sse_event("status", {"label": "正在通过 Tavily 读取指定网页正文" if page_read else "正在判断是否需要检索近期可信公开资料"})
             web_results, search_note = await search_public_references(public_request)
             public_web_context = build_public_web_context(web_results, search_note, question=public_request)
+            try:
+                public_egress = prepare_egress([public_web_context], provider=selected_provider)
+                public_web_context = public_egress.texts[0]
+            except AIEgressBlockedError as exc:
+                raise ResearchAgentError(str(exc)) from exc
             if web_results:
                 evidence.extend({
                     "priority": 4,
@@ -6385,10 +6986,10 @@ async def research_chat_stream(
                 yield sse_event("status", {"label": search_note})
 
             if len(f"{evidence_context}\n\n{public_web_context}") > MAX_RESEARCH_CONTEXT_CHARS:
-                yield sse_event("error", {
-                    "detail": "当前会话附件、已发布数据与公开资料合计过长，未向模型截断。请移除部分附件或拆分问题后重试。",
-                })
-                return
+                raise ResearchAgentError(
+                    "当前会话附件、已发布数据与公开资料合计过长，未向模型截断。"
+                    "请移除部分附件或拆分问题后重试。"
+                )
 
             # Yield before compacting so the browser can render the same
             # waiting state users see in mature research assistants.  The
@@ -6399,23 +7000,32 @@ async def research_chat_stream(
                 # tiny yield window so the browser can paint the progress
                 # state before the request continues to the model call.
                 await asyncio.sleep(0.12)
-            working_memory_state, memory_was_compacted = prepare_working_memory_state(memory_state)
+            working_memory_state, memory_was_compacted = prepare_working_memory_state(safe_memory_state)
             if memory_was_compacted and len((memory_state or {}).get("content") or []) <= 8:
                 yield sse_event("status", {"label": "正在自动压缩上下文"})
                 await asyncio.sleep(0.12)
             yield sse_event("status", {"label": "正在调用大模型"})
-            async for result in stream_research_reply(
-                user_prompt=payload.content.strip(),
-                evidence_context=evidence_context,
-                memory_state=working_memory_state,
-                public_web_context=public_web_context,
-                vision_images=vision_blocks,
-                # A new image is a new observation.  Do not send prior visual
-                # diagnoses as chat history, or they can be mistaken for facts
-                # about this image.  Pure text follow-ups retain the history.
-                conversation_history=[] if has_current_vision_images else conversation_history,
-                has_current_vision_images=has_current_vision_images,
+            async for result in _stream_ai_with_resilience(
+                ai_task_id,
+                lambda: stream_research_reply(
+                    user_prompt=safe_user_prompt,
+                    evidence_context=evidence_context,
+                    memory_state=working_memory_state,
+                    public_web_context=public_web_context,
+                    vision_images=vision_blocks,
+                    # A new image is a new observation.  Do not send prior visual
+                    # diagnoses as chat history, or they can be mistaken for facts
+                    # about this image.  Pure text follow-ups retain the history.
+                    conversation_history=[] if has_current_vision_images else safe_conversation_history,
+                    has_current_vision_images=has_current_vision_images,
+                ),
             ):
+                if result["type"] == "gateway_retry":
+                    yield sse_event("status", {
+                        "label": f"上游调用未完成，正在进行第 {result['attempt']} 次受控重试",
+                        "task_id": ai_task_id,
+                    })
+                    continue
                 if result["type"] == "token":
                     if not model_answer_started:
                         model_answer_started = True
@@ -6458,6 +7068,7 @@ async def research_chat_stream(
                         session_id=research_session_id,
                         action="assistant_answer_completed",
                         audit_metadata={
+                            "ai_task_id": ai_task_id,
                             "evidence_count": len(evidence),
                             "knowledge_evidence_count": len(knowledge_cards),
                             "public_web_source_count": len(web_results),
@@ -6487,14 +7098,44 @@ async def research_chat_stream(
                         ]
                     response_message = serialize_research_message(assistant_message)
                     write_session.commit()
-                yield sse_event("complete", {"message": response_message})
+                _update_ai_task(
+                    ai_task_id,
+                    status="completed",
+                    action="completed",
+                    metadata={"response_mode": result.get("response_mode", "model")},
+                    result_message_id=response_message["id"],
+                )
+                yield sse_event("complete", {"message": response_message, "task_id": ai_task_id})
+        except asyncio.CancelledError:
+            _update_ai_task(
+                ai_task_id, status="cancelled", action="cancelled",
+                error_code="client_or_user_cancelled",
+                error_message="客户端断开连接或用户主动取消。",
+            )
+            raise
+        except AITaskCancelledError as exc:
+            _update_ai_task(
+                ai_task_id, status="cancelled", action="cancelled",
+                error_code="user_cancelled", error_message=str(exc),
+            )
+            yield sse_event("error", {"detail": str(exc), "task_id": ai_task_id})
         except HTTPException as exc:
             detail = exc.detail if isinstance(exc.detail, str) else "请求未能完成，请检查输入内容后重试。"
-            yield sse_event("error", {"detail": detail})
+            _update_ai_task(
+                ai_task_id, status="failed", action="failed",
+                error_code="http_error", error_message=detail,
+            )
+            yield sse_event("error", {"detail": detail, "task_id": ai_task_id})
         except EmptyResearchAnswerError:
             if not report_requested:
+                _update_ai_task(
+                    ai_task_id, status="failed", action="failed",
+                    error_code="empty_model_answer",
+                    error_message="大模型未返回可展示的研究结论。",
+                )
                 yield sse_event("error", {
                     "detail": "大模型未返回可展示的研究结论（仅收到占位符或空内容）。本轮未保存回答，请重新提问。",
+                    "task_id": ai_task_id,
                 })
                 return
 
@@ -6541,6 +7182,7 @@ async def research_chat_stream(
                     session_id=research_session_id,
                     action="assistant_report_completed_without_model_text",
                     audit_metadata={
+                        "ai_task_id": ai_task_id,
                         "evidence_count": len(evidence),
                         "knowledge_evidence_count": len(knowledge_cards),
                         "public_web_source_count": len(web_results),
@@ -6548,8 +7190,14 @@ async def research_chat_stream(
                         "model_output": "placeholder_or_empty",
                     },
                 ))
+                write_session.flush()
                 response_message = serialize_research_message(assistant_message)
                 write_session.commit()
+            _update_ai_task(
+                ai_task_id, status="completed", action="completed_without_model_text",
+                metadata={"result_source": "controlled_report"},
+                result_message_id=response_message["id"],
+            )
             logger.warning(
                 "Completed deterministic report after rejecting placeholder model output: session_id=%s user_id=%s report_kind=%s",
                 research_session_id,
@@ -6557,9 +7205,13 @@ async def research_chat_stream(
                 "breeding_dossier" if breeding_report_requested else "research_report",
             )
             yield sse_event("status", {"label": "大模型未返回可展示的说明，已保留基于受控数据生成的报告"})
-            yield sse_event("complete", {"message": response_message})
+            yield sse_event("complete", {"message": response_message, "task_id": ai_task_id})
         except ResearchAgentError as exc:
-            yield sse_event("error", {"detail": str(exc)})
+            _update_ai_task(
+                ai_task_id, status="failed", action="failed",
+                error_code="provider_or_policy_error", error_message=str(exc),
+            )
+            yield sse_event("error", {"detail": str(exc), "task_id": ai_task_id})
         except Exception as exc:
             error_id = uuid.uuid4().hex[:10]
             logger.exception(
@@ -6568,12 +7220,19 @@ async def research_chat_stream(
                 research_session_id,
                 user.id,
             )
-            raw_detail = re.sub(r"(?i)(bearer\\s+|api[_-]?key[=:]\\s*)[^\\s,;]+", r"\\1***", str(exc)).strip()
+            raw_detail = redact_secrets(exc).strip()
             if raw_detail:
                 detail = f"后端执行异常（{type(exc).__name__}，错误编号 {error_id}）：{raw_detail[:260]}"
             else:
                 detail = f"后端执行异常（{type(exc).__name__}，错误编号 {error_id}）。请将该编号提供给管理员排查。"
-            yield sse_event("error", {"detail": detail})
+            _update_ai_task(
+                ai_task_id, status="failed", action="failed",
+                error_code=type(exc).__name__, error_message=detail,
+            )
+            yield sse_event("error", {"detail": detail, "task_id": ai_task_id})
+        finally:
+            if slot_acquired:
+                _release_ai_task(ai_task_id)
 
     return StreamingResponse(
         event_stream(),
@@ -7365,32 +8024,149 @@ def pdf_report(
     return Response(content=buffer.getvalue(), media_type="application/pdf", headers={"Content-Disposition": "attachment; filename=rice-phenotype-report.pdf"})
 
 
-async def execute_longyun_acps_partner(question: str, caller_aic: str) -> AcpsExecutionResult:
+async def execute_longyun_acps_partner(question: str, caller_aic: str, acps_task_id: str) -> AcpsExecutionResult:
     """Run an ACPs Partner task inside the published-data-only boundary.
 
     External ACPs callers never inherit a browser user's private knowledge
     scope, attachments, chat history, or public-web search configuration.
     """
+    try:
+        selected_provider = provider_settings()
+    except AIGatewayConfigurationError as exc:
+        raise ResearchAgentError(str(exc)) from exc
+    owner_id = f"acps:{caller_aic or 'unknown-leader'}"[:120]
+    idempotency_key = f"acps:{acps_task_id}"[:120]
+    request_hash = hashlib.sha256(
+        f"{caller_aic}\n{acps_task_id}\n{question.strip()}".encode("utf-8")
+    ).hexdigest()
     with SessionLocal() as session:
         published_context, evidence_cards = await build_published_evidence_context(
             session,
             question.strip(),
             requested_by=f"ACPs:{caller_aic or 'unknown-leader'}",
         )
+        try:
+            egress = prepare_egress(
+                [question.strip(), published_context],
+                provider=selected_provider,
+            )
+        except AIEgressBlockedError as exc:
+            blocked_task = AIGatewayTask(
+                institution_id=INSTITUTION_ID,
+                project_id=DEFAULT_PROJECT_ID,
+                owner_id=owner_id,
+                session_id=acps_task_id[:36],
+                task_type="acps_partner",
+                provider=selected_provider.provider,
+                model=selected_provider.model,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                egress_classification="blocked_sensitive",
+                status="failed",
+                error_code="egress_policy_blocked",
+                error_message=str(exc),
+                completed_at=datetime.now(timezone.utc),
+            )
+            session.add(blocked_task)
+            try:
+                session.flush()
+                _record_ai_audit(session, blocked_task, "egress_blocked", "failed", {
+                    "caller_aic": caller_aic,
+                })
+                session.commit()
+            except IntegrityError:
+                session.rollback()
+            raise ResearchAgentError(str(exc)) from exc
+        safe_question, safe_published_context = egress.texts
+        gateway_task = session.scalar(select(AIGatewayTask).where(
+            AIGatewayTask.institution_id == INSTITUTION_ID,
+            AIGatewayTask.owner_id == owner_id,
+            AIGatewayTask.idempotency_key == idempotency_key,
+        ))
+        if gateway_task and gateway_task.request_hash != request_hash:
+            raise ResearchAgentError("ACPs 任务编号已用于不同请求，已阻止幂等冲突。")
+        if gateway_task and gateway_task.status == "completed" and gateway_task.result_payload:
+            stored = gateway_task.result_payload
+            return AcpsExecutionResult(
+                text=str(stored.get("text") or ""),
+                structured_data=dict(stored.get("structured_data") or {}),
+            )
+        if gateway_task and gateway_task.status in {"queued", "running"}:
+            raise ResearchAgentError("相同 ACPs 任务正在执行，不会重复创建 AI 调用。")
+        if gateway_task:
+            gateway_task.status = "queued"
+            gateway_task.cancel_requested = False
+            gateway_task.started_at = None
+            gateway_task.completed_at = None
+            gateway_task.error_code = None
+            gateway_task.error_message = None
+            gateway_task.result_payload = {}
+            gateway_task.queued_at = datetime.now(timezone.utc)
+            _record_ai_audit(session, gateway_task, "retry_queued", "queued")
+        else:
+            gateway_task = AIGatewayTask(
+                institution_id=INSTITUTION_ID,
+                project_id=DEFAULT_PROJECT_ID,
+                owner_id=owner_id,
+                session_id=acps_task_id[:36],
+                task_type="acps_partner",
+                provider=selected_provider.provider,
+                model=selected_provider.model,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                egress_classification=egress.classification,
+                redaction_count=egress.redactions,
+                status="queued",
+            )
+            session.add(gateway_task)
+            session.flush()
+            _record_ai_audit(session, gateway_task, "queued", "queued", {
+                "queue_namespace": INSTITUTION_ID,
+                "caller_aic": caller_aic,
+                "max_concurrency": AI_GATEWAY_CONCURRENCY,
+            })
+        session.commit()
+        gateway_task_id = gateway_task.id
 
     completed: dict[str, Any] | None = None
-    async for event in stream_research_reply(
-        user_prompt=question.strip(),
-        evidence_context=published_context,
-        memory_state={},
-        public_web_context="",
-        vision_images=[],
-        conversation_history=[],
-        has_current_vision_images=False,
-    ):
-        if event["type"] == "complete":
-            completed = event
+    admitted = False
+    try:
+        await _admit_ai_task(gateway_task_id)
+        admitted = True
+        async for event in _stream_ai_with_resilience(
+            gateway_task_id,
+            lambda: stream_research_reply(
+                user_prompt=safe_question,
+                evidence_context=safe_published_context,
+                memory_state={},
+                public_web_context="",
+                vision_images=[],
+                conversation_history=[],
+                has_current_vision_images=False,
+            ),
+        ):
+            if event["type"] == "complete":
+                completed = event
+    except asyncio.CancelledError:
+        _update_ai_task(
+            gateway_task_id, status="cancelled", action="cancelled",
+            error_code="acps_cancelled", error_message="ACPs Leader 已取消任务。",
+        )
+        raise
+    except Exception as exc:
+        _update_ai_task(
+            gateway_task_id, status="failed", action="failed",
+            error_code=type(exc).__name__, error_message=str(exc),
+        )
+        raise
+    finally:
+        if admitted:
+            _release_ai_task(gateway_task_id)
     if not completed or not str(completed.get("content") or "").strip():
+        _update_ai_task(
+            gateway_task_id, status="failed", action="failed",
+            error_code="empty_model_answer", error_message="隆耘智能体未生成可展示的 ACPs 任务结果。",
+        )
         raise ResearchAgentError("隆耘智能体未生成可展示的 ACPs 任务结果。")
 
     evidence_summary = [
@@ -7401,7 +8177,7 @@ async def execute_longyun_acps_partner(question: str, caller_aic: str) -> AcpsEx
         }
         for card in evidence_cards
     ]
-    return AcpsExecutionResult(
+    result = AcpsExecutionResult(
         text=str(completed["content"]).strip(),
         structured_data={
             "dataBoundary": "published-standard-data-only",
@@ -7409,6 +8185,13 @@ async def execute_longyun_acps_partner(question: str, caller_aic: str) -> AcpsEx
             "evidence": evidence_summary,
         },
     )
+    _update_ai_task(
+        gateway_task_id,
+        status="completed",
+        action="completed",
+        result_payload={"text": result.text, "structured_data": result.structured_data},
+    )
+    return result
 
 
 def _raise_acps_leader_error(exc: Exception, action: str) -> None:
