@@ -4,6 +4,7 @@ Only the current public target is sent. History, attachments and database record
 are never inputs. Implicit background searches retain a generic-topic allowlist.
 """
 
+import asyncio
 import ipaddress
 import json
 import logging
@@ -17,6 +18,7 @@ import httpx
 logger = logging.getLogger("uvicorn.error")
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 TAVILY_EXTRACT_URL = "https://api.tavily.com/extract"
+TAVILY_RETRYABLE_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 PUBLIC_TOPIC_TERMS = (
     "水稻", "稻米", "育种", "表型", "根系", "种质", "基因", "qtl", "基因组",
     "稻瘟病", "白叶枯病", "纹枯病", "病虫害", "抗病", "抗倒伏", "耐盐", "耐旱",
@@ -157,6 +159,15 @@ def _explicit_target(question: str) -> str:
         text = re.sub(r"(?:使用|通过)?\s*tavily(?:的)?(?:密钥|工具)?|(?:访问|打开|读取|浏览)(?:这个|该)?(?:网站|网页|网址|官网)?\s*[：:]?", " ", text, flags=re.I)
     text = re.sub(r"^(?:帮我|请|在网上|联网|公开|一下)\s*", "", text.strip())
     text = re.sub(r"(?:并|然后)(?:帮我|请)?(?:总结|分析|整理|给出|回答).*$", "", text, flags=re.S)
+    # Keep output-format instructions out of the provider query.  Sending a
+    # complete request such as "列出链接、日期和结论，不要编造" makes searches
+    # slower and less precise while adding no retrieval terms.
+    text = re.sub(
+        r"[，,；;。]\s*(?:请)?(?:列出|给出|返回|整理|汇总|说明|注明|标明|包含|包括|总结|概括|不要|不得).*$",
+        "",
+        text,
+        flags=re.S,
+    )
     return re.sub(r"\s+", " ", text).strip(" ：:，,。.;；‘’“”\"'《》")
 
 
@@ -239,6 +250,77 @@ def _page_excerpt(body: str, *, limit: int = MAX_PUBLIC_PAGE_CHARS) -> tuple[str
     return cleaned[:limit], len(cleaned) > limit, bool(count)
 
 
+def _bounded_env_number(name: str, default: float, *, minimum: float, maximum: float) -> float:
+    try:
+        return min(max(float(os.getenv(name, str(default))), minimum), maximum)
+    except (TypeError, ValueError):
+        return default
+
+
+def _retry_delay(attempt: int, response: httpx.Response | None = None) -> float:
+    """Return a short bounded delay, respecting a numeric Retry-After value."""
+    if response is not None:
+        try:
+            return min(max(float(response.headers.get("Retry-After", "")), 0.0), 5.0)
+        except (TypeError, ValueError):
+            pass
+    base = _bounded_env_number("TAVILY_RETRY_BASE_SECONDS", 0.75, minimum=0.0, maximum=3.0)
+    return min(base * (2 ** max(0, attempt - 1)), 5.0)
+
+
+async def _post_tavily(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    headers: dict[str, str],
+    payload: dict[str, object],
+    operation: str,
+    fallback_payload: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """POST with bounded retries for transient transport/provider failures.
+
+    Authentication and permanent permission failures are never retried.  A
+    malformed successful response is retried because Tavily/CDN interruptions
+    can occasionally return an incomplete JSON body with status 200.
+    """
+    attempts = int(_bounded_env_number("TAVILY_MAX_ATTEMPTS", 3, minimum=1, maximum=4))
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        request_payload = fallback_payload if fallback_payload is not None and attempt == attempts else payload
+        response: httpx.Response | None = None
+        try:
+            response = await client.post(url, headers=headers, json=request_payload)
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+                raise ValueError("Tavily response did not contain a results list")
+            if attempt > 1:
+                logger.info("Tavily %s recovered on attempt=%s/%s", operation, attempt, attempts)
+            return data
+        except httpx.HTTPStatusError as exc:
+            last_error = exc
+            retry = exc.response.status_code in TAVILY_RETRYABLE_STATUS_CODES and attempt < attempts
+            logger.warning(
+                "Tavily %s HTTP failure: status=%s attempt=%s/%s retry=%s",
+                operation, exc.response.status_code, attempt, attempts, retry,
+            )
+            if not retry:
+                raise
+            response = exc.response
+        except (httpx.TransportError, ValueError, TypeError) as exc:
+            last_error = exc
+            retry = attempt < attempts
+            logger.warning(
+                "Tavily %s transient failure: type=%s attempt=%s/%s retry=%s",
+                operation, type(exc).__name__, attempt, attempts, retry,
+            )
+            if not retry:
+                raise
+        await asyncio.sleep(_retry_delay(attempt, response))
+    assert last_error is not None
+    raise last_error
+
+
 async def _read_public_pages(urls: list[str], api_key: str) -> tuple[list[PublicSearchResult], str | None]:
     """Read the requested URLs first. Search failures/indexing cannot block it.
 
@@ -246,15 +328,13 @@ async def _read_public_pages(urls: list[str], api_key: str) -> tuple[list[Public
     a phrase the page must contain. Only exact requested pages are accepted.
     """
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(40, connect=10)) as client:
-            response = await client.post(TAVILY_EXTRACT_URL,
+        extract_timeout = _bounded_env_number("TAVILY_EXTRACT_TIMEOUT_SECONDS", 40, minimum=10, maximum=60)
+        async with httpx.AsyncClient(timeout=httpx.Timeout(extract_timeout, connect=10, write=15, pool=10)) as client:
+            data = await _post_tavily(client, TAVILY_EXTRACT_URL,
                 headers={"Authorization": f"Bearer {api_key}"},
-                json={"urls": urls, "extract_depth": "advanced", "format": "markdown",
-                      "include_images": False, "timeout": 30})
-            response.raise_for_status()
-            data = response.json()
-            if not isinstance(data, dict) or not isinstance(data.get("results"), list):
-                raise ValueError("Invalid Tavily extraction response")
+                payload={"urls": urls, "extract_depth": "advanced", "format": "markdown",
+                         "include_images": False, "timeout": min(30, int(extract_timeout))},
+                operation="page extraction")
     except httpx.HTTPStatusError as exc:
         logger.warning("Tavily page extraction HTTP failure: status=%s", exc.response.status_code)
         return [], "指定网页正文未读取成功。" + _error_note(exc.response.status_code)
@@ -320,18 +400,23 @@ async def search_public_references(question: str) -> tuple[list[PublicSearchResu
     direct_urls = [url for url in urls if urlsplit(url).path not in {"", "/"} or urlsplit(url).query]
     headers = {"Authorization": f"Bearer {api_key}"}
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(35, connect=10)) as client:
-            response = await client.post(TAVILY_SEARCH_URL, headers=headers, json={
+        search_timeout = _bounded_env_number("TAVILY_SEARCH_TIMEOUT_SECONDS", 35, minimum=10, maximum=60)
+        async with httpx.AsyncClient(timeout=httpx.Timeout(search_timeout, connect=10, write=15, pool=10)) as client:
+            search_payload: dict[str, object] = {
                 "query": query, "topic": "general", "search_depth": "advanced" if explicit else "basic",
                 "chunks_per_source": 3, "max_results": 8,
                 "include_answer": False, "include_raw_content": False,
                 "include_images": False, "include_domains": domains,
-            })
-            response.raise_for_status()
-            data = response.json()
-            raw_results = data.get("results", []) if isinstance(data, dict) else []
-            if not isinstance(raw_results, list):
-                raise ValueError("Invalid Tavily results")
+            }
+            fallback_payload = None
+            if explicit:
+                fallback_payload = {**search_payload, "search_depth": "basic"}
+                fallback_payload.pop("chunks_per_source", None)
+            data = await _post_tavily(
+                client, TAVILY_SEARCH_URL, headers=headers, payload=search_payload,
+                operation="search", fallback_payload=fallback_payload,
+            )
+            raw_results = data["results"]
             for item in raw_results:
                 if not isinstance(item, dict):
                     continue
@@ -351,12 +436,13 @@ async def search_public_references(question: str) -> tuple[list[PublicSearchResu
                 extract_urls = urls[:1]
             if explicit and extract_urls:
                 try:
-                    extraction = await client.post(TAVILY_EXTRACT_URL, headers=headers, json={
-                        "urls": extract_urls, "extract_depth": "advanced", "format": "markdown",
-                        "include_images": False, "timeout": 20,
-                    })
-                    extraction.raise_for_status()
-                    extracted = extraction.json()
+                    extracted = await _post_tavily(
+                        client, TAVILY_EXTRACT_URL, headers=headers,
+                        payload={"urls": extract_urls, "extract_depth": "advanced", "format": "markdown",
+                                 "include_images": False, "timeout": min(20, int(search_timeout))},
+                        operation="result extraction",
+                    )
+                    extracted_count = 0
                     for item in extracted.get("results", []):
                         if not isinstance(item, dict):
                             continue
@@ -378,6 +464,9 @@ async def search_public_references(question: str) -> tuple[list[PublicSearchResu
                             results[results.index(existing)] = result
                         else:
                             results.insert(0, result)
+                        extracted_count += 1
+                    if not extracted_count:
+                        notes.append("网页正文提取未返回可用内容；以下仅使用已获取的搜索摘要，不代表已读取全文。")
                     if extracted.get("failed_results"):
                         notes.append("部分网页正文无法公开提取；搜索摘要不等于全文，需登录或付费的内容未读取。")
                     if any(result.unreadable_images for result in results):

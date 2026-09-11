@@ -23,6 +23,10 @@ class QueryTests(unittest.TestCase):
         question = "使用Tavily，访问知网：https://www.cnki.net/ 帮我搜索：" + PAPER
         self.assertEqual(search.build_safe_public_query(question), (PAPER, ["cnki.net"]))
 
+    def test_output_instructions_are_not_sent_as_search_terms(self):
+        question = "请检索最近公开发布的水稻耐盐碱育种研究进展，列出来源链接、发布日期和主要结论。不要凭空编造来源。"
+        self.assertEqual(search.build_safe_public_query(question), ("最近公开发布的水稻耐盐碱育种研究进展", []))
+
     def test_local_only(self):
         for question in ["不要联网，搜索水稻文献", "仅从本地知识库检索水稻", "查询知识库中的水稻论文"]:
             self.assertFalse(search.needs_current_public_search(question), question)
@@ -99,7 +103,8 @@ class TavilyTests(unittest.IsolatedAsyncioTestCase):
             return handler(request)
 
         client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
-        with patch.dict(os.environ, {"TAVILY_API_KEY": key}), patch.object(search.httpx, "AsyncClient", return_value=client):
+        environment = {"TAVILY_API_KEY": key, "TAVILY_MAX_ATTEMPTS": "3", "TAVILY_RETRY_BASE_SECONDS": "0"}
+        with patch.dict(os.environ, environment), patch.object(search.httpx, "AsyncClient", return_value=client):
             result = await search.search_public_references(question)
         return result, requests
 
@@ -170,7 +175,9 @@ class TavilyTests(unittest.IsolatedAsyncioTestCase):
             (results, note), calls = await self.execute(DETAIL_URL, lambda _, response=response: response)
             self.assertEqual(results, [])
             self.assertTrue(note)
-            self.assertEqual([call[0] for call in calls], ["/extract"])
+            malformed = response.status_code == 200 and response.json().get("results") is None
+            expected_attempts = 3 if response.status_code == 429 or malformed else 1
+            self.assertEqual([call[0] for call in calls], ["/extract"] * expected_attempts)
             context = search.build_public_web_context(results, note, question=DETAIL_URL)
             self.assertIn("不会根据网址猜测", search.build_public_page_failure_answer(context))
 
@@ -209,7 +216,40 @@ class TavilyTests(unittest.IsolatedAsyncioTestCase):
         for status in [401, 429, 500]:
             (_, note), calls = await self.execute(VARIETY, lambda _, status=status: httpx.Response(status))
             self.assertIn("Tavily", note)
-            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(calls), 1 if status == 401 else 3)
+
+    async def test_transient_search_failure_is_retried_and_recovers(self):
+        calls = 0
+
+        def handler(request):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise httpx.ReadTimeout("temporary timeout")
+            return httpx.Response(200, json={"results": [{
+                "title": "水稻耐盐碱研究进展",
+                "url": "https://example.gov.cn/rice-salt-tolerance",
+                "content": "水稻耐盐碱育种研究进展与主要结论",
+            }]})
+
+        (results, note), requests = await self.execute("搜索水稻耐盐碱研究进展", handler)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(len(requests), 3)  # two searches, then one extract attempt
+        self.assertIsNotNone(note)  # extraction had no page body; search snippet remains usable
+
+    async def test_last_search_attempt_uses_basic_depth(self):
+        payloads = []
+
+        def handler(request):
+            body = json.loads(request.content)
+            payloads.append(body)
+            if len(payloads) < 3:
+                return httpx.Response(503)
+            return httpx.Response(200, json={"results": []})
+
+        await self.execute("搜索水稻耐盐碱研究进展", handler)
+        self.assertEqual([payload["search_depth"] for payload in payloads], ["advanced", "advanced", "basic"])
+        self.assertNotIn("chunks_per_source", payloads[-1])
 
     async def test_bad_payload(self):
         (results, note), _ = await self.execute(VARIETY, lambda _: httpx.Response(200, json={"results": None}))
