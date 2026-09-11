@@ -475,5 +475,7 @@ body:has(.research-shell), body:has(.assistant-loading), body:has(.auth-error) {
 .parameter-grid { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 9px; }
 .trial-analysis-form .primary-button { justify-self: start; }
 .analysis-chart img { display: block; width: min(100%, 900px); max-height: 500px; object-fit: contain; margin: 0 auto; }
+.chat-message.paused .message-content { border-color: #e0c77b; background: #fffdf4; }
+.paused-task-marker { margin-top: 10px; border-top: 1px solid #eadba8; padding-top: 8px; color: #87671c; font-size: 12px; font-weight: 600; }
 @media (max-width: 800px) { .material-check-grid, .weight-grid, .parameter-grid, .dimension-check-grid, .weight-input-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }.trial-analysis-form { grid-template-columns: 1fr; }.parameter-grid { grid-column: auto; }.analysis-summary { align-items: flex-start; }.intelligence-workspace { width: calc(100% - 24px); } }
 @media (max-width: 520px) { .material-check-grid, .weight-grid, .parameter-grid { grid-template-columns: 1fr; }.control-card, .analysis-summary, .recommendation-results > header { display: grid; }.workspace-hero > svg { display: none; } }

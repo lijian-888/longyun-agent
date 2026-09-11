@@ -686,6 +686,14 @@ async def stream_research_reply(
                         streamed_any_text = True
                         yield {"type": "token", "text": chunk}
                 final_message = await reasoning_task
+            except asyncio.CancelledError:
+                # Pause/cancel interrupts the outer SSE task.  Explicitly stop
+                # the detached AgentScope reasoning task as well so no upstream
+                # model request keeps consuming capacity after the UI pauses.
+                if not reasoning_task.done():
+                    reasoning_task.cancel()
+                await asyncio.gather(reasoning_task, return_exceptions=True)
+                raise
             except TimeoutError as exc:
                 await asyncio.gather(reasoning_task, return_exceptions=True)
                 if streamed_any_text:

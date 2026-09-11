@@ -885,6 +885,10 @@ class AITaskCancelledError(RuntimeError):
     """Internal cooperative cancellation signal for an admitted AI task."""
 
 
+class AITaskPausedError(RuntimeError):
+    """Internal cooperative pause signal for a durable AI task."""
+
+
 def _ai_request_hash(session_id: str, payload: "ResearchChatRequest") -> str:
     canonical = json.dumps({
         "session_id": session_id,
@@ -981,11 +985,21 @@ def _update_ai_task(
 
 async def _admit_ai_task(task_id: str) -> None:
     """Wait in the institution-tagged durable queue for one of four slots."""
+    AI_TASK_CANCEL_EVENTS[task_id] = asyncio.Event()
+    current = asyncio.current_task()
+    if current:
+        # Register before waiting for a slot so a queued task can be paused
+        # immediately instead of occupying its HTTP connection for minutes.
+        AI_TASK_RUNNING_COROUTINES[task_id] = current
     try:
         task_snapshot = _load_ai_task(task_id)
         namespace = task_snapshot.institution_id if task_snapshot else "unknown"
         await AI_TASK_GATE.acquire(task_id, namespace, AI_TASK_QUEUE_WAIT_SECONDS)
+    except asyncio.CancelledError:
+        _release_ai_task(task_id)
+        raise
     except TimeoutError as exc:
+        _release_ai_task(task_id)
         _update_ai_task(
             task_id,
             status="failed",
@@ -997,6 +1011,8 @@ async def _admit_ai_task(task_id: str) -> None:
     try:
         with SessionLocal() as db:
             task = db.get(AIGatewayTask, task_id)
+            if task and task.status == "paused":
+                raise AITaskPausedError("AI 任务已暂停。")
             if not task or task.cancel_requested or task.status == "cancelled":
                 if task and task.status != "cancelled":
                     task.status = "cancelled"
@@ -1014,12 +1030,8 @@ async def _admit_ai_task(task_id: str) -> None:
             })
             db.commit()
     except Exception:
-        AI_TASK_GATE.release(task_id)
+        _release_ai_task(task_id)
         raise
-    AI_TASK_CANCEL_EVENTS[task_id] = asyncio.Event()
-    current = asyncio.current_task()
-    if current:
-        AI_TASK_RUNNING_COROUTINES[task_id] = current
 
 
 def _release_ai_task(task_id: str) -> None:
@@ -1030,12 +1042,42 @@ def _release_ai_task(task_id: str) -> None:
 
 def _raise_if_ai_task_cancelled(task_id: str) -> None:
     event = AI_TASK_CANCEL_EVENTS.get(task_id)
-    if event and event.is_set():
-        raise AITaskCancelledError("AI 任务已取消。")
     with SessionLocal() as db:
         task = db.get(AIGatewayTask, task_id)
+        if task and task.status == "paused":
+            raise AITaskPausedError("AI 任务已暂停。")
+        if event and event.is_set():
+            raise AITaskCancelledError("AI 任务已取消。")
         if task and task.cancel_requested:
             raise AITaskCancelledError("AI 任务已取消。")
+
+
+def _store_paused_ai_checkpoint(task_id: str, partial_text: str) -> None:
+    """Persist a private restart-safe checkpoint without saving a final answer."""
+    with SessionLocal() as db:
+        task = db.get(AIGatewayTask, task_id)
+        if not task or task.status != "paused":
+            return
+        payload = dict(task.result_payload or {})
+        payload["checkpoint"] = {
+            # This is only returned to the task owner.  Resume intentionally
+            # regenerates the complete answer from the durable request because
+            # upstream model providers do not expose resumable generation IDs.
+            "partial_text": partial_text[:20000],
+            "strategy": "restart_from_durable_request",
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+        }
+        task.result_payload = payload
+        task.cancel_requested = False
+        task.error_code = None
+        task.error_message = None
+        task.completed_at = None
+        task.updated_at = datetime.now(timezone.utc)
+        _record_ai_audit(db, task, "paused", "paused", {
+            "checkpoint_characters": len(payload["checkpoint"]["partial_text"]),
+            "resume_strategy": payload["checkpoint"]["strategy"],
+        })
+        db.commit()
 
 
 def _record_ai_retry(task_id: str, reason: str) -> int:
@@ -1074,6 +1116,8 @@ async def _stream_ai_with_resilience(
                     yield result
             return
         except asyncio.CancelledError:
+            raise
+        except AITaskPausedError:
             raise
         except AITaskCancelledError:
             raise
@@ -6522,6 +6566,7 @@ def _report_fallback_content(
 
 
 def _serialize_ai_task(item: AIGatewayTask) -> dict[str, Any]:
+    checkpoint = (item.result_payload or {}).get("checkpoint") or {}
     return {
         "id": item.id,
         "institution_id": item.institution_id,
@@ -6538,11 +6583,33 @@ def _serialize_ai_task(item: AIGatewayTask) -> dict[str, Any]:
         "egress_classification": item.egress_classification,
         "redaction_count": item.redaction_count,
         "cancel_requested": item.cancel_requested,
+        "can_pause": item.status in {"queued", "running"},
+        "can_resume": item.status == "paused",
+        "checkpoint_characters": len(str(checkpoint.get("partial_text") or "")),
         "error_code": item.error_code,
         "error_message": item.error_message,
         "queued_at": item.queued_at.isoformat(),
         "started_at": item.started_at.isoformat() if item.started_at else None,
         "completed_at": item.completed_at.isoformat() if item.completed_at else None,
+    }
+
+
+def _serialize_ai_resume_request(session: Session, task: AIGatewayTask) -> dict[str, Any] | None:
+    request_message = session.get(ResearchMessage, task.request_message_id) if task.request_message_id else None
+    if not request_message or request_message.session_id != task.session_id:
+        return None
+    payload = task.result_payload or {}
+    request_metadata = payload.get("request") if isinstance(payload.get("request"), dict) else {}
+    checkpoint = payload.get("checkpoint") if isinstance(payload.get("checkpoint"), dict) else {}
+    return {
+        "task_id": task.id,
+        "session_id": task.session_id,
+        "content": request_message.content,
+        "knowledge_scope": request_metadata.get("knowledge_scope", "both"),
+        "attachment_ids": request_metadata.get("attachment_ids", []),
+        "idempotency_key": task.idempotency_key,
+        "partial_text": str(checkpoint.get("partial_text") or ""),
+        "resume_strategy": checkpoint.get("strategy", "restart_from_durable_request"),
     }
 
 
@@ -6620,8 +6687,71 @@ def get_ai_task_status(
     return _serialize_ai_task(task)
 
 
+@app.get("/api/research/sessions/{research_session_id}/ai/tasks/paused")
+def get_paused_research_ai_task(
+    research_session_id: str,
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> dict[str, Any]:
+    research_session = get_owned_research_session(session, research_session_id)
+    task = session.scalar(
+        select(AIGatewayTask)
+        .where(
+            AIGatewayTask.session_id == research_session.id,
+            AIGatewayTask.project_id == research_session.project_id,
+            AIGatewayTask.owner_id == user.id,
+            AIGatewayTask.status == "paused",
+        )
+        .order_by(AIGatewayTask.updated_at.desc())
+        .limit(1)
+    )
+    if not task:
+        return {"task": None, "resume_request": None}
+    return {
+        "task": _serialize_ai_task(task),
+        "resume_request": _serialize_ai_resume_request(session, task),
+    }
+
+
+@app.post("/api/ai/tasks/{task_id}/pause")
+async def pause_ai_task(
+    task_id: str,
+    user: CurrentUser = Depends(require_business_user),
+    session: Session = Depends(get_business_project_session),
+) -> dict[str, Any]:
+    account = sync_platform_account(session, user)
+    task = session.get(AIGatewayTask, task_id)
+    if (
+        not task
+        or task.institution_id != account.institution_id
+        or ("field_admin" not in user.roles and task.owner_id != user.id)
+    ):
+        raise HTTPException(404, "未找到该 AI 任务。")
+    if task.status == "paused":
+        return _serialize_ai_task(task)
+    if task.status not in {"queued", "running"}:
+        raise HTTPException(409, f"AI 任务已处于 {task.status} 状态，不能暂停。")
+    previous_status = task.status
+    task.status = "paused"
+    task.cancel_requested = False
+    task.completed_at = None
+    task.updated_at = datetime.now(timezone.utc)
+    _record_ai_audit(session, task, "pause_requested", "paused", {
+        "requested_by": user.id,
+        "previous_status": previous_status,
+    })
+    session.commit()
+    pause_event = AI_TASK_CANCEL_EVENTS.get(task_id)
+    if pause_event:
+        pause_event.set()
+    running = AI_TASK_RUNNING_COROUTINES.get(task_id)
+    if running and not running.done():
+        running.cancel()
+    return _serialize_ai_task(task)
+
+
 @app.post("/api/ai/tasks/{task_id}/cancel")
-def cancel_ai_task(
+async def cancel_ai_task(
     task_id: str,
     user: CurrentUser = Depends(require_business_user),
     session: Session = Depends(get_business_project_session),
@@ -6637,7 +6767,7 @@ def cancel_ai_task(
     if task.status in {"completed", "failed", "cancelled"}:
         raise HTTPException(409, f"AI 任务已处于终态 {task.status}，不能再次取消。")
     task.cancel_requested = True
-    if task.status == "queued":
+    if task.status in {"queued", "paused"}:
         task.status = "cancelled"
         task.completed_at = datetime.now(timezone.utc)
     task.updated_at = datetime.now(timezone.utc)
@@ -6828,7 +6958,12 @@ async def research_chat_stream(
         for item, safe_content in zip(conversation_history, safe_history_texts, strict=True)
     ]
 
+    task_request_metadata = {
+        "knowledge_scope": payload.knowledge_scope,
+        "attachment_ids": current_turn_attachment_ids,
+    }
     ai_task = existing_task
+    resuming_paused_task = bool(ai_task and ai_task.status == "paused")
     new_request_message = not (ai_task and ai_task.request_message_id)
     user_message = session.get(ResearchMessage, ai_task.request_message_id) if ai_task and ai_task.request_message_id else None
     if not user_message:
@@ -6852,6 +6987,10 @@ async def research_chat_stream(
         session.add(user_message)
         session.flush()
     if ai_task:
+        previous_status = ai_task.status
+        previous_attempt_count = ai_task.attempt_count
+        previous_payload = dict(ai_task.result_payload or {})
+        checkpoint = previous_payload.get("checkpoint") if isinstance(previous_payload.get("checkpoint"), dict) else {}
         ai_task.status = "queued"
         ai_task.cancel_requested = False
         ai_task.completed_at = None
@@ -6861,9 +7000,18 @@ async def research_chat_stream(
         ai_task.egress_classification = egress.classification
         ai_task.redaction_count = egress.redactions
         ai_task.request_message_id = user_message.id
+        ai_task.result_payload = {"request": task_request_metadata}
         ai_task.queued_at = datetime.now(timezone.utc)
-        _record_ai_audit(session, ai_task, "retry_queued", "queued", {
-            "previous_attempts": ai_task.attempt_count,
+        if resuming_paused_task:
+            # Provider streams are not resumable at an exact token offset.  A
+            # resume therefore restarts generation from the durable original
+            # request while reusing this task/message/idempotency identity.
+            ai_task.attempt_count = 0
+        _record_ai_audit(session, ai_task, "resumed_queued" if resuming_paused_task else "retry_queued", "queued", {
+            "previous_status": previous_status,
+            "previous_attempts": previous_attempt_count,
+            "checkpoint_characters": len(str(checkpoint.get("partial_text") or "")),
+            "resume_strategy": checkpoint.get("strategy") if resuming_paused_task else None,
             "egress_classification": egress.classification,
             "redaction_count": egress.redactions,
         })
@@ -6883,6 +7031,7 @@ async def research_chat_stream(
             max_attempts=AI_TASK_MAX_ATTEMPTS,
             timeout_seconds=AI_TASK_TIMEOUT_SECONDS,
             request_message_id=user_message.id,
+            result_payload={"request": task_request_metadata},
         )
         session.add(ai_task)
         try:
@@ -6936,7 +7085,12 @@ async def research_chat_stream(
                 "session_id": research_session_id,
                 "title": automatic_session_title,
             })
-        yield sse_event("status", {"label": "正在读取已发布标准数据、当前会话附件和本地知识库证据"})
+        yield sse_event("status", {
+            "label": "正在从暂停检查点恢复任务" if resuming_paused_task else "正在读取已发布标准数据、当前会话附件和本地知识库证据",
+            "task_id": ai_task_id,
+            "queue_namespace": account.institution_id,
+            "resumed": resuming_paused_task,
+        })
         full_text = ""
         model_answer_started = False
         slot_acquired = False
@@ -7107,12 +7261,23 @@ async def research_chat_stream(
                 )
                 yield sse_event("complete", {"message": response_message, "task_id": ai_task_id})
         except asyncio.CancelledError:
+            task_snapshot = _load_ai_task(ai_task_id)
+            if task_snapshot and task_snapshot.status == "paused":
+                _store_paused_ai_checkpoint(ai_task_id, full_text)
+                return
             _update_ai_task(
                 ai_task_id, status="cancelled", action="cancelled",
                 error_code="client_or_user_cancelled",
                 error_message="客户端断开连接或用户主动取消。",
             )
             raise
+        except AITaskPausedError:
+            _store_paused_ai_checkpoint(ai_task_id, full_text)
+            yield sse_event("paused", {
+                "task_id": ai_task_id,
+                "checkpoint_characters": len(full_text),
+                "resume_strategy": "restart_from_durable_request",
+            })
         except AITaskCancelledError as exc:
             _update_ai_task(
                 ai_task_id, status="cancelled", action="cancelled",

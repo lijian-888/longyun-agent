@@ -13,7 +13,9 @@ import {
   LogOut,
   MessageSquarePlus,
   Paperclip,
+  Pause,
   Pencil,
+  Play,
   Plus,
   Search,
   Scale,
@@ -385,6 +387,8 @@ export default function ResearchAssistant({ platformContext, onProjectChange }) 
   const [progress, setProgress] = useState("");
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
+  const [activeAiTaskId, setActiveAiTaskId] = useState("");
+  const [pausedRequest, setPausedRequest] = useState(null);
   const [uploading, setUploading] = useState(false);
   const [preview, setPreview] = useState(null);
   const [imagePreviewUrls, setImagePreviewUrls] = useState({});
@@ -401,6 +405,8 @@ export default function ResearchAssistant({ platformContext, onProjectChange }) 
   const imagePreviewUrlsRef = useRef({});
   const activeAiTaskIdRef = useRef("");
   const activeAiAbortRef = useRef(null);
+  const activeAiRequestRef = useRef(null);
+  const pauseRequestedRef = useRef(false);
   const retryRequestRef = useRef(null);
 
   const activeSession = sessions.find((item) => item.id === activeSessionId);
@@ -482,13 +488,26 @@ export default function ResearchAssistant({ platformContext, onProjectChange }) 
 
   async function loadConversation(sessionId) {
     if (!sessionId) return;
-    const [messageList, attachmentList] = await Promise.all([
+    const [messageList, attachmentList, pausedTaskState] = await Promise.all([
       request(`/api/research/sessions/${sessionId}/messages`),
       request(`/api/research/sessions/${sessionId}/attachments`),
+      request(`/api/research/sessions/${sessionId}/ai/tasks/paused`),
     ]);
     followLatestRef.current = true;
     setShowLatestButton(false);
-    setMessages(messageList);
+    const resumeRequest = pausedTaskState?.resume_request;
+    if (resumeRequest) {
+      const assistantEntryId = `paused-${pausedTaskState.task.id}`;
+      setMessages([...messageList, {
+        ...localMessage("assistant", resumeRequest.partial_text || ""),
+        id: assistantEntryId,
+        paused: true,
+      }]);
+      setPausedRequest({ ...resumeRequest, sessionId, assistantEntryId });
+    } else {
+      setMessages(messageList);
+      setPausedRequest(null);
+    }
     setAttachments(attachmentList);
     const sentAttachmentIds = new Set(messageList.flatMap((message) => (message.evidence || [])
       .filter((item) => item.type === "message_attachment" && item.attachment_id)
@@ -696,25 +715,33 @@ export default function ResearchAssistant({ platformContext, onProjectChange }) 
     }
   }
 
-  async function sendQuestion(event) {
+  async function sendQuestion(event, resumeRequest = null) {
     event?.preventDefault();
-    const content = draft.trim();
-    if (!content || sending || !activeSessionId) return;
+    const resuming = Boolean(resumeRequest);
+    const targetSessionId = resumeRequest?.sessionId || activeSessionId;
+    const content = (resumeRequest?.content || draft).trim();
+    if (!content || sending || !targetSessionId) return;
     setSending(true);
-    setProgress("正在提交问题");
+    setProgress(resuming ? "正在恢复暂停任务" : "正在提交问题");
     setNotice("");
-    setDraft("");
+    if (!resuming) setDraft("");
+    else setPausedRequest(null);
     followLatestRef.current = true;
     setShowLatestButton(false);
-    const currentTurnAttachmentIds = composerAttachmentIds.filter((id) => attachmentById.has(id));
-    const requestFingerprint = JSON.stringify({ content, knowledgeScope, attachmentIds: [...currentTurnAttachmentIds].sort() });
-    const idempotencyKey = retryRequestRef.current?.fingerprint === requestFingerprint
+    const currentTurnAttachmentIds = resuming
+      ? [...(resumeRequest.attachment_ids || [])]
+      : composerAttachmentIds.filter((id) => attachmentById.has(id));
+    const requestKnowledgeScope = resumeRequest?.knowledge_scope || knowledgeScope;
+    const requestFingerprint = JSON.stringify({ content, knowledgeScope: requestKnowledgeScope, attachmentIds: [...currentTurnAttachmentIds].sort() });
+    const idempotencyKey = resumeRequest?.idempotency_key || (retryRequestRef.current?.fingerprint === requestFingerprint
       ? retryRequestRef.current.key
-      : crypto.randomUUID();
+      : crypto.randomUUID());
     const abortController = new AbortController();
     activeAiAbortRef.current = abortController;
-    activeAiTaskIdRef.current = "";
-    const currentTurnAttachments = currentTurnAttachmentIds.map((id) => attachmentById.get(id));
+    activeAiTaskIdRef.current = resumeRequest?.task_id || "";
+    setActiveAiTaskId(resumeRequest?.task_id || "");
+    pauseRequestedRef.current = false;
+    const currentTurnAttachments = currentTurnAttachmentIds.map((id) => attachmentById.get(id)).filter(Boolean);
     const userEntry = {
       ...localMessage("user", content),
       evidence: currentTurnAttachments.map((item) => ({
@@ -725,17 +752,41 @@ export default function ResearchAssistant({ platformContext, onProjectChange }) 
         size_bytes: item.size_bytes,
       })),
     };
-    const assistantEntry = { ...localMessage("assistant", ""), streaming: true };
-    setComposerAttachmentIds([]);
-    setMessages((items) => [...items, userEntry, assistantEntry]);
+    const assistantEntry = resuming
+      ? { ...localMessage("assistant", ""), id: resumeRequest.assistantEntryId, streaming: true }
+      : { ...localMessage("assistant", ""), streaming: true };
+    activeAiRequestRef.current = {
+      task_id: resumeRequest?.task_id || "",
+      sessionId: targetSessionId,
+      assistantEntryId: assistantEntry.id,
+      content,
+      knowledge_scope: requestKnowledgeScope,
+      attachment_ids: currentTurnAttachmentIds,
+      idempotency_key: idempotencyKey,
+      fingerprint: requestFingerprint,
+    };
+    if (resuming) {
+      setMessages((items) => {
+        let found = false;
+        const updated = items.map((item) => {
+          if (item.id !== assistantEntry.id) return item;
+          found = true;
+          return { ...assistantEntry };
+        });
+        return found ? updated : [...updated, assistantEntry];
+      });
+    } else {
+      setComposerAttachmentIds([]);
+      setMessages((items) => [...items, userEntry, assistantEntry]);
+    }
 
     try {
-      const response = await authorizedFetch(`/api/research/sessions/${activeSessionId}/chat/stream`, {
+      const response = await authorizedFetch(`/api/research/sessions/${targetSessionId}/chat/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           content,
-          knowledge_scope: knowledgeScope,
+          knowledge_scope: requestKnowledgeScope,
           attachment_ids: currentTurnAttachmentIds,
           idempotency_key: idempotencyKey,
         }),
@@ -762,7 +813,11 @@ export default function ResearchAssistant({ platformContext, onProjectChange }) 
               ? { ...item, title: parsed.data.title }
               : item));
           } else if (parsed.event === "status") {
-            if (parsed.data.task_id) activeAiTaskIdRef.current = parsed.data.task_id;
+            if (parsed.data.task_id) {
+              activeAiTaskIdRef.current = parsed.data.task_id;
+              setActiveAiTaskId(parsed.data.task_id);
+              if (activeAiRequestRef.current) activeAiRequestRef.current.task_id = parsed.data.task_id;
+            }
             setProgress(parsed.data.label || "正在处理");
           } else if (parsed.event === "token") {
             setMessages((items) => items.map((item) => item.id === assistantEntry.id
@@ -771,6 +826,7 @@ export default function ResearchAssistant({ platformContext, onProjectChange }) 
           } else if (parsed.event === "complete") {
             completed = true;
             retryRequestRef.current = null;
+            setPausedRequest(null);
             setMessages((items) => items.map((item) => item.id === assistantEntry.id ? parsed.data.message : item));
             if (parsed.data.message?.report_available) {
               // The user already explicitly asked for a report in this turn.
@@ -780,7 +836,10 @@ export default function ResearchAssistant({ platformContext, onProjectChange }) 
             }
             // The streamed answer is already in local state. Refresh only the sidebar
             // metadata so completing a response never pulls the reader back to the bottom.
-            await loadSessions(activeSessionId, { reloadConversation: false });
+            await loadSessions(targetSessionId, { reloadConversation: false });
+          } else if (parsed.event === "paused") {
+            pauseRequestedRef.current = true;
+            setProgress("任务已暂停");
           } else if (parsed.event === "error") {
             throw new Error(parsed.data.detail || "模型分析未完成。");
           }
@@ -789,6 +848,15 @@ export default function ResearchAssistant({ platformContext, onProjectChange }) 
       }
       if (!completed) throw new Error("模型连接已结束，但没有返回完整答案。");
     } catch (error) {
+      if (pauseRequestedRef.current) {
+        const requestState = activeAiRequestRef.current;
+        setMessages((items) => items.map((item) => item.id === assistantEntry.id
+          ? { ...item, streaming: false, paused: true, error: false }
+          : item));
+        if (requestState) setPausedRequest({ ...requestState });
+        setNotice("任务已暂停；点击“继续”后将从已保存的原请求检查点重新生成完整回答，不会重复创建消息或结果。");
+        return;
+      }
       const detail = error instanceof Error && error.message
         ? error.message
         : "模型分析未完成，未获得可用的错误说明。";
@@ -801,19 +869,54 @@ export default function ResearchAssistant({ platformContext, onProjectChange }) 
       setNotice(detail);
     } finally {
       activeAiTaskIdRef.current = "";
+      activeAiRequestRef.current = null;
       activeAiAbortRef.current = null;
+      pauseRequestedRef.current = false;
+      setActiveAiTaskId("");
       setSending(false);
       setProgress("");
     }
   }
 
-  async function cancelGeneration() {
+  async function pauseGeneration() {
     const taskId = activeAiTaskIdRef.current;
-    if (taskId) {
-      await authorizedFetch(`/api/ai/tasks/${taskId}/cancel`, { method: "POST" }).catch(() => null);
+    if (!taskId) {
+      setNotice("任务正在提交，请在出现任务编号后再暂停。");
+      return;
     }
-    activeAiAbortRef.current?.abort();
-    setNotice("已请求取消当前 AI 任务；未完成内容不会保存为最终结果。");
+    pauseRequestedRef.current = true;
+    setProgress("正在保存暂停检查点");
+    try {
+      const response = await authorizedFetch(`/api/ai/tasks/${taskId}/pause`, { method: "POST" });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.detail || "任务暂停失败。");
+      }
+      activeAiAbortRef.current?.abort();
+    } catch (error) {
+      pauseRequestedRef.current = false;
+      setProgress("正在调用大模型");
+      setNotice(error instanceof Error ? error.message : "任务暂停失败。");
+    }
+  }
+
+  function resumeGeneration() {
+    if (!pausedRequest || pausedRequest.sessionId !== activeSessionId) return;
+    void sendQuestion(null, pausedRequest);
+  }
+
+  async function discardPausedGeneration() {
+    if (!pausedRequest?.task_id) return;
+    try {
+      await request(`/api/ai/tasks/${pausedRequest.task_id}/cancel`, { method: "POST" });
+      setMessages((items) => items.filter((item) => item.id !== pausedRequest.assistantEntryId));
+      setDraft(pausedRequest.content || "");
+      setComposerAttachmentIds((items) => [...new Set([...(pausedRequest.attachment_ids || []), ...items])]);
+      setPausedRequest(null);
+      setNotice("已放弃暂停任务；原问题已放回输入框，可修改后重新发送。");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "无法放弃暂停任务。");
+    }
   }
 
   function sendOnEnter(event) {
@@ -869,16 +972,17 @@ export default function ResearchAssistant({ platformContext, onProjectChange }) 
       <section className="chat-log" ref={chatLogRef} onScroll={handleChatScroll}>
         {!messages.length && <div className="chat-empty"><Bot size={28} /><h2>开始隆耘 Agent 育种对话</h2><p>数据处理员发布区域试验资料包后，可在这里直接获得同试验比较、多年多点稳定性、环境和管理影响、性状权衡及表现变差的可追溯分析。</p><div className="trial-prompt-list" aria-label="区域试验分析示例问题"><span>区域试验分析示例</span>{TRIAL_ANALYSIS_PROMPTS.map((prompt) => <button type="button" key={prompt} onClick={() => applyTrialAnalysisPrompt(prompt)}>{prompt}</button>)}</div></div>}
         {messages.map((message) => {
-          const content = message.content || (message.streaming ? "正在调用大模型…" : "");
+          const content = message.content || (message.streaming ? "正在调用大模型…" : message.paused ? "任务已暂停，尚未生成可保留的正文。" : "");
           const messageAttachments = (message.evidence || []).filter((item) => item.type === "message_attachment");
           const sourceEvidence = (message.evidence || []).filter((item) => item.type !== "message_attachment");
-          return <article className={`chat-message ${message.role} ${message.error ? "error" : ""}`} key={message.id}>
+          return <article className={`chat-message ${message.role} ${message.error ? "error" : ""} ${message.paused ? "paused" : ""}`} key={message.id}>
             <div className="message-avatar">{message.role === "assistant" ? <Bot size={18} /> : <UserRound size={17} />}</div>
             <div className="message-content">
               <div className="message-role">{message.role === "assistant" ? AGENT_NAME : user?.display_name || "科研人员"}</div>
               <div className="message-text">
                 {message.role === "assistant" ? <AssistantMarkdown content={content} streaming={message.streaming} suppressReportInstructions={message.report_available} /> : content}
               </div>
+              {message.paused && <div className="paused-task-marker">任务已暂停 · 继续后将从原请求检查点重新生成完整回答</div>}
               {messageAttachments.length > 0 && <div className="message-attachment-row" aria-label="随本轮问题发送的附件">{messageAttachments.map((item) => {
                 const attachment = attachmentById.get(item.attachment_id);
                 const imageUrl = imagePreviewUrls[item.attachment_id];
@@ -914,10 +1018,12 @@ export default function ResearchAssistant({ platformContext, onProjectChange }) 
             <input ref={fileInputRef} hidden type="file" multiple accept=".pdf,.docx,.xlsx,.xls,.pptx,.txt,.md,.markdown,.html,.htm,.csv,.json,.xml,.png,.jpg,.jpeg,.webp" onChange={uploadFileInput} />
             <button className="icon-button" type="button" title="上传、粘贴或拖入当前会话附件（单个不超过 10 MB）" onClick={() => fileInputRef.current?.click()} disabled={uploading}><Paperclip size={18} /></button>
             <label className="knowledge-scope-select">知识库<select value={knowledgeScope} onChange={(event) => setKnowledgeScope(event.target.value)}><option value="both">我的 + 公共</option><option value="private">仅我的</option><option value="public">仅公共</option></select></label>
-            <span>{uploading ? "正在保存附件" : sending ? "模型正在生成，可继续编辑下一条问题或添加图片；当前问题完成后再发送" : "外部模型仅接收公开或脱敏文本；私人附件需切换本地 vLLM；按 Enter 发送，Shift + Enter 换行"}</span>
+            <span>{uploading ? "正在保存附件" : sending ? (activeAiTaskId ? "模型正在生成，可随时暂停" : "正在创建任务，任务编号生成后即可暂停") : pausedRequest?.sessionId === activeSessionId ? "任务已暂停；继续时复用原任务和消息，不产生重复结果" : "外部模型仅接收公开或脱敏文本；私人附件需切换本地 vLLM；按 Enter 发送，Shift + Enter 换行"}</span>
             {sending
-              ? <button className="secondary-button send-button" type="button" onClick={cancelGeneration}><Square size={15} />停止</button>
-              : <button className="primary-button send-button" type="submit" disabled={!draft.trim() || uploading}><SendHorizontal size={17} />发送</button>}
+              ? <button className="secondary-button send-button" type="button" onClick={pauseGeneration} disabled={!activeAiTaskId}><Pause size={15} />暂停</button>
+              : pausedRequest?.sessionId === activeSessionId
+                ? <><button className="secondary-button" type="button" onClick={discardPausedGeneration}><Square size={14} />放弃</button><button className="primary-button send-button" type="button" onClick={resumeGeneration}><Play size={16} />继续</button></>
+                : <button className="primary-button send-button" type="submit" disabled={!draft.trim() || uploading}><SendHorizontal size={17} />发送</button>}
           </div>
         </form>
       </section>
