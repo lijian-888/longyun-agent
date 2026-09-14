@@ -28,6 +28,8 @@ from reportlab.platypus import KeepTogether, Paragraph, SimpleDocTemplate, Space
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from .sandbox_artifacts import SANDBOX_WATERMARK, artifact_model_version, source_descriptions, stamp_pdf_bytes
+
 
 PDF_FONT = "STSong-Light"
 MOCK_PROGRAM_CODE = "JX-RICE-DEMO-2021"
@@ -829,8 +831,18 @@ def build_breeding_report_pdf(context: dict[str, Any], generated_at: datetime | 
     ])
     for evidence in context["evidence"]:
         story.append(_paragraph_or_default(f"{evidence['priority']}. {evidence['title']}：{evidence['detail']}", styles))
+    model_version = artifact_model_version({"analysis_engine": "breeding-dossier", "analysis_version": "v1"})
+    story.extend([
+        Paragraph("十一、模型版本与沙盒说明", styles["heading"]),
+        _paragraph_or_default(f"模型版本：{model_version}", styles),
+        _paragraph_or_default(f"导出标识：{SANDBOX_WATERMARK}。所有页面均由服务端统一添加水印，普通业务账号不提供无水印导出。", styles),
+    ])
     document.build(story)
-    return buffer.getvalue()
+    return stamp_pdf_bytes(
+        buffer.getvalue(),
+        sources=source_descriptions(context["evidence"]),
+        model_version=model_version,
+    )
 
 
 def _paragraph_or_default(value: str, styles: dict[str, ParagraphStyle]) -> Paragraph:

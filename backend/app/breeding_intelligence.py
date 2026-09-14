@@ -32,6 +32,8 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
+from .sandbox_artifacts import artifact_model_version, source_descriptions, stamp_csv_bytes, stamp_pdf_bytes
+
 
 ANALYSIS_VERSION = "longyun-germplasm-evidence-v1.0"
 RECOMMENDATION_VERSION = "longyun-parent-auxiliary-v1.1"
@@ -930,7 +932,15 @@ def recommendation_csv(result: dict[str, Any]) -> bytes:
             "；".join(item.get("risks", [])),
             "；".join(item.get("data_gaps", [])),
         ])
-    return ("\ufeff" + buffer.getvalue()).encode("utf-8")
+    raw = ("\ufeff" + buffer.getvalue()).encode("utf-8")
+    sources = []
+    for item in result.get("recommendations", []):
+        sources.extend(evidence.get("source") for evidence in item.get("evidence", []) if evidence.get("source"))
+    return stamp_csv_bytes(
+        raw,
+        sources=sources,
+        model_version=artifact_model_version(result),
+    )
 
 
 def _pdf_font() -> str:
@@ -1014,5 +1024,15 @@ def build_intelligence_pdf(title: str, result: dict[str, Any]) -> bytes:
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
     ]))
     story.append(table)
+    model_version = artifact_model_version(result)
+    story.extend([
+        Paragraph("模型版本与沙盒说明", styles["Heading1"]),
+        Paragraph(f"模型版本：{model_version}", styles["BodyText"]),
+        Paragraph("所有页面均由服务端添加“隆耘 Agent 沙盒演示环境”水印；本报告不存在普通业务账号可调用的无水印版本。", styles["BodyText"]),
+    ])
     document.build(story)
-    return buffer.getvalue()
+    return stamp_pdf_bytes(
+        buffer.getvalue(),
+        sources=source_descriptions(sources),
+        model_version=model_version,
+    )

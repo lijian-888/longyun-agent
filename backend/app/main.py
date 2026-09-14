@@ -170,6 +170,15 @@ from .breeding_intelligence import (
     save_parent_recommendation,
     update_recommendation_rule,
 )
+from .sandbox_artifacts import (
+    SANDBOX_WATERMARK,
+    artifact_model_version,
+    build_project_application_draft_pdf,
+    build_trial_ledger_xlsx,
+    compliance_metadata,
+    ensure_compliant_artifact_bytes,
+    stamp_pdf_bytes,
+)
 from .institution_data import (
     DATASET_LABELS,
     FIELD_ALIASES,
@@ -2653,6 +2662,8 @@ RESEARCH_RESULT_LABELS = {
     "statistics_json": "结构化统计结果",
     "genotype_qc_package": "基因型质控结果包",
     "gwas_result_zip": "GWAS 分析结果",
+    "trial_ledger_xlsx": "试验台账",
+    "project_application_draft_pdf": "课题申报辅助材料草稿",
 }
 
 
@@ -2711,6 +2722,17 @@ def _store_research_result(
     analysis: dict[str, Any] | None = None,
 ) -> ResearchResult:
     """Upsert one private output and write it under the local research volume."""
+    artifact_sources = (analysis or {}).get("sources") or [
+        f"当前课题受控分析结果：{(analysis or {}).get('title') or title}"
+    ]
+    model_version = artifact_model_version(analysis)
+    content = ensure_compliant_artifact_bytes(
+        content,
+        file_name=file_name,
+        content_type=content_type,
+        sources=artifact_sources,
+        model_version=model_version,
+    )
     existing = session.scalar(select(ResearchResult).where(
         ResearchResult.owner_id == owner_id,
         ResearchResult.source_message_id == source_message_id,
@@ -2753,6 +2775,7 @@ def _store_research_result(
         "analysis_title": (analysis or {}).get("title"),
         "source_record_count": (analysis or {}).get("source_record_count"),
         "generated_from": "agricultural_research_assistant",
+        "sandbox_compliance": compliance_metadata(artifact_sources, model_version),
     }
     return result
 
@@ -2768,6 +2791,15 @@ def _store_gwas_result_bundle(
     metadata: dict[str, Any],
 ) -> ResearchResult:
     """Upsert one downloadable, private ZIP for one completed GWAS plan."""
+    sources = [f"本地 GWAS 计划：{plan_id}", f"性状：{metadata.get('trait_name') or '未命名性状'}"]
+    model_version = artifact_model_version({"analysis_engine": "local-rice-gwas", "analysis_version": metadata.get("runner_version") or "v1"})
+    content = ensure_compliant_artifact_bytes(
+        content,
+        file_name=file_name,
+        content_type="application/zip",
+        sources=sources,
+        model_version=model_version,
+    )
     result = session.scalar(select(ResearchResult).where(
         ResearchResult.owner_id == owner_id,
         ResearchResult.analysis_run_id == plan_id,
@@ -2801,7 +2833,11 @@ def _store_gwas_result_bundle(
     result.size_bytes = len(content)
     result.storage_path = str(target)
     result.summary = f"包含 {metadata.get('file_count', 0)} 个已完成的 GWAS 输出：质控、PCA、Manhattan、QQ、候选位点及可复核数据。"
-    result.result_metadata = {**metadata, "generated_from": "local_rice_gwas"}
+    result.result_metadata = {
+        **metadata,
+        "generated_from": "local_rice_gwas",
+        "sandbox_compliance": compliance_metadata(sources, model_version),
+    }
     return result
 
 
@@ -3825,6 +3861,14 @@ def _trial_run_for_current_user(session: Session, run_id: str, user: CurrentUser
     return intelligence_json_safe(dict(row))
 
 
+def _trial_artifact_sources(run: dict[str, Any]) -> list[str]:
+    analysis = run.get("result_json") or {}
+    return [
+        f"已发布试验资料包：{run.get('package_name') or '-'}（{run.get('package_code') or '-'}）",
+        f"受控分析运行：{run.get('id') or '-'}；原始记录 {analysis.get('source_record_count', 0)} 条",
+    ]
+
+
 @app.get("/api/research/trial-analysis/runs/{run_id}/chart.png")
 def controlled_trial_chart(
     run_id: str,
@@ -3859,6 +3903,62 @@ def controlled_trial_report(
         content=content,
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="trial-analysis-{run_id}.pdf"'},
+    )
+
+
+@app.get("/api/research/trial-analysis/runs/{run_id}/ledger.xlsx")
+def controlled_trial_ledger(
+    run_id: str,
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> Response:
+    """Export a traceable trial ledger; the server always applies R9 compliance."""
+    run = _trial_run_for_current_user(session, run_id, user)
+    sources = _trial_artifact_sources(run)
+    content = build_trial_ledger_xlsx(
+        run,
+        sources=sources,
+        model_version=artifact_model_version(run.get("result_json")),
+    )
+    record_permission_audit(
+        session, user, "trial_ledger_exported", "trial_analysis_run", run_id,
+        project_id=active_project_id(session),
+        after={"watermark": SANDBOX_WATERMARK, "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+    )
+    session.commit()
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": _download_content_disposition(f"试验台账-{run_id}.xlsx", f"trial-ledger-{run_id}.xlsx")},
+    )
+
+
+@app.get("/api/research/trial-analysis/runs/{run_id}/project-application-draft.pdf")
+def controlled_project_application_draft(
+    run_id: str,
+    user: CurrentUser = Depends(require_researcher),
+    session: Session = Depends(get_research_session),
+) -> Response:
+    """Generate an evidence-bounded project application support draft."""
+    run = _trial_run_for_current_user(session, run_id, user)
+    project = session.get(ResearchProject, active_project_id(session))
+    sources = _trial_artifact_sources(run)
+    content = build_project_application_draft_pdf(
+        run,
+        project_name=project.project_name if project else "海南南繁水稻研究课题",
+        sources=sources,
+        model_version=artifact_model_version(run.get("result_json")),
+    )
+    record_permission_audit(
+        session, user, "project_application_draft_exported", "trial_analysis_run", run_id,
+        project_id=active_project_id(session),
+        after={"watermark": SANDBOX_WATERMARK, "content_type": "application/pdf"},
+    )
+    session.commit()
+    return Response(
+        content=content,
+        media_type="application/pdf",
+        headers={"Content-Disposition": _download_content_disposition(f"课题申报辅助材料草稿-{run_id}.pdf", f"project-application-draft-{run_id}.pdf")},
     )
 
 
@@ -4581,7 +4681,13 @@ def download_genotype_phenotype_template(
 ) -> Response:
     try:
         get_genotype_asset_version(session, asset_id, version_id)
-        content = build_genotype_phenotype_template(session, version_id)
+        content = ensure_compliant_artifact_bytes(
+            build_genotype_phenotype_template(session, version_id),
+            file_name="phenotype-template.xlsx",
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            sources=[f"基因型资产 {asset_id} 版本 {version_id} 的材料清单"],
+            model_version=artifact_model_version({"analysis_engine": "genotype-governance", "analysis_version": "v1"}),
+        )
         filename = quote(f"{asset_id}-v{version_id[:8]}-连续性状表型模板.xlsx")
         return Response(content=content, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"})
     except GenotypeAssetError as exc:
@@ -4597,7 +4703,13 @@ def download_genotype_mapping_template(
 ) -> Response:
     try:
         get_genotype_asset_version(session, asset_id, version_id)
-        content = build_genotype_mapping_template(session, version_id)
+        content = ensure_compliant_artifact_bytes(
+            build_genotype_mapping_template(session, version_id),
+            file_name="mapping-template.csv",
+            content_type="text/csv",
+            sources=[f"基因型资产 {asset_id} 版本 {version_id} 的样本清单"],
+            model_version=artifact_model_version({"analysis_engine": "genotype-governance", "analysis_version": "v1"}),
+        )
         filename = quote(f"{asset_id}-v{version_id[:8]}-样本材料映射模板.csv")
         return Response(content=content, media_type="text/csv; charset=utf-8", headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"})
     except GenotypeAssetError as exc:
@@ -4611,11 +4723,22 @@ def download_genotype_qc_artifact(
     kind: Literal["report", "package"],
     user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
-) -> FileResponse:
+) -> Response:
     try:
         get_genotype_asset_version(session, asset_id, version_id)
         path, media_type = genotype_artifact_path(session, version_id, kind)
-        return FileResponse(path, media_type=media_type, filename=path.name)
+        content = ensure_compliant_artifact_bytes(
+            path.read_bytes(),
+            file_name=path.name,
+            content_type=media_type,
+            sources=[f"基因型资产 {asset_id} 版本 {version_id} 的质控结果"],
+            model_version=artifact_model_version({"analysis_engine": "genotype-qc", "analysis_version": "v1"}),
+        )
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={"Content-Disposition": _download_content_disposition(path.name, f"genotype-qc-{version_id[:8]}")},
+        )
     except GenotypeAssetError as exc:
         raise HTTPException(404, str(exc)) from exc
 
@@ -4772,10 +4895,21 @@ def download_local_gwas_result(
     file_key: str,
     user: CurrentUser = Depends(require_researcher),
     session: Session = Depends(get_research_session),
-) -> FileResponse:
+) -> Response:
     try:
         path, media_type = get_local_gwas_result_file(session, plan_id, file_key, RESEARCH_STORAGE_DIR)
-        return FileResponse(path, media_type=media_type, filename=path.name)
+        content = ensure_compliant_artifact_bytes(
+            path.read_bytes(),
+            file_name=path.name,
+            content_type=media_type,
+            sources=[f"本地 GWAS 计划：{plan_id}", f"结果文件：{file_key}"],
+            model_version=artifact_model_version({"analysis_engine": "local-rice-gwas", "analysis_version": "v1"}),
+        )
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={"Content-Disposition": _download_content_disposition(path.name, f"gwas-result-{plan_id[:8]}")},
+        )
     except GenomicsError as exc:
         raise HTTPException(404, str(exc)) from exc
 
@@ -6594,6 +6728,21 @@ def _serialize_ai_task(item: AIGatewayTask) -> dict[str, Any]:
     }
 
 
+@app.get("/api/artifacts/compliance")
+def artifact_compliance_contract(
+    user: CurrentUser = Depends(require_business_user),
+) -> dict[str, Any]:
+    """Return only non-secret labels needed by the few browser-rendered exports.
+
+    A browser export must fail closed when this contract cannot be loaded; it
+    never receives an upstream key or an option for disabling the watermark.
+    """
+    return compliance_metadata(
+        ["当前账号有权访问的海南南繁已发布标准数据"],
+        artifact_model_version(),
+    )
+
+
 def _serialize_ai_resume_request(session: Session, task: AIGatewayTask) -> dict[str, Any] | None:
     request_message = session.get(ResearchMessage, task.request_message_id) if task.request_message_id else None
     if not request_message or request_message.session_id != task.session_id:
@@ -7432,8 +7581,16 @@ def download_research_message_report(
         ResearchResult.result_type == "pdf_report",
     ))
     if existing and Path(existing.storage_path).is_file():
+        existing_compliance = (existing.result_metadata or {}).get("sandbox_compliance") or {}
+        content = ensure_compliant_artifact_bytes(
+            Path(existing.storage_path).read_bytes(),
+            file_name=existing.file_name,
+            content_type=existing.content_type,
+            sources=existing_compliance.get("data_sources") or [existing.summary or existing.title],
+            model_version=existing_compliance.get("model_version") or artifact_model_version(existing.result_metadata),
+        )
         return Response(
-            content=Path(existing.storage_path).read_bytes(),
+            content=content,
             media_type=existing.content_type,
             headers={
                 "Content-Disposition": _download_content_disposition(
@@ -7572,8 +7729,16 @@ def download_research_result(
     path = Path(result.storage_path)
     if not path.is_file():
         raise HTTPException(409, "该研究产物的本地文件已不存在，请重新生成。")
+    stored_compliance = (result.result_metadata or {}).get("sandbox_compliance") or {}
+    content = ensure_compliant_artifact_bytes(
+        path.read_bytes(),
+        file_name=result.file_name,
+        content_type=result.content_type,
+        sources=stored_compliance.get("data_sources") or [result.summary or result.title],
+        model_version=stored_compliance.get("model_version") or artifact_model_version(result.result_metadata),
+    )
     return Response(
-        content=path.read_bytes(),
+        content=content,
         media_type=result.content_type,
         headers={
             "Content-Disposition": _download_content_disposition(
@@ -8185,8 +8350,15 @@ def pdf_report(
     story.append(table)
     story.append(Spacer(1, 5 * mm))
     story.append(Paragraph("说明：本报告仅基于已发布标准数据生成。原始文件不包含在下载内容中；抗病等级未在缺少正式评价体系时自动转换为抗性分类。", chinese))
+    model_version = artifact_model_version({"analysis_engine": "published-phenotype-query", "analysis_version": "v1"})
+    story.append(Paragraph(f"数据来源：当前课题已发布标准表型数据；模型版本：{model_version}；导出标识：{SANDBOX_WATERMARK}。", chinese))
     document.build(story)
-    return Response(content=buffer.getvalue(), media_type="application/pdf", headers={"Content-Disposition": "attachment; filename=rice-phenotype-report.pdf"})
+    content = stamp_pdf_bytes(
+        buffer.getvalue(),
+        sources=["当前课题已发布标准表型数据"],
+        model_version=model_version,
+    )
+    return Response(content=content, media_type="application/pdf", headers={"Content-Disposition": "attachment; filename=rice-phenotype-report.pdf"})
 
 
 async def execute_longyun_acps_partner(question: str, caller_aic: str, acps_task_id: str) -> AcpsExecutionResult:

@@ -45,6 +45,43 @@ const roles = [
   { id: "admin", label: "字段管理员", user: "字段管理员-陈工", icon: UserRoundCog, description: "维护课题成员、字段模板、规则和公共知识" },
 ];
 
+async function loadArtifactCompliance() {
+  const response = await authorizedFetch("/api/artifacts/compliance");
+  if (!response.ok) throw new Error("未能取得沙盒导出策略，已阻止无水印导出");
+  return response.json();
+}
+
+async function watermarkPngDataUrl(dataUrl, compliance) {
+  const image = new Image();
+  await new Promise((resolve, reject) => {
+    image.onload = resolve;
+    image.onerror = () => reject(new Error("图表水印渲染失败"));
+    image.src = dataUrl;
+  });
+  const canvas = document.createElement("canvas");
+  canvas.width = image.naturalWidth;
+  canvas.height = image.naturalHeight;
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("浏览器不支持安全图表导出");
+  context.drawImage(image, 0, 0);
+  context.save();
+  context.translate(canvas.width / 2, canvas.height / 2);
+  context.rotate(-Math.PI / 10);
+  context.globalAlpha = 0.2;
+  context.fillStyle = "#35584d";
+  context.textAlign = "center";
+  context.font = `700 ${Math.max(28, Math.round(canvas.width / 20))}px sans-serif`;
+  context.fillText(compliance.watermark, 0, 0);
+  context.restore();
+  context.fillStyle = "rgba(255,255,255,0.92)";
+  context.fillRect(0, canvas.height - 52, canvas.width, 52);
+  context.fillStyle = "#234b40";
+  context.font = `${Math.max(12, Math.round(canvas.width / 80))}px sans-serif`;
+  context.textAlign = "left";
+  context.fillText(`${compliance.watermark}｜数据来源：${compliance.data_sources.join("；")}｜模型版本：${compliance.model_version}`, 14, canvas.height - 19);
+  return canvas.toDataURL("image/png");
+}
+
 const traitLabels = {
   plant_height: "株高(cm)",
   thousand_grain_weight: "千粒重(g)",
@@ -367,23 +404,33 @@ function App({ user, accessRole = "data_processor", platformContext, onProjectCh
     setSelected((current) => current.includes(id) ? current.filter((item) => item !== id) : current.length >= 5 ? current : [...current, id]);
   }
 
-  function downloadCsv() {
-    const rows = researchRows.map((item) => ({ 品种名称: item.variety_name, 别名: item.alias_names.join("、"), 株高_cm: item.traits.plant_height ?? "", 千粒重_g: item.traits.thousand_grain_weight ?? "", 亩产_kg每亩: item.traits.yield_per_mu ?? "", 叶瘟等级: item.traits.leaf_blast_score ?? "", 数据状态: item.data_status }));
-    const text = XLSX.utils.sheet_to_csv(XLSX.utils.json_to_sheet(rows));
-    downloadBlob(new Blob([`\uFEFF${text}`], { type: "text/csv;charset=utf-8" }), "水稻表型查询结果.csv");
+  async function downloadCsv() {
+    try {
+      const compliance = await loadArtifactCompliance();
+      const rows = researchRows.map((item, index) => ({ 品种名称: item.variety_name, 别名: item.alias_names.join("、"), 株高_cm: item.traits.plant_height ?? "", 千粒重_g: item.traits.thousand_grain_weight ?? "", 亩产_kg每亩: item.traits.yield_per_mu ?? "", 叶瘟等级: item.traits.leaf_blast_score ?? "", 数据状态: item.data_status, 沙盒水印: index === 0 ? compliance.watermark : "", 数据来源: index === 0 ? compliance.data_sources.join("；") : "", 模型版本: index === 0 ? compliance.model_version : "" }));
+      const text = XLSX.utils.sheet_to_csv(XLSX.utils.json_to_sheet(rows));
+      downloadBlob(new Blob([`\uFEFF${text}`], { type: "text/csv;charset=utf-8" }), "水稻表型查询结果.csv");
+    } catch (error) { setMessage(error.message); }
   }
 
-  function downloadXlsx() {
-    const rows = researchRows.map((item) => ({ 品种名称: item.variety_name, 别名: item.alias_names.join("、"), 株高_cm: item.traits.plant_height ?? "", 千粒重_g: item.traits.thousand_grain_weight ?? "", 亩产_kg每亩: item.traits.yield_per_mu ?? "", 叶瘟等级: item.traits.leaf_blast_score ?? "", 生育期_天: item.traits.growth_duration ?? "" }));
-    const workbook = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(rows), "查询结果");
-    XLSX.writeFile(workbook, "水稻表型查询结果.xlsx");
+  async function downloadXlsx() {
+    try {
+      const compliance = await loadArtifactCompliance();
+      const rows = researchRows.map((item) => ({ 品种名称: item.variety_name, 别名: item.alias_names.join("、"), 株高_cm: item.traits.plant_height ?? "", 千粒重_g: item.traits.thousand_grain_weight ?? "", 亩产_kg每亩: item.traits.yield_per_mu ?? "", 叶瘟等级: item.traits.leaf_blast_score ?? "", 生育期_天: item.traits.growth_duration ?? "" }));
+      const workbook = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(rows), "查询结果");
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([["导出标识", compliance.watermark], ["数据来源", compliance.data_sources.join("；")], ["模型版本", compliance.model_version], ["合规版本", compliance.compliance_version]]), "沙盒说明");
+      workbook.Props = { ...(workbook.Props || {}), Comments: `${compliance.watermark}；模型版本：${compliance.model_version}` };
+      XLSX.writeFile(workbook, "水稻表型查询结果.xlsx");
+    } catch (error) { setMessage(error.message); }
   }
 
   async function downloadPng() {
     if (!chartRef.current) return;
     try {
-      const dataUrl = await toPng(chartRef.current, { backgroundColor: "#ffffff", pixelRatio: 2 });
+      const compliance = await loadArtifactCompliance();
+      const rawDataUrl = await toPng(chartRef.current, { backgroundColor: "#ffffff", pixelRatio: 2 });
+      const dataUrl = await watermarkPngDataUrl(rawDataUrl, compliance);
       const link = document.createElement("a");
       link.href = dataUrl;
       link.download = "水稻表型对比图.png";

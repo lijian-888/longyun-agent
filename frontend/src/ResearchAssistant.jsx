@@ -274,25 +274,33 @@ function StructuredQueryPanel({ onNotice }) {
     setFilters((current) => current.filter((_, itemIndex) => itemIndex !== index));
   }
 
-  function exportCsv() {
+  async function exportCsv() {
     if (!result?.records?.length) return;
-    const columns = [identityField?.name || "品种/材料名称", "别名", ...selectedFields.map(fieldLabel)];
-    const escapeCell = (value) => `"${String(value ?? "").replaceAll('"', '""')}"`;
-    const rows = result.records.map((record) => [
-      record.variety_name,
-      record.aliases?.join("、") || "",
-      ...selectedFields.map((field) => record.traits?.[field.code]?.value ?? ""),
-    ]);
-    const csv = `\uFEFF${[columns, ...rows].map((row) => row.map(escapeCell).join(",")).join("\r\n")}`;
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = `已发布标准数据查询-${new Date().toISOString().slice(0, 10)}.csv`;
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    URL.revokeObjectURL(url);
+    try {
+      const policyResponse = await authorizedFetch("/api/artifacts/compliance");
+      if (!policyResponse.ok) throw new Error("未能取得沙盒导出策略，已阻止无水印导出");
+      const compliance = await policyResponse.json();
+      const columns = [identityField?.name || "品种/材料名称", "别名", ...selectedFields.map(fieldLabel), "沙盒水印", "数据来源", "模型版本"];
+      const escapeCell = (value) => `"${String(value ?? "").replaceAll('"', '""')}"`;
+      const rows = result.records.map((record, index) => [
+        record.variety_name,
+        record.aliases?.join("、") || "",
+        ...selectedFields.map((field) => record.traits?.[field.code]?.value ?? ""),
+        index === 0 ? compliance.watermark : "",
+        index === 0 ? compliance.data_sources.join("；") : "",
+        index === 0 ? compliance.model_version : "",
+      ]);
+      const csv = `\uFEFF${[columns, ...rows].map((row) => row.map(escapeCell).join(",")).join("\r\n")}`;
+      const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `已发布标准数据查询-${new Date().toISOString().slice(0, 10)}.csv`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+    } catch (exportError) { setError(exportError.message); }
   }
 
   async function runQuery(event) {

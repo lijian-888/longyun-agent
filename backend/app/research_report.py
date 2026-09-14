@@ -26,6 +26,8 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.platypus import KeepTogether, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
+from .sandbox_artifacts import SANDBOX_WATERMARK, artifact_model_version, source_descriptions, stamp_pdf_bytes, stamp_png_bytes
+
 
 PDF_FONT = "STSong-Light"
 REPORT_REQUEST_PATTERN = re.compile(
@@ -450,7 +452,11 @@ def build_analysis_chart_png(analysis: dict[str, Any] | None) -> bytes | None:
 
     buffer = io.BytesIO()
     image.save(buffer, format="PNG", optimize=True)
-    return buffer.getvalue()
+    return stamp_png_bytes(
+        buffer.getvalue(),
+        sources=[f"受控统计运行：{analysis.get('title') or analysis_type}"],
+        model_version=artifact_model_version(analysis),
+    )
 
 
 def build_research_report_pdf(
@@ -513,5 +519,15 @@ def build_research_report_pdf(
             value = f"{value}：{item['source']}"
         reference_items.append(f"{index}. {value}")
     story.extend([_paragraph(item, styles["small"]) for item in reference_items] or [_paragraph("本轮未引用可列示的外部资料。", styles["small"])])
+    model_version = artifact_model_version(analysis)
+    story.extend([
+        Paragraph("八、模型版本与沙盒说明", styles["heading"]),
+        _paragraph(f"模型版本：{model_version}", styles["body"]),
+        _paragraph(f"导出标识：{SANDBOX_WATERMARK}。所有页面均由服务端统一添加水印，普通业务账号不提供无水印导出。", styles["body"]),
+    ])
     document.build(story)
-    return buffer.getvalue()
+    return stamp_pdf_bytes(
+        buffer.getvalue(),
+        sources=source_descriptions(evidence),
+        model_version=model_version,
+    )
