@@ -496,10 +496,24 @@ export default function ResearchAssistant({ platformContext, onProjectChange }) 
 
   async function loadConversation(sessionId) {
     if (!sessionId) return;
+    const pausedTaskRequest = authorizedFetch(`/api/research/sessions/${sessionId}/ai/tasks/paused`)
+      .then(async (response) => {
+        if (!response.ok) {
+          // Pause recovery is an auxiliary capability. A missing or temporarily
+          // unavailable endpoint must never prevent ordinary chat from loading.
+          console.warn("暂停任务状态暂不可用，继续加载正常会话。", response.status);
+          return { task: null, resume_request: null };
+        }
+        return response.json();
+      })
+      .catch((error) => {
+        console.warn("暂停任务状态查询失败，继续加载正常会话。", error);
+        return { task: null, resume_request: null };
+      });
     const [messageList, attachmentList, pausedTaskState] = await Promise.all([
       request(`/api/research/sessions/${sessionId}/messages`),
       request(`/api/research/sessions/${sessionId}/attachments`),
-      request(`/api/research/sessions/${sessionId}/ai/tasks/paused`),
+      pausedTaskRequest,
     ]);
     followLatestRef.current = true;
     setShowLatestButton(false);

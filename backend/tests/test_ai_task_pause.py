@@ -70,6 +70,16 @@ class AITaskPauseTests(unittest.TestCase):
         main.AI_TASK_CANCEL_EVENTS.clear()
         main.AI_TASK_RUNNING_COROUTINES.clear()
 
+    def test_pause_and_resume_routes_are_registered(self):
+        routes = {
+            (route.path, method)
+            for route in main.app.routes
+            for method in (getattr(route, "methods", None) or set())
+        }
+        self.assertIn(("/api/research/sessions/{research_session_id}/ai/tasks/paused", "GET"), routes)
+        self.assertIn(("/api/ai/tasks/{task_id}/pause", "POST"), routes)
+        self.assertIn(("/api/ai/tasks/{task_id}/cancel", "POST"), routes)
+
     def test_running_task_is_paused_and_coroutine_is_stopped(self):
         item = task()
         session = FakeSession(item)
