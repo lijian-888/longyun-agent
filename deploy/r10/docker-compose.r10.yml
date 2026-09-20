@@ -1,0 +1,36 @@
+# Add to the existing LAN + ACPs Compose stack; no additional public port.
+services:
+  control-plane:
+    image: ${CONTROL_PLANE_IMAGE:-longyun-agent-api:lan}
+    command: ["python", "/opt/longyun-r10/control_plane.py", "serve"]
+    restart: unless-stopped
+    environment:
+      CONTROL_PLANE_DB_DSN: postgresql://rice:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@db:5432/rice_demo
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD}
+      R10_AUDIT_DIR: /var/lib/longyun-r10
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      keycloak:
+        condition: service_started
+    volumes:
+      - ./deploy/r10/control_plane.py:/opt/longyun-r10/control_plane.py:ro
+      - r10_audit:/var/lib/longyun-r10
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/healthz', timeout=7)"]
+      interval: 20s
+      timeout: 10s
+      retries: 6
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  r10_audit:
