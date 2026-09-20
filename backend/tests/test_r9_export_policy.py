@@ -1,3 +1,4 @@
+import ast
 import inspect
 import unittest
 from pathlib import Path
@@ -26,6 +27,25 @@ class R9ExportPolicyTests(unittest.TestCase):
         self.assertEqual(file_response_lines, [
             'return FileResponse(path, media_type=media_type, headers={"Content-Disposition": "inline"})',
         ])
+
+    def test_sandbox_export_contract_is_declared_and_requires_login(self):
+        source = (Path(__file__).resolve().parents[1] / "app" / "main.py").read_text(encoding="utf-8")
+        functions = [
+            node for node in ast.parse(source).body
+            if isinstance(node, ast.FunctionDef) and node.name == "artifact_compliance_contract"
+        ]
+        self.assertEqual(len(functions), 1)
+        function = functions[0]
+        decorators = [ast.unparse(item) for item in function.decorator_list]
+        self.assertIn("app.get('/api/artifacts/compliance')", decorators)
+        self.assertIn("Depends(require_business_user)", [ast.unparse(item) for item in function.args.defaults])
+
+        policy = sandbox_artifacts.compliance_metadata(["已发布标准数据"])
+        self.assertEqual(policy["watermark"], sandbox_artifacts.SANDBOX_WATERMARK)
+        self.assertTrue(policy["data_sources"])
+        self.assertTrue(policy["model_version"])
+        self.assertTrue(policy["compliance_version"])
+        self.assertFalse(any("key" in name.lower() or "secret" in name.lower() for name in policy))
 
     def test_browser_exports_fail_closed_through_server_contract(self):
         frontend = Path(__file__).resolve().parents[2] / "frontend" / "src"
